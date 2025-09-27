@@ -98,14 +98,32 @@ Walks a target directory, stores the metadata and (optionally) UTF-8 content for
 | `maxFileSizeBytes` | `number` | Skip files larger than this size (default 512 KiB). |
 | `storeFileContent` | `boolean` | When `false`, only metadata is stored; content is omitted. |
 | `contentSanitizer` | `{ module: string, exportName?: string, options?: unknown }` | Dynamically import a sanitizer to scrub or redact content before it is persisted. |
+| `embedding` | `{ enabled?: boolean, model?: string, chunkSizeTokens?: number, chunkOverlapTokens?: number, batchSize?: number }` | Configure semantic chunking/embedding (defaults use `Xenova/bge-small-en-v1.5`, 256-token chunks). |
 
-The tool response contains both a human-readable summary and structured content describing the ingestion (file count, skipped files, deleted paths, database size, etc.).
+The tool response contains both a human-readable summary and structured content describing the ingestion (file count, skipped files, deleted paths, database size, embedded chunk count, etc.).
+
+### `semantic_search`
+
+Queries the indexed `file_chunks` table using cosine similarity between the `bge-small-en-v1.5` embeddings stored during ingestion and a user-supplied query string. Results surface the best-matching snippets along with scores and metadata.
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `root` (required) | `string` | Absolute or relative path to the codebase root. Should match the path used for ingestion. |
+| `query` (required) | `string` | Natural-language or code-oriented search string. |
+| `databaseName` | `string` | Override the SQLite filename if you changed it during ingestion. |
+| `limit` | `number` | Max matches to return (default 8, capped at 50). |
+| `model` | `string` | Optional embedding model identifier when multiple models are stored in the database. |
+
+Each response includes the evaluated chunk count, the embedding model used, and the top-ranked snippets (path, chunk index, score, and sanitized content).
 
 ## Project structure
 
 ```
 ├── src/
-│   ├── ingest.ts      # Code ingestion and SQLite persistence
+│   ├── constants.ts   # Shared defaults for tool configuration
+│   ├── embedding.ts   # Lightweight transformer utilities for embeddings
+│   ├── ingest.ts      # Code ingestion, chunking, and SQLite persistence
+│   ├── search.ts      # Semantic retrieval over stored embeddings
 │   └── server.ts      # MCP server wiring and tool registration
 ├── dist/              # Build output (generated)
 ├── package.json
@@ -119,6 +137,7 @@ The tool response contains both a human-readable summary and structured content 
 - Binary files are detected heuristically (null-byte scan) and stored without content even when `storeFileContent` is true.
 - The ingestion table keeps track of added, updated, and deleted entries so repeated runs stay fast, and unchanged files are skipped using mtime/size checks.
 - Provide a sanitizer module to strip secrets or redact sensitive payloads before they reach the index.
+- Semantic embeddings (BGE small) are computed for sanitized text chunks by default; disable or tune chunking via the `embedding` ingest option if you need to trade accuracy for speed.
 - Patterns from a root `.gitignore` file are honored automatically so ignored artifacts never enter the index.
 
 ## Troubleshooting

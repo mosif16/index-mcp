@@ -7,29 +7,13 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const DEFAULT_DB_FILENAME = '.mcp-index.sqlite';
-const DEFAULT_INCLUDE = ['**/*'];
-const DEFAULT_EXCLUDE = [
-  '**/.git/**',
-  '**/.svn/**',
-  '**/.hg/**',
-  '**/.mcp-index.sqlite',
-  '**/node_modules/**',
-  '**/vendor/**',
-  '**/dist/**',
-  '**/build/**'
-];
+import { embedTexts, float32ArrayToBuffer, getDefaultEmbeddingModel } from './embedding.js';
+import { DEFAULT_DB_FILENAME, DEFAULT_INCLUDE_GLOBS, DEFAULT_EXCLUDE_GLOBS } from './constants.js';
 const DEFAULT_MAX_FILE_SIZE_BYTES = 512 * 1024; // 512 KiB
 
-export interface IngestOptions {
-  root: string;
-  include?: string[];
-  exclude?: string[];
-  databaseName?: string;
-  maxFileSizeBytes?: number;
-  storeFileContent?: boolean;
-  contentSanitizer?: ContentSanitizerSpec;
-}
+const DEFAULT_CHUNK_SIZE_TOKENS = 256;
+const DEFAULT_CHUNK_OVERLAP_TOKENS = 32;
+const DEFAULT_EMBED_BATCH_SIZE = 12;
 
 export interface ContentSanitizerSpec {
   module: string;
@@ -51,6 +35,25 @@ type SanitizerModuleFunction = (
 
 type ContentSanitizer = (payload: SanitizerPayload) => Promise<string | null>;
 
+export interface EmbeddingOptions {
+  enabled?: boolean;
+  model?: string;
+  chunkSizeTokens?: number;
+  chunkOverlapTokens?: number;
+  batchSize?: number;
+}
+
+export interface IngestOptions {
+  root: string;
+  include?: string[];
+  exclude?: string[];
+  databaseName?: string;
+  maxFileSizeBytes?: number;
+  storeFileContent?: boolean;
+  contentSanitizer?: ContentSanitizerSpec;
+  embedding?: EmbeddingOptions;
+}
+
 export interface SkippedFile {
   path: string;
   reason: 'file-too-large' | 'read-error';
@@ -66,6 +69,8 @@ export interface IngestResult {
   skipped: SkippedFile[];
   deletedPaths: string[];
   durationMs: number;
+  embeddedChunkCount: number;
+  embeddingModel: string | null;
 }
 
 interface FileRow {
@@ -75,6 +80,15 @@ interface FileRow {
   hash: string;
   lastIndexedAt: number;
   content: string | null;
+}
+
+interface PendingChunk {
+  id: string;
+  path: string;
+  chunkIndex: number;
+  content: string;
+  model: string;
+  embedding?: Buffer;
 }
 
 function toPosixPath(relativePath: string): string {
@@ -93,6 +107,7 @@ function isProbablyBinary(buffer: Buffer): boolean {
 
 function ensureSchema(db: DatabaseInstance) {
   db.exec(`
+    PRAGMA foreign_keys = ON;
     PRAGMA journal_mode = WAL;
     CREATE TABLE IF NOT EXISTS files (
       path TEXT PRIMARY KEY,
@@ -101,6 +116,15 @@ function ensureSchema(db: DatabaseInstance) {
       hash TEXT NOT NULL,
       last_indexed_at INTEGER NOT NULL,
       content TEXT
+    );
+    CREATE TABLE IF NOT EXISTS file_chunks (
+      id TEXT PRIMARY KEY,
+      path TEXT NOT NULL,
+      chunk_index INTEGER NOT NULL,
+      content TEXT NOT NULL,
+      embedding BLOB NOT NULL,
+      embedding_model TEXT NOT NULL,
+      FOREIGN KEY (path) REFERENCES files(path) ON DELETE CASCADE
     );
     CREATE TABLE IF NOT EXISTS ingestions (
       id TEXT PRIMARY KEY,
@@ -112,6 +136,7 @@ function ensureSchema(db: DatabaseInstance) {
       deleted_count INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS files_hash_idx ON files(hash);
+    CREATE INDEX IF NOT EXISTS file_chunks_path_idx ON file_chunks(path);
   `);
 }
 
@@ -174,7 +199,7 @@ async function loadGitIgnore(root: string): Promise<Ignore | null> {
 
     return ignore().add(contents);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+    if ((error as { code?: string }).code === 'ENOENT') {
       return null;
     }
 
@@ -182,18 +207,67 @@ async function loadGitIgnore(root: string): Promise<Ignore | null> {
   }
 }
 
+function chunkText(content: string, chunkSizeTokens: number, overlapTokens: number): string[] {
+  const sanitized = content.trim();
+  if (!sanitized) {
+    return [];
+  }
+
+  const maxChars = Math.max(256, chunkSizeTokens * 4);
+  const overlapChars = Math.max(0, overlapTokens * 4);
+  const chunks: string[] = [];
+
+  let start = 0;
+  while (start < sanitized.length) {
+    let end = Math.min(sanitized.length, start + maxChars);
+
+    if (end < sanitized.length) {
+      const newlineBreak = sanitized.lastIndexOf('\n', end - 1);
+      if (newlineBreak > start + 200) {
+        end = newlineBreak + 1;
+      }
+    }
+
+    const snippet = sanitized.slice(start, end).trimEnd();
+    if (snippet) {
+      chunks.push(snippet);
+    }
+
+    if (end >= sanitized.length) {
+      break;
+    }
+
+    const nextStart = end - overlapChars;
+    start = nextStart > start ? nextStart : end;
+  }
+
+  return chunks;
+}
+
+function resolveEmbeddingDefaults(options?: EmbeddingOptions) {
+  const model = options?.model ?? getDefaultEmbeddingModel();
+  return {
+    enabled: options?.enabled ?? true,
+    model,
+    chunkSizeTokens: options?.chunkSizeTokens ?? DEFAULT_CHUNK_SIZE_TOKENS,
+    chunkOverlapTokens: options?.chunkOverlapTokens ?? DEFAULT_CHUNK_OVERLAP_TOKENS,
+    batchSize: options?.batchSize ?? DEFAULT_EMBED_BATCH_SIZE
+  };
+}
+
 export async function ingestCodebase(options: IngestOptions): Promise<IngestResult> {
   const databaseName = options.databaseName ?? DEFAULT_DB_FILENAME;
-  const includeGlobs = options.include ?? DEFAULT_INCLUDE;
+  const includeGlobs = options.include ?? DEFAULT_INCLUDE_GLOBS;
   const excludeGlobs = Array.from(
     new Set([
-      ...DEFAULT_EXCLUDE,
+      ...DEFAULT_EXCLUDE_GLOBS,
       ...(options.exclude ?? []),
       `**/${databaseName}`
     ])
   );
   const maxFileSizeBytes = options.maxFileSizeBytes ?? DEFAULT_MAX_FILE_SIZE_BYTES;
   const storeFileContent = options.storeFileContent ?? true;
+  const embeddingConfig = resolveEmbeddingDefaults(options.embedding);
 
   const absoluteRoot = path.resolve(options.root);
   const rootStats = await fs.stat(absoluteRoot);
@@ -229,6 +303,8 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
     const files: FileRow[] = [];
     const skipped: SkippedFile[] = [];
     const seenPaths = new Set<string>();
+    const chunkJobs: PendingChunk[] = [];
+    const chunkRefreshPaths = new Set<string>();
 
     for (const relativePath of matches) {
       const normalizedPath = toPosixPath(relativePath);
@@ -289,7 +365,7 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
       }
 
       let content: string | null = null;
-      if (storeFileContent && !isProbablyBinary(fileBuffer)) {
+      if (!isProbablyBinary(fileBuffer)) {
         const rawContent = fileBuffer.toString('utf8');
         content = await sanitizeContent({
           path: normalizedPath,
@@ -305,6 +381,27 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
         .digest('hex');
 
       seenPaths.add(normalizedPath);
+      chunkRefreshPaths.add(normalizedPath);
+
+      if (embeddingConfig.enabled && content) {
+        const trimmedContent = content.trim();
+        if (trimmedContent) {
+          const chunks = chunkText(trimmedContent, embeddingConfig.chunkSizeTokens, embeddingConfig.chunkOverlapTokens);
+          const targetChunks = chunks.length > 0 ? chunks : [trimmedContent];
+          targetChunks.forEach((chunkContent, index) => {
+            if (!chunkContent.trim()) {
+              return;
+            }
+            chunkJobs.push({
+              id: crypto.randomUUID(),
+              path: normalizedPath,
+              chunkIndex: index,
+              content: chunkContent,
+              model: embeddingConfig.model
+            });
+          });
+        }
+      }
 
       files.push({
         path: normalizedPath,
@@ -312,11 +409,37 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
         modified: normalizedMtime,
         hash,
         lastIndexedAt: Date.now(),
-        content
+        content: storeFileContent ? content : null
       });
     }
 
     const deletedPaths = Array.from(existingPathsSet).filter((p) => !seenPaths.has(p));
+    deletedPaths.forEach((p) => chunkRefreshPaths.add(p));
+
+    let embeddedChunkCount = 0;
+
+    if (embeddingConfig.enabled && chunkJobs.length > 0) {
+      const jobsByModel = new Map<string, PendingChunk[]>();
+      for (const job of chunkJobs) {
+        const list = jobsByModel.get(job.model) ?? [];
+        list.push(job);
+        jobsByModel.set(job.model, list);
+      }
+
+      for (const [model, jobs] of jobsByModel) {
+        for (let i = 0; i < jobs.length; i += embeddingConfig.batchSize) {
+          const batch = jobs.slice(i, i + embeddingConfig.batchSize);
+          const embeddings = await embedTexts(
+            batch.map((job) => job.content),
+            { model }
+          );
+          batch.forEach((job, idx) => {
+            job.embedding = float32ArrayToBuffer(embeddings[idx]);
+          });
+          embeddedChunkCount += batch.length;
+        }
+      }
+    }
 
     const upsertStmt = db.prepare(
       `INSERT INTO files (path, size, modified, hash, last_indexed_at, content)
@@ -330,6 +453,11 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
     );
 
     const deleteStmt = db.prepare('DELETE FROM files WHERE path = ?');
+    const deleteChunksStmt = db.prepare('DELETE FROM file_chunks WHERE path = ?');
+    const insertChunkStmt = db.prepare(
+      `INSERT INTO file_chunks (id, path, chunk_index, content, embedding, embedding_model)
+       VALUES (@id, @path, @chunkIndex, @content, @embedding, @model)`
+    );
 
     const insertIngestionStmt = db.prepare(
       `INSERT INTO ingestions (id, root, started_at, finished_at, file_count, skipped_count, deleted_count)
@@ -340,8 +468,24 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
     const endTime = Date.now();
 
     const transaction = db.transaction(() => {
+      for (const pathToReset of chunkRefreshPaths) {
+        deleteChunksStmt.run(pathToReset);
+      }
       for (const file of files) {
         upsertStmt.run(file);
+      }
+      for (const chunk of chunkJobs) {
+        if (!chunk.embedding) {
+          continue;
+        }
+        insertChunkStmt.run({
+          id: chunk.id,
+          path: chunk.path,
+          chunkIndex: chunk.chunkIndex,
+          content: chunk.content,
+          embedding: chunk.embedding,
+          model: chunk.model
+        });
       }
       for (const deleted of deletedPaths) {
         deleteStmt.run(deleted);
@@ -368,7 +512,9 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
       ingestedFileCount: files.length,
       skipped,
       deletedPaths,
-      durationMs: endTime - startTime
+      durationMs: endTime - startTime,
+      embeddedChunkCount,
+      embeddingModel: embeddingConfig.enabled ? embeddingConfig.model : null
     };
   } finally {
     db.close();
