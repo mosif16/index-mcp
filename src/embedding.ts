@@ -6,8 +6,11 @@ const DEFAULT_MODEL = 'Xenova/bge-small-en-v1.5';
 
 type EmbeddingPipeline = FeatureExtractionPipeline;
 
+type TensorData = Float32Array | ArrayLike<number>;
+
 type TensorLike = {
-  data: Float32Array;
+  data: TensorData;
+  dims?: number[];
 };
 
 const pipelineCache = new Map<string, Promise<EmbeddingPipeline>>();
@@ -22,15 +25,60 @@ async function getEmbeddingPipeline(model = DEFAULT_MODEL): Promise<EmbeddingPip
   return pipelineCache.get(model)!;
 }
 
-function tensorToFloat32Array(tensor: unknown): Float32Array {
-  if (!tensor || typeof tensor !== 'object' || !(tensor as TensorLike).data) {
-    throw new Error('Unexpected tensor output from embedding pipeline');
+function toFloat32Array(data: TensorData): Float32Array {
+  if (data instanceof Float32Array) {
+    return data;
   }
-  const data = (tensor as TensorLike).data;
-  if (!(data instanceof Float32Array)) {
-    return new Float32Array(data as Float32Array);
+  return new Float32Array(data);
+}
+
+function normalizeToFloat32Arrays(output: unknown): Float32Array[] {
+  if (output instanceof Float32Array) {
+    return [output];
   }
-  return data;
+
+  if (ArrayBuffer.isView(output)) {
+    const view = output as ArrayBufferView;
+    const floatView = new Float32Array(
+      view.buffer,
+      view.byteOffset,
+      view.byteLength / Float32Array.BYTES_PER_ELEMENT
+    );
+    return [floatView.slice()];
+  }
+
+  if (Array.isArray(output)) {
+    if (output.length === 0) {
+      return [];
+    }
+
+    if (typeof output[0] === 'number') {
+      return [new Float32Array(output as number[])];
+    }
+
+    return output.flatMap((item) => normalizeToFloat32Arrays(item));
+  }
+
+  if (output && typeof output === 'object' && (output as TensorLike).data) {
+    const tensor = output as TensorLike;
+    const baseArray = toFloat32Array(tensor.data);
+    const dims = Array.isArray(tensor.dims) ? tensor.dims : [];
+
+    if (dims.length > 1 && dims[0] && dims[0] > 1) {
+      const vectorLength = Math.floor(baseArray.length / dims[0]);
+      const vectors: Float32Array[] = [];
+      for (let i = 0; i < dims[0]; i += 1) {
+        const start = i * vectorLength;
+        const end = start + vectorLength;
+        vectors.push(baseArray.slice(start, end));
+      }
+      return vectors;
+    }
+
+    return [baseArray];
+  }
+
+  throw new Error('Unexpected tensor output from embedding pipeline');
 }
 
 export interface EmbedConfig {
@@ -48,11 +96,7 @@ export async function embedTexts(texts: string[], config: EmbedConfig = {}): Pro
     normalize: true
   });
 
-  if (Array.isArray(output)) {
-    return output.map((tensor) => tensorToFloat32Array(tensor));
-  }
-
-  return [tensorToFloat32Array(output)];
+  return normalizeToFloat32Arrays(output);
 }
 
 export function float32ArrayToBuffer(array: Float32Array): Buffer {
