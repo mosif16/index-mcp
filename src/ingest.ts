@@ -1,9 +1,11 @@
 import Database from 'better-sqlite3';
 import type { Database as DatabaseInstance } from 'better-sqlite3';
 import fg from 'fast-glob';
+import ignore, { type Ignore } from 'ignore';
 import { promises as fs } from 'node:fs';
 import crypto from 'node:crypto';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const DEFAULT_DB_FILENAME = '.mcp-index.sqlite';
 const DEFAULT_INCLUDE = ['**/*'];
@@ -26,7 +28,28 @@ export interface IngestOptions {
   databaseName?: string;
   maxFileSizeBytes?: number;
   storeFileContent?: boolean;
+  contentSanitizer?: ContentSanitizerSpec;
 }
+
+export interface ContentSanitizerSpec {
+  module: string;
+  exportName?: string;
+  options?: unknown;
+}
+
+interface SanitizerPayload {
+  path: string;
+  absolutePath: string;
+  root: string;
+  content: string;
+}
+
+type SanitizerModuleFunction = (
+  payload: SanitizerPayload,
+  options?: unknown
+) => string | null | undefined | Promise<string | null | undefined>;
+
+type ContentSanitizer = (payload: SanitizerPayload) => Promise<string | null>;
 
 export interface SkippedFile {
   path: string;
@@ -92,6 +115,73 @@ function ensureSchema(db: DatabaseInstance) {
   `);
 }
 
+function toModuleSpecifier(root: string, specifier: string): string {
+  if (specifier.startsWith('.') || specifier.startsWith('..')) {
+    return pathToFileURL(path.resolve(root, specifier)).href;
+  }
+
+  if (path.isAbsolute(specifier)) {
+    return pathToFileURL(specifier).href;
+  }
+
+  return specifier;
+}
+
+function isSanitizer(fn: unknown): fn is SanitizerModuleFunction {
+  return typeof fn === 'function';
+}
+
+const identitySanitizer: ContentSanitizer = async ({ content }) => content;
+
+async function loadSanitizer(root: string, spec?: ContentSanitizerSpec): Promise<ContentSanitizer> {
+  if (!spec) {
+    return identitySanitizer;
+  }
+
+  const moduleSpecifier = toModuleSpecifier(root, spec.module);
+  const imported = await import(moduleSpecifier);
+  const candidate = spec.exportName
+    ? (imported as Record<string, unknown>)[spec.exportName]
+    : (imported as Record<string, unknown>).default ?? (imported as Record<string, unknown>).sanitize;
+
+  if (!isSanitizer(candidate)) {
+    throw new Error(
+      `Content sanitizer '${spec.module}${spec.exportName ? `#${spec.exportName}` : ''}' is not a function`
+    );
+  }
+
+  return async (payload) => {
+    const result = await candidate(payload, spec.options);
+    if (typeof result === 'string' || result === null) {
+      return result ?? null;
+    }
+
+    if (result === undefined) {
+      return payload.content;
+    }
+
+    throw new Error('Content sanitizer must return a string, null, or undefined.');
+  };
+}
+
+async function loadGitIgnore(root: string): Promise<Ignore | null> {
+  const gitignorePath = path.join(root, '.gitignore');
+  try {
+    const contents = await fs.readFile(gitignorePath, 'utf8');
+    if (!contents.trim()) {
+      return null;
+    }
+
+    return ignore().add(contents);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return null;
+    }
+
+    throw error;
+  }
+}
+
 export async function ingestCodebase(options: IngestOptions): Promise<IngestResult> {
   const databaseName = options.databaseName ?? DEFAULT_DB_FILENAME;
   const includeGlobs = options.include ?? DEFAULT_INCLUDE;
@@ -118,8 +208,14 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
   try {
     ensureSchema(db);
 
-    const existingPaths = db.prepare('SELECT path FROM files').pluck().all() as string[];
-    const existingPathsSet = new Set<string>(existingPaths);
+    const sanitizeContent = await loadSanitizer(absoluteRoot, options.contentSanitizer);
+    const gitIgnore = await loadGitIgnore(absoluteRoot);
+
+    const existingRows = db
+      .prepare('SELECT path, size, modified, hash, last_indexed_at as lastIndexedAt, content FROM files')
+      .all() as FileRow[];
+    const existingByPath = new Map<string, FileRow>(existingRows.map((row) => [row.path, row]));
+    const existingPathsSet = new Set<string>(existingByPath.keys());
 
     const matches = await fg(includeGlobs, {
       cwd: absoluteRoot,
@@ -135,13 +231,19 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
     const seenPaths = new Set<string>();
 
     for (const relativePath of matches) {
+      const normalizedPath = toPosixPath(relativePath);
+
+      if (gitIgnore?.ignores(normalizedPath)) {
+        continue;
+      }
+
       const absPath = path.join(absoluteRoot, relativePath);
       let stats;
       try {
         stats = await fs.stat(absPath);
       } catch (error) {
         skipped.push({
-          path: toPosixPath(relativePath),
+          path: normalizedPath,
           reason: 'read-error',
           message: error instanceof Error ? error.message : 'Unknown error'
         });
@@ -150,9 +252,25 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
 
       if (stats.size > maxFileSizeBytes) {
         skipped.push({
-          path: toPosixPath(relativePath),
+          path: normalizedPath,
           reason: 'file-too-large',
           size: stats.size
+        });
+        continue;
+      }
+
+      const normalizedMtime = Math.floor(stats.mtimeMs);
+      const existing = existingByPath.get(normalizedPath);
+
+      if (existing && existing.size === stats.size && existing.modified === normalizedMtime) {
+        seenPaths.add(normalizedPath);
+        files.push({
+          path: normalizedPath,
+          size: existing.size,
+          modified: existing.modified,
+          hash: existing.hash,
+          lastIndexedAt: Date.now(),
+          content: storeFileContent ? existing.content : null
         });
         continue;
       }
@@ -162,7 +280,7 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
         fileBuffer = await fs.readFile(absPath);
       } catch (error) {
         skipped.push({
-          path: toPosixPath(relativePath),
+          path: normalizedPath,
           reason: 'read-error',
           size: stats.size,
           message: error instanceof Error ? error.message : 'Unknown error'
@@ -170,22 +288,28 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
         continue;
       }
 
-      const content: string | null = storeFileContent && !isProbablyBinary(fileBuffer)
-        ? fileBuffer.toString('utf8')
-        : null;
+      let content: string | null = null;
+      if (storeFileContent && !isProbablyBinary(fileBuffer)) {
+        const rawContent = fileBuffer.toString('utf8');
+        content = await sanitizeContent({
+          path: normalizedPath,
+          absolutePath: absPath,
+          root: absoluteRoot,
+          content: rawContent
+        });
+      }
 
       const hash = crypto
         .createHash('sha256')
         .update(fileBuffer)
         .digest('hex');
 
-      const normalizedPath = toPosixPath(relativePath);
       seenPaths.add(normalizedPath);
 
       files.push({
         path: normalizedPath,
         size: stats.size,
-        modified: Math.floor(stats.mtimeMs),
+        modified: normalizedMtime,
         hash,
         lastIndexedAt: Date.now(),
         content

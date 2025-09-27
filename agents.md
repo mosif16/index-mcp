@@ -115,6 +115,9 @@ When the client connects, it receives this message:
 | `databaseName`     | `.mcp-index.sqlite`   | File created at the root. |
 | `maxFileSizeBytes` | `524288` (512 KiB)    | Larger files are skipped and logged in `skipped`. |
 | `storeFileContent` | `true`                | If `false`, only metadata is stored. Binary detection uses a null-byte heuristic. |
+| `contentSanitizer` | `undefined`           | Optional `{ module, exportName?, options? }` descriptor that loads a sanitizer to redact or strip contents before storage. |
+
+During repeat runs the ingestor compares size + mtime against the existing database, reusing prior entries when nothing changed and skipping unnecessary file reads. A `.gitignore` located at the root is parsed automatically so ignored paths never enter the index.
 
 The tool response returns both text (a summary) and `structuredContent` matching the `ingestToolOutputShape` schema.
 

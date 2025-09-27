@@ -97,6 +97,7 @@ Walks a target directory, stores the metadata and (optionally) UTF-8 content for
 | `databaseName` | `string` | Filename to create in the root (default `.mcp-index.sqlite`). |
 | `maxFileSizeBytes` | `number` | Skip files larger than this size (default 512 KiB). |
 | `storeFileContent` | `boolean` | When `false`, only metadata is stored; content is omitted. |
+| `contentSanitizer` | `{ module: string, exportName?: string, options?: unknown }` | Dynamically import a sanitizer to scrub or redact content before it is persisted. |
 
 The tool response contains both a human-readable summary and structured content describing the ingestion (file count, skipped files, deleted paths, database size, etc.).
 
@@ -116,10 +117,11 @@ The tool response contains both a human-readable summary and structured content 
 
 - Files larger than `maxFileSizeBytes` are skipped to avoid ballooning the index. Adjust per codebase needs.
 - Binary files are detected heuristically (null-byte scan) and stored without content even when `storeFileContent` is true.
-- The ingestion table keeps track of added, updated, and deleted entries so repeated runs stay fast.
+- The ingestion table keeps track of added, updated, and deleted entries so repeated runs stay fast, and unchanged files are skipped using mtime/size checks.
+- Provide a sanitizer module to strip secrets or redact sensitive payloads before they reach the index.
+- Patterns from a root `.gitignore` file are honored automatically so ignored artifacts never enter the index.
 
 ## Troubleshooting
 
 - Ensure the `root` directory exists and is readable; the tool throws an error otherwise.
 - Delete the generated database file (`.mcp-index.sqlite` by default) if you need to reset the index from scratch.
-

@@ -11,7 +11,14 @@ const ingestToolArgs = {
   exclude: z.array(z.string()).optional(),
   databaseName: z.string().min(1).optional(),
   maxFileSizeBytes: z.number().int().positive().optional(),
-  storeFileContent: z.boolean().optional()
+  storeFileContent: z.boolean().optional(),
+  contentSanitizer: z
+    .object({
+      module: z.string().min(1, 'module specifier is required'),
+      exportName: z.string().min(1).optional(),
+      options: z.unknown().optional()
+    })
+    .optional()
 } as const;
 const ingestToolSchema = z.object(ingestToolArgs);
 
