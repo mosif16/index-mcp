@@ -67,6 +67,43 @@ function createRootResolutionContext(extra: unknown): RootResolutionContext {
   return context;
 }
 
+function hasAcknowledgedInstructions(extra: unknown): boolean {
+  if (!extra || typeof extra !== 'object') {
+    return false;
+  }
+
+  const meta = (extra as { _meta?: unknown })._meta;
+  if (meta && typeof meta === 'object') {
+    const metaValue = (meta as Record<string, unknown>)[ACKNOWLEDGEMENT_META_KEY];
+    if (metaValue === true || (typeof metaValue === 'string' && metaValue.toLowerCase() === 'true')) {
+      return true;
+    }
+  }
+
+  const requestInfo = (extra as { requestInfo?: { headers?: unknown } }).requestInfo;
+  const headers = requestInfo?.headers ? normalizeHeaders(requestInfo.headers) : undefined;
+  const headerValue = headers?.[ACKNOWLEDGEMENT_HEADER_NAME];
+  if (typeof headerValue === 'string' && headerValue.toLowerCase() === 'true') {
+    return true;
+  }
+
+  return false;
+}
+
+function ensureInstructionsAcknowledged(extra: unknown): void {
+  if (hasAcknowledgedInstructions(extra)) {
+    return;
+  }
+
+  throw new Error(
+    [
+      'Acknowledgement required: set request metadata',
+      `"${ACKNOWLEDGEMENT_META_KEY}" to true or header "${ACKNOWLEDGEMENT_HEADER_NAME}: true" after reviewing the server instructions before calling tools.`,
+      'Call the indexing_guidance prompt if you need to revisit the instructions.'
+    ].join(' ')
+  );
+}
+
 const ingestToolArgs = {
   root: z.string().min(1, 'root directory is required'),
   include: z.array(z.string()).optional(),
@@ -191,12 +228,16 @@ const graphNeighborOutputShape = {
 } as const;
 const graphNeighborOutputSchema = z.object(graphNeighborOutputShape);
 
+const ACKNOWLEDGEMENT_META_KEY = 'index_mcp_acknowledged';
+const ACKNOWLEDGEMENT_HEADER_NAME = 'x-index-mcp-acknowledged';
+
 const SERVER_INSTRUCTIONS = [
   'Tools available: ingest_codebase (index the current codebase into SQLite), semantic_search (embedding-powered retrieval with byte/line metadata and nearby context), graph_neighbors (explore GraphRAG relationships), and indexing_guidance (prompt describing when to reindex).',
   'Use this MCP server for all repository-aware searches: run ingest_codebase to refresh context, rely on semantic_search for locating code or docs, and use graph_neighbors when you need structural call/import details before considering any other lookup method.',
   'Always run ingest_codebase on a new or freshly checked out codebase before asking for help.',
   'Always exclude files and folders matched by .gitignore patterns so ignored content never enters the index.',
-  'Any time you or the agent edits files—or after upgrading this server—re-run ingest_codebase so the SQLite index stays current and backfills the latest metadata.'
+  'Any time you or the agent edits files—or after upgrading this server—re-run ingest_codebase so the SQLite index stays current and backfills the latest metadata.',
+  `After reviewing these instructions, set request metadata "${ACKNOWLEDGEMENT_META_KEY}" to true (or header "${ACKNOWLEDGEMENT_HEADER_NAME}: true") before invoking tools so the server knows you've acknowledged them.`
 ].join(' ');
 
 const INDEXING_GUIDANCE_PROMPT: GetPromptResult = {
@@ -257,6 +298,7 @@ async function main() {
       outputSchema: ingestToolOutputShape
     },
     async (args, extra) => {
+      ensureInstructionsAcknowledged(extra);
       try {
         const parsedInput = ingestToolSchema.parse(args);
         const context = createRootResolutionContext(extra);
@@ -289,6 +331,7 @@ async function main() {
       outputSchema: semanticSearchOutputShape
     },
     async (args, extra) => {
+      ensureInstructionsAcknowledged(extra);
       try {
         const parsedInput = semanticSearchSchema.parse(args);
         const context = createRootResolutionContext(extra);
@@ -322,6 +365,7 @@ async function main() {
       outputSchema: graphNeighborOutputShape
     },
     async (args, extra) => {
+      ensureInstructionsAcknowledged(extra);
       try {
         const parsedInput = graphNeighborSchema.parse(args);
         const context = createRootResolutionContext(extra);
