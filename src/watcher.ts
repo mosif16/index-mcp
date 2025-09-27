@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import { DEFAULT_DB_FILENAME, DEFAULT_EXCLUDE_GLOBS, DEFAULT_INCLUDE_GLOBS } from './constants.js';
 import { ingestCodebase, type IngestOptions, type IngestResult } from './ingest.js';
+import { createLogger } from './logger.js';
 
 export interface WatcherOptions {
   root: string;
@@ -24,6 +25,8 @@ export interface WatcherHandle {
 }
 
 const DEFAULT_DEBOUNCE_MS = 500;
+
+const log = createLogger('watcher');
 
 function toPosixPath(input: string): string {
   return input.split(path.sep).join('/');
@@ -86,14 +89,22 @@ export async function startIngestWatcher(options: WatcherOptions): Promise<Watch
     try {
       const result: IngestResult = await ingestCodebase(ingestOptions);
       if (!quiet) {
-        const durationSec = ((Date.now() - startedAt) / 1000).toFixed(2);
+        const durationSec = (Date.now() - startedAt) / 1000;
         const changeDescriptor = targetPaths.length ? `${targetPaths.length} path(s)` : 'full scan';
-        console.log(
-          `[watcher] ${reason} ingest (${changeDescriptor}) completed in ${durationSec}s: ${result.ingestedFileCount} indexed, ${result.deletedPaths.length} deleted, ${result.skipped.length} skipped.`
+        log.info(
+          {
+            reason,
+            changeDescriptor,
+            durationSec,
+            ingested: result.ingestedFileCount,
+            deleted: result.deletedPaths.length,
+            skipped: result.skipped.length
+          },
+          'Watcher ingest completed'
         );
       }
     } catch (error) {
-      console.error('[watcher] ingest failed:', error);
+      log.error({ err: error }, 'Watcher ingest failed');
     } finally {
       isIngesting = false;
       if (rerunRequested) {
@@ -148,11 +159,12 @@ export async function startIngestWatcher(options: WatcherOptions): Promise<Watch
     .on('add', (filePath) => trackChange(filePath))
     .on('change', (filePath) => trackChange(filePath))
     .on('unlink', (filePath) => trackRemoval(filePath))
-    .on('error', (error) => console.error('[watcher] error:', error));
+    .on('error', (error) => log.error({ err: error }, 'Watcher error'));
 
   if (!quiet) {
-    console.log(
-      `[watcher] Watching ${absoluteRoot} (debounce ${debounceMs}ms, db ${databaseName}) for incremental ingest updates.`
+    log.info(
+      { root: absoluteRoot, debounceMs, databaseName, includeGlobs, excludeGlobs },
+      'Watcher started'
     );
   }
 
