@@ -131,7 +131,7 @@ Walks a target directory, stores the metadata and (optionally) UTF-8 content for
 | `maxFileSizeBytes` | `number` | Skip files larger than this size (default 512 KiB). |
 | `storeFileContent` | `boolean` | When `false`, only metadata is stored; content is omitted. |
 | `contentSanitizer` | `{ module: string, exportName?: string, options?: unknown }` | Dynamically import a sanitizer to scrub or redact content before it is persisted. |
-| `embedding` | `{ enabled?: boolean, model?: string, chunkSizeTokens?: number, batchSize?: number, chunkOverlapTokens?: number }` | Configure semantic chunking/embedding (defaults use `Xenova/bge-small-en-v1.5`, 256-token chunks). |
+| `embedding` | `{ enabled?: boolean, model?: string, chunkSizeTokens?: number, batchSize?: number, chunkOverlapTokens?: number }` | Configure semantic chunking/embedding (defaults use `Xenova/bge-base-en-v1.5`, 256-token chunks). |
 | `graph` | `{ enabled?: boolean }` | Toggle structural graph extraction. Disable if you only need file metadata and embeddings. |
 | `paths` | `string[]` | Optional relative paths to re-ingest incrementally (useful for watcher-driven updates). |
 
@@ -139,7 +139,7 @@ The tool response contains both a human-readable summary and structured content 
 
 ### `semantic_search`
 
-Queries the indexed `file_chunks` table using cosine similarity between the `bge-small-en-v1.5` embeddings stored during ingestion and a user-supplied query string. Results surface the best-matching snippets along with scores and metadata.
+Queries the indexed `file_chunks` table using cosine similarity between the `bge-base-en-v1.5` embeddings stored during ingestion and a user-supplied query string. Results surface the best-matching snippets along with scores and metadata.
 
 | Argument | Type | Description |
 |----------|------|-------------|
@@ -189,7 +189,7 @@ The response echoes the resolved node and lists neighbors with edge metadata (di
 - Binary files are detected heuristically (null-byte scan) and stored without content even when `storeFileContent` is true.
 - The ingestion table keeps track of added, updated, and deleted entries so repeated runs stay fast, and unchanged files are skipped using mtime/size checks.
 - Provide a sanitizer module to strip secrets or redact sensitive payloads before they reach the index.
-- Semantic embeddings (BGE small) are computed for sanitized text chunks by default; disable or tune chunking via the `embedding` ingest option if you need to trade accuracy for speed.
+- Semantic embeddings (BGE base) are computed for sanitized text chunks by default; disable or tune chunking via the `embedding` ingest option if you need to trade accuracy for speed.
 - Structural metadata is stored in `code_graph_nodes` and `code_graph_edges` tables to power GraphRAG queries; disable via `graph.enabled = false` if you only need file/embedding data.
 - Patterns from a root `.gitignore` file are honored automatically so ignored artifacts never enter the index.
 
