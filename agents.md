@@ -37,6 +37,7 @@ This installs dependencies including `@modelcontextprotocol/sdk`, `better-sqlite
 | `npm start`          | Execute the compiled server (`dist/server.js`) with Node.       |
 | `npm run watch`      | Run the server with an incremental ingest file watcher.         |
 | `npm run lint`       | ESLint (flat config) over the workspace.                        |
+| `npm test`           | Execute the TypeScript-based test suite (`tests/run-all.ts`).   |
 | `npm run clean`      | Remove `dist/`.                                                 |
 
 `start.sh` wraps the build/start workflow so external agents don’t have to worry about the build step.
@@ -150,7 +151,7 @@ When the client connects, it receives this message:
 | `include`          | `["**/*"]`           | Glob patterns to include (fast-glob syntax). |
 | `exclude`          | Several defaults      | Includes VCS folders, `node_modules`, `dist`, and the database itself. You can pass extra patterns. |
 | `databaseName`     | `.mcp-index.sqlite`   | File created at the root. |
-| `maxFileSizeBytes` | `524288` (512 KiB)    | Larger files are skipped and logged in `skipped`. |
+| `maxFileSizeBytes` | `8388608` (8 MiB)     | Larger files are skipped and logged in `skipped`. |
 | `storeFileContent` | `true`                | If `false`, only metadata is stored. Binary detection uses a null-byte heuristic. |
 | `contentSanitizer` | `undefined`           | Optional `{ module, exportName?, options? }` descriptor that loads a sanitizer to redact or strip contents before storage. |
 | `embedding`        | defaults enabled       | Configure semantic chunking (`enabled`, `model`, `chunkSizeTokens`, `chunkOverlapTokens`, `batchSize`). |
@@ -159,7 +160,7 @@ When the client connects, it receives this message:
 
 During repeat runs the ingestor compares size + mtime against the existing database, reusing prior entries when nothing changed and skipping unnecessary file reads. A `.gitignore` located at the root is parsed automatically so ignored paths never enter the index.
 
-Relative `root` values are resolved against the caller-supplied working directory metadata (such as `_meta.cwd` or the `x-mcp-cwd` header) when available, so CLI clients can safely pass `"."` to target their active workspace. If no caller context is provided the path falls back to the server process directory.
+Relative `root` values are resolved against the caller-supplied working directory metadata (such as `_meta.cwd`), common headers (`x-mcp-cwd`, `x-mcp-root`, `x-workspace-*`), and environment overrides like `MCP_CALLER_CWD` or `MCP_WORKSPACE_ROOT` when available, so CLI clients can safely pass `"."` to target their active workspace. If no caller context is provided the path falls back to the server process directory.
 
 Embeddings default to the `Xenova/bge-small-en-v1.5` model provided by `@xenova/transformers`. The server downloads and caches the model on first use; set `embedding.model` in tool inputs if you need an alternative.
 
@@ -169,7 +170,7 @@ The tool response returns both text (a summary) and `structuredContent` matching
 
 - **Node binding error:** If the MCP server complains about missing `better_sqlite3.node`, ensure `npm install` was run with a Node version >= 18. Prebuilt binaries are available beginning with `better-sqlite3@12.x`.
 - **Index not updating:** Re-run `ingest_codebase` as soon as files are added/changed. The server reminder text emphasizes this.
-- **Repeated ingest failures after a transient embedding error:** The embedding pipeline cache in `src/embedding.ts` stores the first failed promise. If the initial model download fails (e.g., due to a network hiccup), every subsequent `ingest_codebase` call will reuse that rejected promise and fail until the process restarts. Restart the MCP server or set `{"embedding": {"enabled": false}}` on the tool call as a stopgap, then rerun ingest once connectivity is stable.
+- **Embedding pipeline hiccup:** If the initial model download fails (for example, due to a network hiccup), the server clears the cached pipeline and the next ingest or search request will trigger a fresh download. Simply re-run the command once connectivity is restored, or temporarily disable embeddings with `{"embedding": {"enabled": false}}` if you need to proceed without vectors.
 - **Large repos:** Increase `maxFileSizeBytes` or adjust `include`/`exclude` to limit scope.
 - **Manual rebuild:** `npm run build` regenerates `dist/` if `start.sh` ever reports a missing bundle.
 

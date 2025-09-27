@@ -23,6 +23,7 @@
     "node": ">=18.17"
   },
   "dependencies": {
+    "@index-mcp/native": "file:crates/index_mcp_native",
     "@modelcontextprotocol/sdk": "^1.18.2",
     "better-sqlite3": "^12.4.1",
     "chokidar": "^3.6.0",

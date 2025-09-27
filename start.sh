@@ -19,5 +19,17 @@ if [[ ! -f "$DIST_ENTRY" ]]; then
   (cd "$SCRIPT_DIR" && npm run build) >&2
 fi
 
+NATIVE_DIR="$SCRIPT_DIR/crates/index_mcp_native"
+NATIVE_BINARY="$NATIVE_DIR/index.node"
+if [[ ! -f "$NATIVE_BINARY" ]]; then
+  echo "[index-mcp] Native addon missing; provisioning @index-mcp/native..." >&2
+  if ! command -v npm >/dev/null 2>&1; then
+    echo "[index-mcp] Error: npm is not on PATH to build the native addon." >&2
+    exit 1
+  fi
+  (cd "$NATIVE_DIR" && npm install) >&2
+  (cd "$NATIVE_DIR" && npm run build) >&2
+fi
+
 echo "[index-mcp] Launching MCP server from $DIST_ENTRY" >&2
 exec "$NODE_BIN" "$DIST_ENTRY"

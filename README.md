@@ -21,6 +21,21 @@ npm run build
 
 The transpiled output is emitted to `dist/`.
 
+### Native acceleration
+
+The Rust module in `crates/index_mcp_native` now powers every ingest run. It parallelizes the filesystem walk, hashing, and text chunking steps. The JavaScript fallback has been removed, so the native addon must be available before the server starts.
+
+1. Install Rust (`rustup`) and the [`@napi-rs/cli`](https://github.com/napi-rs/napi-rs/tree/main/cli) helper.
+2. Build the native addon:
+
+   ```bash
+   cd crates/index_mcp_native
+   npm install
+   npm run build
+   ```
+
+3. Restart the MCP server. On startup `ingest_codebase` attempts to load the native scanner and will throw if the addon cannot be initialized. Rebuild the crate if you see a load error.
+
 ## Develop
 
 Use the `dev` script to run the TypeScript entrypoint directly while iterating:
@@ -177,6 +192,10 @@ The response echoes the resolved node and lists neighbors with edge metadata (di
 - Semantic embeddings (BGE small) are computed for sanitized text chunks by default; disable or tune chunking via the `embedding` ingest option if you need to trade accuracy for speed.
 - Structural metadata is stored in `code_graph_nodes` and `code_graph_edges` tables to power GraphRAG queries; disable via `graph.enabled = false` if you only need file/embedding data.
 - Patterns from a root `.gitignore` file are honored automatically so ignored artifacts never enter the index.
+
+## Accelerating with Rust
+
+Large repositories can overwhelm the single-threaded ingestion pipeline. See [docs/rust-acceleration.md](docs/rust-acceleration.md) for a roadmap that introduces a `napi-rs` native module to parallelize filesystem crawling, chunking, and graph extraction while keeping the existing JavaScript fallback path intact. The plan covers crate layout, runtime feature flags, and CI packaging so the Rust acceleration can ship incrementally.
 
 ## Troubleshooting
 

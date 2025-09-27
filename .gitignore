@@ -1,4 +1,15 @@
 node_modules/
+**/node_modules/
 dist/
 .DS_Store
 *.log
+
+# Local SQLite indexes
+.mcp-index.sqlite
+.mcp-index.sqlite-*
+*.sqlite
+
+# Native addon build outputs
+crates/index_mcp_native/target/
+crates/index_mcp_native/index.node
+crates/index_mcp_native/index.*.node

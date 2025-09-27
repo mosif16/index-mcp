@@ -1,7 +1,5 @@
 import Database from 'better-sqlite3';
 import type { Database as DatabaseInstance } from 'better-sqlite3';
-import fg from 'fast-glob';
-import ignore, { type Ignore } from 'ignore';
 import { createReadStream, promises as fs } from 'node:fs';
 import crypto from 'node:crypto';
 import path from 'node:path';
@@ -11,6 +9,8 @@ import { StringDecoder } from 'node:string_decoder';
 import { embedTexts, float32ArrayToBuffer, getDefaultEmbeddingModel } from './embedding.js';
 import { extractGraphMetadata, type GraphExtractionResult } from './graph.js';
 import { DEFAULT_DB_FILENAME, DEFAULT_INCLUDE_GLOBS, DEFAULT_EXCLUDE_GLOBS } from './constants.js';
+import { loadNativeModule } from './native/index.js';
+import type { NativeFileEntry, NativeScanResult } from './types/native.js';
 const DEFAULT_MAX_FILE_SIZE_BYTES = 8 * 1024 * 1024; // 8 MiB
 
 const STREAM_READER_HIGH_WATER_MARK = 256 * 1024; // 256 KiB
@@ -279,119 +279,6 @@ async function loadSanitizer(root: string, spec?: ContentSanitizerSpec): Promise
   };
 }
 
-interface GitIgnoreFilter {
-  ignores(path: string): boolean;
-}
-
-async function loadIgnoreFile(filePath: string): Promise<Ignore | null> {
-  try {
-    const contents = await fs.readFile(filePath, 'utf8');
-    if (!contents.trim()) {
-      return null;
-    }
-
-    return ignore().add(contents);
-  } catch (error) {
-    if ((error as { code?: string }).code === 'ENOENT') {
-      return null;
-    }
-
-    throw error;
-  }
-}
-
-async function createGitIgnoreFilter(root: string, excludeGlobs: string[]): Promise<GitIgnoreFilter | null> {
-  const baseMatchers: Ignore[] = [];
-  const rootIgnore = await loadIgnoreFile(path.join(root, '.gitignore'));
-  if (rootIgnore) {
-    baseMatchers.push(rootIgnore);
-  }
-
-  const gitInfoExclude = await loadIgnoreFile(path.join(root, '.git', 'info', 'exclude'));
-  if (gitInfoExclude) {
-    baseMatchers.push(gitInfoExclude);
-  }
-
-  const nestedGitIgnorePaths = await fg('**/.gitignore', {
-    cwd: root,
-    dot: true,
-    ignore: excludeGlobs,
-    onlyFiles: true,
-    followSymbolicLinks: false,
-    unique: true
-  });
-
-  const nestedMatchers = new Map<string, Ignore>();
-
-  for (const relativePath of nestedGitIgnorePaths) {
-    const normalized = toPosixPath(relativePath);
-    if (normalized === '.gitignore') {
-      continue;
-    }
-
-    const absolutePath = path.join(root, relativePath);
-    const matcher = await loadIgnoreFile(absolutePath);
-    if (!matcher) {
-      continue;
-    }
-
-    const directory = toPosixPath(path.posix.dirname(normalized));
-    const directoryKey = directory === '.' ? '' : directory;
-    nestedMatchers.set(directoryKey, matcher);
-  }
-
-  if (baseMatchers.length === 0 && nestedMatchers.size === 0) {
-    return null;
-  }
-
-  return {
-    ignores(targetPath: string): boolean {
-      const normalizedPath = toPosixPath(targetPath);
-      if (!normalizedPath) {
-        return false;
-      }
-
-      let ignored = false;
-
-      for (const matcher of baseMatchers) {
-        const result = matcher.test(normalizedPath);
-        if (result.ignored) {
-          ignored = true;
-        }
-        if (result.unignored) {
-          ignored = false;
-        }
-      }
-
-      if (nestedMatchers.size === 0) {
-        return ignored;
-      }
-
-      const segments = normalizedPath.split('/');
-      const directorySegments = segments.slice(0, Math.max(segments.length - 1, 0));
-
-      for (let depth = 0; depth <= directorySegments.length; depth += 1) {
-        const directoryKey = directorySegments.slice(0, depth).join('/');
-        const matcher = nestedMatchers.get(directoryKey);
-        if (!matcher) {
-          continue;
-        }
-
-        const relativeRemainder = segments.slice(depth).join('/');
-        const result = matcher.test(relativeRemainder);
-        if (result.ignored) {
-          ignored = true;
-        }
-        if (result.unignored) {
-          ignored = false;
-        }
-      }
-
-      return ignored;
-    }
-  };
-}
-
 function chunkText(content: string, chunkSizeTokens: number, overlapTokens: number): string[] {
   const sanitized = content.trim();
   if (!sanitized) {
@@ -444,6 +331,150 @@ function resolveGraphDefaults(options?: GraphOptions) {
   return {
     enabled: options?.enabled ?? true
   };
+}
+
+type EmbeddingConfig = ReturnType<typeof resolveEmbeddingDefaults>;
+type GraphConfig = ReturnType<typeof resolveGraphDefaults>;
+
+interface ProcessNativeEntriesParams {
+  absoluteRoot: string;
+  nativeResult: NativeScanResult;
+  existingByPath: Map<string, FileRow>;
+  files: FileRow[];
+  seenPaths: Set<string>;
+  chunkJobs: PendingChunk[];
+  chunkRefreshPaths: Set<string>;
+  graphUpdates: Map<string, GraphExtractionResult | null>;
+  sanitizeContent: ContentSanitizer;
+  embeddingConfig: EmbeddingConfig;
+  graphConfig: GraphConfig;
+  storeFileContent: boolean;
+}
+
+async function processNativeEntries({
+  absoluteRoot,
+  nativeResult,
+  existingByPath,
+  files,
+  seenPaths,
+  chunkJobs,
+  chunkRefreshPaths,
+  graphUpdates,
+  sanitizeContent,
+  embeddingConfig,
+  graphConfig,
+  storeFileContent
+}: ProcessNativeEntriesParams): Promise<void> {
+  for (const entry of nativeResult.files) {
+    await processNativeEntry({
+      absoluteRoot,
+      entry,
+      existingByPath,
+      files,
+      seenPaths,
+      chunkJobs,
+      chunkRefreshPaths,
+      graphUpdates,
+      sanitizeContent,
+      embeddingConfig,
+      graphConfig,
+      storeFileContent
+    });
+  }
+}
+
+interface ProcessNativeEntryParams {
+  absoluteRoot: string;
+  entry: NativeFileEntry;
+  existingByPath: Map<string, FileRow>;
+  files: FileRow[];
+  seenPaths: Set<string>;
+  chunkJobs: PendingChunk[];
+  chunkRefreshPaths: Set<string>;
+  graphUpdates: Map<string, GraphExtractionResult | null>;
+  sanitizeContent: ContentSanitizer;
+  embeddingConfig: EmbeddingConfig;
+  graphConfig: GraphConfig;
+  storeFileContent: boolean;
+}
+
+async function processNativeEntry({
+  absoluteRoot,
+  entry,
+  existingByPath,
+  files,
+  seenPaths,
+  chunkJobs,
+  chunkRefreshPaths,
+  graphUpdates,
+  sanitizeContent,
+  embeddingConfig,
+  graphConfig,
+  storeFileContent
+}: ProcessNativeEntryParams): Promise<void> {
+  const normalizedPath = toPosixPath(entry.path);
+  const absolutePath = path.join(absoluteRoot, normalizedPath);
+  const existing = existingByPath.get(normalizedPath);
+
+  if (existing && existing.size === entry.size && existing.modified === entry.modified) {
+    seenPaths.add(normalizedPath);
+    files.push({
+      path: normalizedPath,
+      size: existing.size,
+      modified: existing.modified,
+      hash: existing.hash,
+      lastIndexedAt: Date.now(),
+      content: storeFileContent ? existing.content : null
+    });
+    return;
+  }
+
+  let content: string | null = null;
+  if (!entry.isBinary && entry.content !== null) {
+    content = await sanitizeContent({
+      path: normalizedPath,
+      absolutePath,
+      root: absoluteRoot,
+      content: entry.content
+    });
+  }
+
+  seenPaths.add(normalizedPath);
+  chunkRefreshPaths.add(normalizedPath);
+
+  if (embeddingConfig.enabled && content) {
+    const trimmedContent = content.trim();
+    if (trimmedContent) {
+      const chunks = chunkText(trimmedContent, embeddingConfig.chunkSizeTokens, embeddingConfig.chunkOverlapTokens);
+      const targetChunks = chunks.length > 0 ? chunks : [trimmedContent];
+      targetChunks.forEach((chunkContent, index) => {
+        if (!chunkContent.trim()) {
+          return;
+        }
+        chunkJobs.push({
+          id: crypto.randomUUID(),
+          path: normalizedPath,
+          chunkIndex: index,
+          content: chunkContent,
+          model: embeddingConfig.model
+        });
+      });
+    }
+  }
+
+  files.push({
+    path: normalizedPath,
+    size: entry.size,
+    modified: entry.modified,
+    hash: entry.hash,
+    lastIndexedAt: Date.now(),
+    content: storeFileContent ? content : null
+  });
+
+  if (graphConfig.enabled) {
+    const graphResult = content ? extractGraphMetadata(normalizedPath, content) : null;
+    graphUpdates.set(normalizedPath, graphResult);
+  }
 }
 
 function normalizeTargetPaths(root: string, paths?: string[]): string[] {
@@ -514,24 +545,31 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
     ensureSchema(db);
 
     const sanitizeContent = await loadSanitizer(absoluteRoot, options.contentSanitizer);
-    const gitIgnore = await createGitIgnoreFilter(absoluteRoot, excludeGlobs);
 
     const existingRows = db
       .prepare('SELECT path, size, modified, hash, last_indexed_at as lastIndexedAt, content FROM files')
       .all() as FileRow[];
     const existingByPath = new Map<string, FileRow>(existingRows.map((row) => [row.path, row]));
 
-    const matches = await fg(searchPatterns, {
-      cwd: absoluteRoot,
-      dot: false,
-      ignore: excludeGlobs,
-      onlyFiles: true,
-      followSymbolicLinks: false,
-      unique: true
-    });
+    const needsTextContent = storeFileContent || embeddingConfig.enabled || graphConfig.enabled;
+    const nativeModule = await loadNativeModule();
+    let nativeResult: NativeScanResult;
+
+    try {
+      nativeResult = await nativeModule.scanRepo({
+        root: absoluteRoot,
+        include: searchPatterns,
+        exclude: excludeGlobs,
+        maxFileSizeBytes: maxFileSizeBytes,
+        needsContent: needsTextContent
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`[index-mcp] Native scan failed: ${message}`);
+    }
 
     const files: FileRow[] = [];
-    const skipped: SkippedFile[] = [];
+    const skipped: SkippedFile[] = nativeResult.skipped.map((entry) => ({ ...entry }));
     const seenPaths = new Set<string>();
     const chunkJobs: PendingChunk[] = [];
     const chunkRefreshPaths = new Set<string>();
@@ -541,117 +579,20 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
       ? new Set<string>(targetPaths.filter((p) => existingByPath.has(p)))
       : new Set<string>(existingByPath.keys());
 
-    for (const relativePath of matches) {
-      const normalizedPath = toPosixPath(relativePath);
-
-      if (gitIgnore?.ignores(normalizedPath)) {
-        continue;
-      }
-
-      const absPath = path.join(absoluteRoot, relativePath);
-      let stats;
-      try {
-        stats = await fs.stat(absPath);
-      } catch (error) {
-        if ((error as { code?: string }).code === 'ENOENT') {
-          continue;
-        }
-        skipped.push({
-          path: normalizedPath,
-          reason: 'read-error',
-          message: error instanceof Error ? error.message : 'Unknown error'
-        });
-        continue;
-      }
-
-      if (stats.size > maxFileSizeBytes) {
-        skipped.push({
-          path: normalizedPath,
-          reason: 'file-too-large',
-          size: stats.size
-        });
-        continue;
-      }
-
-      const normalizedMtime = Math.floor(stats.mtimeMs);
-      const existing = existingByPath.get(normalizedPath);
-
-      if (existing && existing.size === stats.size && existing.modified === normalizedMtime) {
-        seenPaths.add(normalizedPath);
-        files.push({
-          path: normalizedPath,
-          size: existing.size,
-          modified: existing.modified,
-          hash: existing.hash,
-          lastIndexedAt: Date.now(),
-          content: storeFileContent ? existing.content : null
-        });
-        continue;
-      }
-
-      const needsTextContent = storeFileContent || embeddingConfig.enabled || graphConfig.enabled;
-      let fileData: ReadFileResult;
-      try {
-        fileData = await readFileContentAndHash(absPath, needsTextContent);
-      } catch (error) {
-        skipped.push({
-          path: normalizedPath,
-          reason: 'read-error',
-          size: stats.size,
-          message: error instanceof Error ? error.message : 'Unknown error'
-        });
-        continue;
-      }
-
-      let content: string | null = null;
-      if (!fileData.isBinary && fileData.content !== null) {
-        content = await sanitizeContent({
-          path: normalizedPath,
-          absolutePath: absPath,
-          root: absoluteRoot,
-          content: fileData.content
-        });
-      }
-
-      const hash = fileData.hash;
-
-      seenPaths.add(normalizedPath);
-      chunkRefreshPaths.add(normalizedPath);
-
-      if (embeddingConfig.enabled && content) {
-        const trimmedContent = content.trim();
-        if (trimmedContent) {
-          const chunks = chunkText(trimmedContent, embeddingConfig.chunkSizeTokens, embeddingConfig.chunkOverlapTokens);
-          const targetChunks = chunks.length > 0 ? chunks : [trimmedContent];
-          targetChunks.forEach((chunkContent, index) => {
-            if (!chunkContent.trim()) {
-              return;
-            }
-            chunkJobs.push({
-              id: crypto.randomUUID(),
-              path: normalizedPath,
-              chunkIndex: index,
-              content: chunkContent,
-              model: embeddingConfig.model
-            });
-          });
-        }
-      }
-
-      files.push({
-        path: normalizedPath,
-        size: stats.size,
-        modified: normalizedMtime,
-        hash,
-        lastIndexedAt: Date.now(),
-        content: storeFileContent ? content : null
-      });
-
-      if (graphConfig.enabled) {
-        const graphResult = content ? extractGraphMetadata(normalizedPath, content) : null;
-        graphUpdates.set(normalizedPath, graphResult);
-      }
-    }
+    await processNativeEntries({
+      absoluteRoot,
+      nativeResult,
+      existingByPath,
+      files,
+      seenPaths,
+      chunkJobs,
+      chunkRefreshPaths,
+      graphUpdates,
+      sanitizeContent,
+      embeddingConfig,
+      graphConfig,
+      storeFileContent
+    });
 
     const deletedPaths = usingTargetPaths
       ? targetPaths.filter((p) => !seenPaths.has(p) && existingByPath.has(p))

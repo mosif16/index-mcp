@@ -1,0 +1,290 @@
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use ignore::{Error as IgnoreError, WalkBuilder};
+use napi::bindgen_prelude::*;
+use napi::Result;
+use napi_derive::napi;
+use rayon::prelude::*;
+use sha2::{Digest, Sha256};
+
+#[napi(object)]
+pub struct ScanOptions {
+    pub root: String,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub max_file_size_bytes: Option<f64>,
+    pub needs_content: bool,
+}
+
+#[napi(object)]
+pub struct NativeFileEntry {
+    pub path: String,
+    pub size: f64,
+    pub modified: f64,
+    pub hash: String,
+    pub content: Option<String>,
+    pub is_binary: bool,
+}
+
+#[napi(object)]
+pub struct NativeSkippedFile {
+    pub path: String,
+    pub reason: String,
+    pub size: Option<f64>,
+    pub message: Option<String>,
+}
+
+#[napi(object)]
+pub struct NativeScanResult {
+    pub files: Vec<NativeFileEntry>,
+    pub skipped: Vec<NativeSkippedFile>,
+}
+
+struct ScanJob {
+    relative_path: String,
+}
+
+enum ScanOutcome {
+    File(NativeFileEntry),
+    Skipped(NativeSkippedFile),
+}
+
+#[napi]
+pub fn scan_repo(options: ScanOptions) -> Result<NativeScanResult> {
+    let root_path = PathBuf::from(&options.root);
+    if !root_path.is_dir() {
+        return Err(Error::from_reason(format!(
+            "scan_repo root must be a directory: {}",
+            options.root
+        )));
+    }
+
+    let include_globset = build_globset(&options.include)?;
+    let exclude_globset = build_globset(&options.exclude)?;
+
+    let mut jobs: Vec<ScanJob> = Vec::new();
+    let mut skipped: Vec<NativeSkippedFile> = Vec::new();
+    let mut seen_paths: HashSet<String> = HashSet::new();
+
+    for result in WalkBuilder::new(&root_path)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .require_git(false)
+        .standard_filters(true)
+        .build()
+    {
+        let entry = match result {
+            Ok(entry) => entry,
+            Err(err) => {
+                let path = extract_error_path(&err)
+                    .and_then(|p| to_relative_posix(&root_path, p))
+                    .unwrap_or_else(|| String::from("."));
+                skipped.push(NativeSkippedFile {
+                    path,
+                    reason: "read-error".to_string(),
+                    size: None,
+                    message: Some(err.to_string()),
+                });
+                continue;
+            }
+        };
+
+        if entry.depth() == 0 {
+            continue;
+        }
+
+        if let Some(file_type) = entry.file_type() {
+            if !file_type.is_file() {
+                continue;
+            }
+        } else {
+            continue;
+        }
+
+        if let Some(relative) = to_relative_posix(&root_path, entry.path()) {
+            if seen_paths.contains(&relative) {
+                continue;
+            }
+
+            if let Some(exclude) = &exclude_globset {
+                if exclude.is_match(&relative) {
+                    continue;
+                }
+            }
+
+            if let Some(include) = &include_globset {
+                if !include.is_match(&relative) {
+                    continue;
+                }
+            }
+
+            seen_paths.insert(relative.clone());
+            jobs.push(ScanJob {
+                relative_path: relative,
+            });
+        }
+    }
+
+    let max_file_size = options.max_file_size_bytes.map(|value| value as u64);
+    let needs_content = options.needs_content;
+
+    let outcomes: Vec<ScanOutcome> = jobs
+        .into_par_iter()
+        .map(|job| process_file(&root_path, job, max_file_size, needs_content))
+        .collect();
+
+    let mut files: Vec<NativeFileEntry> = Vec::new();
+
+    for outcome in outcomes {
+        match outcome {
+            ScanOutcome::File(file) => files.push(file),
+            ScanOutcome::Skipped(file) => skipped.push(file),
+        }
+    }
+
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(NativeScanResult { files, skipped })
+}
+
+fn process_file(
+    root: &Path,
+    job: ScanJob,
+    max_file_size: Option<u64>,
+    needs_content: bool,
+) -> ScanOutcome {
+    let absolute_path = root.join(&job.relative_path);
+    let metadata = match fs::metadata(&absolute_path) {
+        Ok(meta) => meta,
+        Err(err) => {
+            return ScanOutcome::Skipped(NativeSkippedFile {
+                path: job.relative_path,
+                reason: "read-error".to_string(),
+                size: None,
+                message: Some(err.to_string()),
+            });
+        }
+    };
+
+    let file_size = metadata.len();
+    if let Some(limit) = max_file_size {
+        if file_size > limit {
+            return ScanOutcome::Skipped(NativeSkippedFile {
+                path: job.relative_path,
+                reason: "file-too-large".to_string(),
+                size: Some(file_size as f64),
+                message: None,
+            });
+        }
+    }
+
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(system_time_to_millis)
+        .unwrap_or(0);
+
+    let bytes = match fs::read(&absolute_path) {
+        Ok(content) => content,
+        Err(err) => {
+            return ScanOutcome::Skipped(NativeSkippedFile {
+                path: job.relative_path,
+                reason: "read-error".to_string(),
+                size: Some(file_size as f64),
+                message: Some(err.to_string()),
+            });
+        }
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let hash = format!("{:x}", hasher.finalize());
+
+    let is_binary = bytes.iter().take(1024).any(|b| *b == 0);
+
+    let content = if needs_content && !is_binary {
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    } else {
+        None
+    };
+
+    ScanOutcome::File(NativeFileEntry {
+        path: job.relative_path,
+        size: file_size as f64,
+        modified: modified as f64,
+        hash,
+        content,
+        is_binary,
+    })
+}
+
+fn system_time_to_millis(time: SystemTime) -> Option<u64> {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as u64)
+}
+
+fn extract_error_path<'a>(error: &'a IgnoreError) -> Option<&'a Path> {
+    match error {
+        IgnoreError::Partial(errors) => errors.iter().find_map(extract_error_path),
+        IgnoreError::WithLineNumber { err, .. } => extract_error_path(err),
+        IgnoreError::WithPath { path, .. } => Some(path.as_path()),
+        IgnoreError::WithDepth { err, .. } => extract_error_path(err),
+        IgnoreError::Loop { child, .. } => Some(child.as_path()),
+        IgnoreError::Io(_) | IgnoreError::Glob { .. } | IgnoreError::UnrecognizedFileType(_) | IgnoreError::InvalidDefinition => None,
+    }
+}
+
+fn to_relative_posix(root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    let mut relative_str = relative.to_string_lossy().replace('\\', "/");
+    if relative_str.starts_with("./") {
+        relative_str = relative_str.trim_start_matches("./").to_string();
+    }
+    if relative_str.starts_with('/') {
+        relative_str = relative_str.trim_start_matches('/').to_string();
+    }
+    if relative_str.is_empty() {
+        None
+    } else {
+        Some(relative_str)
+    }
+}
+
+fn build_globset(patterns: &[String]) -> Result<Option<GlobSet>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+
+    let mut builder = GlobSetBuilder::new();
+    let mut added = false;
+    for pattern in patterns {
+        let trimmed = pattern.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = trimmed.replace('\\', "/");
+        let glob = GlobBuilder::new(&normalized)
+            .literal_separator(false)
+            .build()
+            .map_err(|err| {
+                Error::from_reason(format!("Invalid glob pattern '{}': {}", pattern, err))
+            })?;
+        builder.add(glob);
+        added = true;
+    }
+
+    if !added {
+        return Ok(None);
+    }
+
+    builder
+        .build()
+        .map(Some)
+        .map_err(|err| Error::from_reason(format!("Failed to build globset: {}", err)))
+}
