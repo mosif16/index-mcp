@@ -159,6 +159,8 @@ When the client connects, it receives this message:
 
 During repeat runs the ingestor compares size + mtime against the existing database, reusing prior entries when nothing changed and skipping unnecessary file reads. A `.gitignore` located at the root is parsed automatically so ignored paths never enter the index.
 
+Relative `root` values are resolved against the caller-supplied working directory metadata (such as `_meta.cwd` or the `x-mcp-cwd` header) when available, so CLI clients can safely pass `"."` to target their active workspace. If no caller context is provided the path falls back to the server process directory.
+
 Embeddings default to the `Xenova/bge-small-en-v1.5` model provided by `@xenova/transformers`. The server downloads and caches the model on first use; set `embedding.model` in tool inputs if you need an alternative.
 
 The tool response returns both text (a summary) and `structuredContent` matching the `ingestToolOutputShape` schema.

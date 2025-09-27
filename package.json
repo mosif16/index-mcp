@@ -17,7 +17,7 @@
     "watch": "tsx src/server.ts --watch",
     "start": "node dist/server.js",
     "lint": "eslint .",
-    "test": "tsx tests/embedding-cache.test.ts"
+    "test": "tsx tests/run-all.ts"
   },
   "engines": {
     "node": ">=18.17"

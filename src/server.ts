@@ -8,12 +8,63 @@ import { ingestCodebase } from './ingest.js';
 import { semanticSearch } from './search.js';
 import { graphNeighbors } from './graph-query.js';
 import { startIngestWatcher } from './watcher.js';
+import { resolveRootPath, type RootResolutionContext } from './root-resolver.js';
 
 function rethrowWithContext(toolName: string, error: unknown): never {
   if (error instanceof Error) {
     throw Object.assign(new Error(`${toolName} failed: ${error.message}`), { cause: error });
   }
   throw new Error(`${toolName} failed: ${String(error)}`);
+}
+
+function normalizeHeaders(headers: unknown): Record<string, string> | undefined {
+  if (!headers) {
+    return undefined;
+  }
+
+  if (typeof (headers as { forEach?: unknown }).forEach === 'function') {
+    const result: Record<string, string> = {};
+    (headers as { forEach: (callback: (value: string, key: string) => void) => void }).forEach((value, key) => {
+      result[key.toLowerCase()] = value;
+    });
+    return result;
+  }
+
+  if (typeof headers === 'object') {
+    const result: Record<string, string> = {};
+    for (const [key, value] of Object.entries(headers as Record<string, unknown>)) {
+      if (typeof value === 'string' && value) {
+        result[key.toLowerCase()] = value;
+      } else if (Array.isArray(value) && value.length > 0 && typeof value[0] === 'string') {
+        result[key.toLowerCase()] = value[0];
+      }
+    }
+    return Object.keys(result).length ? result : undefined;
+  }
+
+  return undefined;
+}
+
+function createRootResolutionContext(extra: unknown): RootResolutionContext {
+  if (!extra || typeof extra !== 'object') {
+    return {};
+  }
+
+  const meta = (extra as { _meta?: unknown })._meta;
+  const requestInfo = (extra as { requestInfo?: { headers?: unknown } }).requestInfo;
+
+  const context: RootResolutionContext = {};
+
+  if (meta && typeof meta === 'object') {
+    context.meta = meta as Record<string, unknown>;
+  }
+
+  const headers = requestInfo?.headers ? normalizeHeaders(requestInfo.headers) : undefined;
+  if (headers) {
+    context.headers = headers;
+  }
+
+  return context;
 }
 
 const ingestToolArgs = {
@@ -197,10 +248,13 @@ async function main() {
       inputSchema: ingestToolArgs,
       outputSchema: ingestToolOutputShape
     },
-    async (args) => {
+    async (args, extra) => {
       try {
         const parsedInput = ingestToolSchema.parse(args);
-        const result = ingestToolOutputSchema.parse(await ingestCodebase(parsedInput));
+        const context = createRootResolutionContext(extra);
+        const resolvedRoot = resolveRootPath(parsedInput.root, context);
+        const ingestInput = { ...parsedInput, root: resolvedRoot };
+        const result = ingestToolOutputSchema.parse(await ingestCodebase(ingestInput));
 
         return {
           content: [
@@ -226,10 +280,13 @@ async function main() {
       inputSchema: semanticSearchArgs,
       outputSchema: semanticSearchOutputShape
     },
-    async (args) => {
+    async (args, extra) => {
       try {
         const parsedInput = semanticSearchSchema.parse(args);
-        const result = semanticSearchOutputSchema.parse(await semanticSearch(parsedInput));
+        const context = createRootResolutionContext(extra);
+        const resolvedRoot = resolveRootPath(parsedInput.root, context);
+        const searchInput = { ...parsedInput, root: resolvedRoot };
+        const result = semanticSearchOutputSchema.parse(await semanticSearch(searchInput));
         const modelDescriptor = result.embeddingModel ? `model ${result.embeddingModel}` : 'stored embeddings';
         const summary = result.results.length
           ? `Semantic search scanned ${result.evaluatedChunks} chunks and returned ${result.results.length} matches (${modelDescriptor}).`
@@ -256,10 +313,13 @@ async function main() {
       inputSchema: graphNeighborArgs,
       outputSchema: graphNeighborOutputShape
     },
-    async (args) => {
+    async (args, extra) => {
       try {
         const parsedInput = graphNeighborSchema.parse(args);
-        const result = graphNeighborOutputSchema.parse(await graphNeighbors(parsedInput));
+        const context = createRootResolutionContext(extra);
+        const resolvedRoot = resolveRootPath(parsedInput.root, context);
+        const graphInput = { ...parsedInput, root: resolvedRoot };
+        const result = graphNeighborOutputSchema.parse(await graphNeighbors(graphInput));
         const neighborCount = result.neighbors.length;
         const directionDescriptor = parsedInput.direction ?? 'outgoing';
         const summary = neighborCount
