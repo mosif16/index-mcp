@@ -41,23 +41,19 @@ You can also run the TypeScript source with `npm run dev` during development.
 
 ## Codex CLI Setup
 
-Add the server to your Codex CLI agent configuration (typically `~/.config/codex/agent.json`). Adjust the absolute paths to match your environment:
+A helper script `start.sh` (at the project root) ensures the TypeScript is built before launching the server. Point your Codex CLI config at this script. Adjust the absolute paths to match your environment:
 
 ```json
 {
   "mcpServers": {
     "index-mcp": {
-      "command": "node",
-      "args": [
-        "/absolute/path/to/index-mcp/dist/server.js"
-      ],
-      "cwd": "/absolute/path/to/index-mcp"
+      "command": "/Users/mohammedsayf/Desktop/index-mcp/start.sh"
     }
   }
 }
 ```
 
-During iterative development you can swap the command for `tsx` and point at `src/server.ts` instead of the built artifact:
+During iterative development you can swap the command for `npx tsx` and point at `src/server.ts` instead of the built artifact:
 
 ```json
 {
@@ -68,13 +64,23 @@ During iterative development you can swap the command for `tsx` and point at `sr
         "tsx",
         "src/server.ts"
       ],
-      "cwd": "/absolute/path/to/index-mcp"
+      "cwd": "/Users/mohammedsayf/Desktop/index-mcp"
     }
   }
 }
 ```
 
 Restart your Codex agent after saving the configuration so it picks up the new MCP server.
+
+If you maintain your Codex CLI config in `agent.toml`, mirror the same setup with TOML syntax:
+
+```toml
+[mcp_servers.index_mcp]
+command = "/Users/mohammedsayf/Desktop/index-mcp/start.sh"
+env = { LOG_LEVEL = "INFO" }
+```
+
+The bundled `start.sh` handles building on demand and then spawns `node dist/server.js`. Adjust the paths and environment variables for your machine.
 
 
 ## Exposed tools
