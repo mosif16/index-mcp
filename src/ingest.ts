@@ -223,10 +223,13 @@ async function loadSanitizer(root: string, spec?: ContentSanitizerSpec): Promise
   };
 }
 
-async function loadGitIgnore(root: string): Promise<Ignore | null> {
-  const gitignorePath = path.join(root, '.gitignore');
+interface GitIgnoreFilter {
+  ignores(path: string): boolean;
+}
+
+async function loadIgnoreFile(filePath: string): Promise<Ignore | null> {
   try {
-    const contents = await fs.readFile(gitignorePath, 'utf8');
+    const contents = await fs.readFile(filePath, 'utf8');
     if (!contents.trim()) {
       return null;
     }
@@ -239,6 +242,98 @@ async function loadGitIgnore(root: string): Promise<Ignore | null> {
 
     throw error;
   }
+}
+
+async function createGitIgnoreFilter(root: string, excludeGlobs: string[]): Promise<GitIgnoreFilter | null> {
+  const baseMatchers: Ignore[] = [];
+  const rootIgnore = await loadIgnoreFile(path.join(root, '.gitignore'));
+  if (rootIgnore) {
+    baseMatchers.push(rootIgnore);
+  }
+
+  const gitInfoExclude = await loadIgnoreFile(path.join(root, '.git', 'info', 'exclude'));
+  if (gitInfoExclude) {
+    baseMatchers.push(gitInfoExclude);
+  }
+
+  const nestedGitIgnorePaths = await fg('**/.gitignore', {
+    cwd: root,
+    dot: true,
+    ignore: excludeGlobs,
+    onlyFiles: true,
+    followSymbolicLinks: false,
+    unique: true
+  });
+
+  const nestedMatchers = new Map<string, Ignore>();
+
+  for (const relativePath of nestedGitIgnorePaths) {
+    const normalized = toPosixPath(relativePath);
+    if (normalized === '.gitignore') {
+      continue;
+    }
+
+    const absolutePath = path.join(root, relativePath);
+    const matcher = await loadIgnoreFile(absolutePath);
+    if (!matcher) {
+      continue;
+    }
+
+    const directory = toPosixPath(path.posix.dirname(normalized));
+    const directoryKey = directory === '.' ? '' : directory;
+    nestedMatchers.set(directoryKey, matcher);
+  }
+
+  if (baseMatchers.length === 0 && nestedMatchers.size === 0) {
+    return null;
+  }
+
+  return {
+    ignores(targetPath: string): boolean {
+      const normalizedPath = toPosixPath(targetPath);
+      if (!normalizedPath) {
+        return false;
+      }
+
+      let ignored = false;
+
+      for (const matcher of baseMatchers) {
+        const result = matcher.test(normalizedPath);
+        if (result.ignored) {
+          ignored = true;
+        }
+        if (result.unignored) {
+          ignored = false;
+        }
+      }
+
+      if (nestedMatchers.size === 0) {
+        return ignored;
+      }
+
+      const segments = normalizedPath.split('/');
+      const directorySegments = segments.slice(0, Math.max(segments.length - 1, 0));
+
+      for (let depth = 0; depth <= directorySegments.length; depth += 1) {
+        const directoryKey = directorySegments.slice(0, depth).join('/');
+        const matcher = nestedMatchers.get(directoryKey);
+        if (!matcher) {
+          continue;
+        }
+
+        const relativeRemainder = segments.slice(depth).join('/');
+        const result = matcher.test(relativeRemainder);
+        if (result.ignored) {
+          ignored = true;
+        }
+        if (result.unignored) {
+          ignored = false;
+        }
+      }
+
+      return ignored;
+    }
+  };
 }
 
 function chunkText(content: string, chunkSizeTokens: number, overlapTokens: number): string[] {
@@ -336,7 +431,9 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
     new Set([
       ...DEFAULT_EXCLUDE_GLOBS,
       ...(options.exclude ?? []),
-      `**/${databaseName}`
+      `**/${databaseName}`,
+      `**/${databaseName}-wal`,
+      `**/${databaseName}-shm`
     ])
   );
   const maxFileSizeBytes = options.maxFileSizeBytes ?? DEFAULT_MAX_FILE_SIZE_BYTES;
@@ -361,7 +458,7 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
     ensureSchema(db);
 
     const sanitizeContent = await loadSanitizer(absoluteRoot, options.contentSanitizer);
-    const gitIgnore = await loadGitIgnore(absoluteRoot);
+    const gitIgnore = await createGitIgnoreFilter(absoluteRoot, excludeGlobs);
 
     const existingRows = db
       .prepare('SELECT path, size, modified, hash, last_indexed_at as lastIndexedAt, content FROM files')
