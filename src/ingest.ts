@@ -1,10 +1,9 @@
 import Database from 'better-sqlite3';
 import type { Database as DatabaseInstance } from 'better-sqlite3';
-import { createReadStream, promises as fs } from 'node:fs';
+import { promises as fs } from 'node:fs';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { StringDecoder } from 'node:string_decoder';
 
 import { embedTexts, float32ArrayToBuffer, getDefaultEmbeddingModel } from './embedding.js';
 import { extractGraphMetadata, type GraphExtractionResult } from './graph.js';
@@ -12,8 +11,6 @@ import { DEFAULT_DB_FILENAME, DEFAULT_INCLUDE_GLOBS, DEFAULT_EXCLUDE_GLOBS } fro
 import { loadNativeModule } from './native/index.js';
 import type { NativeFileEntry, NativeScanResult } from './types/native.js';
 const DEFAULT_MAX_FILE_SIZE_BYTES = 8 * 1024 * 1024; // 8 MiB
-
-const STREAM_READER_HIGH_WATER_MARK = 256 * 1024; // 256 KiB
 
 const DEFAULT_CHUNK_SIZE_TOKENS = 256;
 const DEFAULT_CHUNK_OVERLAP_TOKENS = 32;
@@ -100,74 +97,25 @@ interface PendingChunk {
   chunkIndex: number;
   content: string;
   model: string;
+  byteStart: number | null;
+  byteEnd: number | null;
+  lineStart: number | null;
+  lineEnd: number | null;
   embedding?: Buffer;
+}
+
+interface ChunkFragment {
+  content: string;
+  start: number;
+  end: number;
+  byteStart: number;
+  byteEnd: number;
+  lineStart: number;
+  lineEnd: number;
 }
 
 function toPosixPath(relativePath: string): string {
   return relativePath.split(path.sep).join('/');
-}
-
-function bufferContainsNullByte(buffer: Buffer): boolean {
-  const lengthToCheck = Math.min(buffer.length, 1024);
-  for (let i = 0; i < lengthToCheck; i += 1) {
-    if (buffer[i] === 0) {
-      return true;
-    }
-  }
-  return false;
-}
-
-interface ReadFileResult {
-  hash: string;
-  content: string | null;
-  isBinary: boolean;
-}
-
-async function readFileContentAndHash(absPath: string, needsContent: boolean): Promise<ReadFileResult> {
-  const hash = crypto.createHash('sha256');
-  const stream = createReadStream(absPath, { highWaterMark: STREAM_READER_HIGH_WATER_MARK });
-  const decoder = needsContent ? new StringDecoder('utf8') : null;
-
-  let collectedText = '';
-  let collecting = needsContent;
-  let isBinary = false;
-
-  try {
-    for await (const chunk of stream) {
-      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      hash.update(buffer);
-
-      if (!collecting) {
-        continue;
-      }
-
-      if (bufferContainsNullByte(buffer)) {
-        isBinary = true;
-        collecting = false;
-        collectedText = '';
-        continue;
-      }
-
-      collectedText += decoder!.write(buffer);
-    }
-
-    if (collecting) {
-      collectedText += decoder!.end();
-    } else if (decoder) {
-      decoder.end();
-    }
-  } finally {
-    stream.destroy();
-  }
-
-  const hashHex = hash.digest('hex');
-  const content = !isBinary && needsContent ? collectedText : null;
-
-  return {
-    hash: hashHex,
-    content,
-    isBinary
-  };
 }
 
 function ensureSchema(db: DatabaseInstance) {
@@ -189,6 +137,10 @@ function ensureSchema(db: DatabaseInstance) {
       content TEXT NOT NULL,
       embedding BLOB NOT NULL,
       embedding_model TEXT NOT NULL,
+      byte_start INTEGER,
+      byte_end INTEGER,
+      line_start INTEGER,
+      line_end INTEGER,
       FOREIGN KEY (path) REFERENCES files(path) ON DELETE CASCADE
     );
     CREATE TABLE IF NOT EXISTS ingestions (
@@ -228,6 +180,26 @@ function ensureSchema(db: DatabaseInstance) {
     CREATE INDEX IF NOT EXISTS code_graph_edges_source_idx ON code_graph_edges(source_id);
     CREATE INDEX IF NOT EXISTS code_graph_edges_target_idx ON code_graph_edges(target_id);
   `);
+
+  ensureFileChunkMetadataColumns(db);
+}
+
+function ensureFileChunkMetadataColumns(db: DatabaseInstance): void {
+  const columns = db.prepare("PRAGMA table_info('file_chunks')").all() as { name: string }[];
+  const columnNames = new Set(columns.map((column) => column.name));
+
+  const migrations: Array<{ name: string; statement: string }> = [
+    { name: 'byte_start', statement: 'ALTER TABLE file_chunks ADD COLUMN byte_start INTEGER' },
+    { name: 'byte_end', statement: 'ALTER TABLE file_chunks ADD COLUMN byte_end INTEGER' },
+    { name: 'line_start', statement: 'ALTER TABLE file_chunks ADD COLUMN line_start INTEGER' },
+    { name: 'line_end', statement: 'ALTER TABLE file_chunks ADD COLUMN line_end INTEGER' }
+  ];
+
+  for (const migration of migrations) {
+    if (!columnNames.has(migration.name)) {
+      db.prepare(migration.statement).run();
+    }
+  }
 }
 
 function toModuleSpecifier(root: string, specifier: string): string {
@@ -279,7 +251,60 @@ async function loadSanitizer(root: string, spec?: ContentSanitizerSpec): Promise
   };
 }
 
-function chunkText(content: string, chunkSizeTokens: number, overlapTokens: number): string[] {
+function computeLineStarts(text: string): number[] {
+  if (!text) {
+    return [0];
+  }
+
+  const lineStarts = [0];
+  for (let i = 0; i < text.length; i += 1) {
+    if (text.charCodeAt(i) === 10 /* \n */) {
+      lineStarts.push(i + 1);
+    }
+  }
+  return lineStarts;
+}
+
+function findLineNumber(lineStarts: number[], index: number): number {
+  if (lineStarts.length === 0) {
+    return 1;
+  }
+
+  let low = 0;
+  let high = lineStarts.length - 1;
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const value = lineStarts[mid];
+    if (value <= index) {
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  return Math.max(1, high + 1);
+}
+
+function createByteOffsetCalculator(text: string): (index: number) => number {
+  const cache = new Map<number, number>();
+  cache.set(0, 0);
+
+  return (index: number) => {
+    if (index <= 0) {
+      return 0;
+    }
+    const cached = cache.get(index);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const value = Buffer.byteLength(text.slice(0, index), 'utf8');
+    cache.set(index, value);
+    return value;
+  };
+}
+
+function chunkText(content: string, chunkSizeTokens: number, overlapTokens: number): ChunkFragment[] {
   const sanitized = content.trim();
   if (!sanitized) {
     return [];
@@ -287,7 +312,10 @@ function chunkText(content: string, chunkSizeTokens: number, overlapTokens: numb
 
   const maxChars = Math.max(256, chunkSizeTokens * 4);
   const overlapChars = Math.max(0, overlapTokens * 4);
-  const chunks: string[] = [];
+  const fragments: ChunkFragment[] = [];
+
+  const lineStarts = computeLineStarts(sanitized);
+  const byteOffsetFor = createByteOffsetCalculator(sanitized);
 
   let start = 0;
   while (start < sanitized.length) {
@@ -300,20 +328,69 @@ function chunkText(content: string, chunkSizeTokens: number, overlapTokens: numb
       }
     }
 
-    const snippet = sanitized.slice(start, end).trimEnd();
-    if (snippet) {
-      chunks.push(snippet);
+    const rawSlice = sanitized.slice(start, end);
+    const snippet = rawSlice.trimEnd();
+    if (!snippet) {
+      if (end <= start) {
+        break;
+      }
+      start = end;
+      continue;
     }
 
-    if (end >= sanitized.length) {
+    const effectiveEnd = start + snippet.length;
+    const byteStart = byteOffsetFor(start);
+    const byteEnd = byteOffsetFor(effectiveEnd);
+    const lineStart = findLineNumber(lineStarts, start);
+    const lineEnd = findLineNumber(lineStarts, Math.max(effectiveEnd - 1, start));
+
+    fragments.push({
+      content: snippet,
+      start,
+      end: effectiveEnd,
+      byteStart,
+      byteEnd,
+      lineStart,
+      lineEnd
+    });
+
+    if (effectiveEnd >= sanitized.length) {
       break;
     }
 
-    const nextStart = end - overlapChars;
-    start = nextStart > start ? nextStart : end;
+    const overlapStart = Math.max(effectiveEnd - overlapChars, 0);
+    start = overlapStart > start ? overlapStart : effectiveEnd;
   }
 
-  return chunks;
+  return fragments;
+}
+
+function createFallbackFragment(content: string): ChunkFragment {
+  const snippet = content.trim();
+  if (!snippet) {
+    return {
+      content: '',
+      start: 0,
+      end: 0,
+      byteStart: 0,
+      byteEnd: 0,
+      lineStart: 1,
+      lineEnd: 1
+    };
+  }
+
+  const byteLength = Buffer.byteLength(snippet, 'utf8');
+  const lineCount = snippet.split('\n').length;
+
+  return {
+    content: snippet,
+    start: 0,
+    end: snippet.length,
+    byteStart: 0,
+    byteEnd: byteLength,
+    lineStart: 1,
+    lineEnd: lineCount
+  };
 }
 
 function resolveEmbeddingDefaults(options?: EmbeddingOptions) {
@@ -445,18 +522,26 @@ async function processNativeEntry({
   if (embeddingConfig.enabled && content) {
     const trimmedContent = content.trim();
     if (trimmedContent) {
-      const chunks = chunkText(trimmedContent, embeddingConfig.chunkSizeTokens, embeddingConfig.chunkOverlapTokens);
-      const targetChunks = chunks.length > 0 ? chunks : [trimmedContent];
-      targetChunks.forEach((chunkContent, index) => {
-        if (!chunkContent.trim()) {
+      const fragments = chunkText(
+        trimmedContent,
+        embeddingConfig.chunkSizeTokens,
+        embeddingConfig.chunkOverlapTokens
+      );
+      const targetFragments = fragments.length > 0 ? fragments : [createFallbackFragment(trimmedContent)];
+      targetFragments.forEach((fragment, index) => {
+        if (!fragment.content) {
           return;
         }
         chunkJobs.push({
           id: crypto.randomUUID(),
           path: normalizedPath,
           chunkIndex: index,
-          content: chunkContent,
-          model: embeddingConfig.model
+          content: fragment.content,
+          model: embeddingConfig.model,
+          byteStart: fragment.byteStart,
+          byteEnd: fragment.byteEnd,
+          lineStart: fragment.lineStart,
+          lineEnd: fragment.lineEnd
         });
       });
     }
@@ -638,8 +723,8 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
     const deleteStmt = db.prepare('DELETE FROM files WHERE path = ?');
     const deleteChunksStmt = db.prepare('DELETE FROM file_chunks WHERE path = ?');
     const insertChunkStmt = db.prepare(
-      `INSERT INTO file_chunks (id, path, chunk_index, content, embedding, embedding_model)
-       VALUES (@id, @path, @chunkIndex, @content, @embedding, @model)`
+      `INSERT INTO file_chunks (id, path, chunk_index, content, embedding, embedding_model, byte_start, byte_end, line_start, line_end)
+       VALUES (@id, @path, @chunkIndex, @content, @embedding, @model, @byteStart, @byteEnd, @lineStart, @lineEnd)`
     );
     const deleteGraphNodesStmt = db.prepare('DELETE FROM code_graph_nodes WHERE path = ?');
     const insertGraphNodeStmt = db.prepare(
@@ -695,7 +780,11 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
           chunkIndex: chunk.chunkIndex,
           content: chunk.content,
           embedding: chunk.embedding,
-          model: chunk.model
+          model: chunk.model,
+          byteStart: chunk.byteStart ?? null,
+          byteEnd: chunk.byteEnd ?? null,
+          lineStart: chunk.lineStart ?? null,
+          lineEnd: chunk.lineEnd ?? null
         });
       }
       if (graphConfig.enabled) {

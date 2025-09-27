@@ -134,7 +134,13 @@ const semanticSearchMatchSchema = z.object({
   chunkIndex: z.number().int(),
   score: z.number(),
   content: z.string(),
-  embeddingModel: z.string()
+  embeddingModel: z.string(),
+  byteStart: z.number().int().nullable(),
+  byteEnd: z.number().int().nullable(),
+  lineStart: z.number().int().nullable(),
+  lineEnd: z.number().int().nullable(),
+  contextBefore: z.string().nullable(),
+  contextAfter: z.string().nullable()
 });
 const semanticSearchOutputShape = {
   databasePath: z.string(),
@@ -186,11 +192,11 @@ const graphNeighborOutputShape = {
 const graphNeighborOutputSchema = z.object(graphNeighborOutputShape);
 
 const SERVER_INSTRUCTIONS = [
-  'Tools available: ingest_codebase (index the current codebase into SQLite), semantic_search (embedding-powered retrieval), graph_neighbors (explore GraphRAG relationships), and indexing_guidance (prompt describing when to reindex).',
+  'Tools available: ingest_codebase (index the current codebase into SQLite), semantic_search (embedding-powered retrieval with byte/line metadata and nearby context), graph_neighbors (explore GraphRAG relationships), and indexing_guidance (prompt describing when to reindex).',
   'Use this MCP server for all repository-aware searches: run ingest_codebase to refresh context, rely on semantic_search for locating code or docs, and use graph_neighbors when you need structural call/import details before considering any other lookup method.',
   'Always run ingest_codebase on a new or freshly checked out codebase before asking for help.',
   'Always exclude files and folders matched by .gitignore patterns so ignored content never enters the index.',
-  'Any time you or the agent edits files, re-run ingest_codebase so the SQLite index stays current.'
+  'Any time you or the agent edits files—or after upgrading this server—re-run ingest_codebase so the SQLite index stays current and backfills the latest metadata.'
 ].join(' ');
 
 const INDEXING_GUIDANCE_PROMPT: GetPromptResult = {

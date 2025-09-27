@@ -149,7 +149,7 @@ Queries the indexed `file_chunks` table using cosine similarity between the `bge
 | `limit` | `number` | Max matches to return (default 8, capped at 50). |
 | `model` | `string` | Optional embedding model identifier when multiple models are stored in the database. |
 
-Each response includes the evaluated chunk count, the embedding model used, and the top-ranked snippets (path, chunk index, score, and sanitized content).
+Each response includes the evaluated chunk count, the embedding model used, and the top-ranked snippets with metadata (path, chunk index, score, sanitized content, byte offsets, line spans, and nearby context before/after the match).
 
 ### `graph_neighbors`
 

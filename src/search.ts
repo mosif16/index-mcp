@@ -12,6 +12,10 @@ interface ChunkRow {
   content: string;
   embedding: Buffer;
   embeddingModel: string;
+  byteStart: number | null;
+  byteEnd: number | null;
+  lineStart: number | null;
+  lineEnd: number | null;
 }
 
 export interface SemanticSearchOptions {
@@ -28,6 +32,12 @@ export interface SemanticSearchMatch {
   score: number;
   content: string;
   embeddingModel: string;
+  byteStart: number | null;
+  byteEnd: number | null;
+  lineStart: number | null;
+  lineEnd: number | null;
+  contextBefore: string | null;
+  contextAfter: string | null;
 }
 
 export interface SemanticSearchResult {
@@ -39,6 +49,14 @@ export interface SemanticSearchResult {
 }
 
 const DEFAULT_RESULT_LIMIT = 8;
+const CONTEXT_LINE_PADDING = 2;
+
+interface FileCacheEntry {
+  content: string | null;
+  lines: string[] | null;
+  trimmed: string | null;
+  trimmedLines: string[] | null;
+}
 
 function dotProduct(a: Float32Array, b: Float32Array): number {
   if (a.length !== b.length) {
@@ -125,7 +143,17 @@ export async function semanticSearch(options: SemanticSearchOptions): Promise<Se
 
     const modelRows = db
       .prepare(
-        `SELECT id, path, chunk_index as chunkIndex, content, embedding, embedding_model as embeddingModel
+        `SELECT
+           id,
+           path,
+           chunk_index as chunkIndex,
+           content,
+           embedding,
+           embedding_model as embeddingModel,
+           byte_start as byteStart,
+           byte_end as byteEnd,
+           line_start as lineStart,
+           line_end as lineEnd
          FROM file_chunks
          WHERE embedding_model = ?`
       )
@@ -141,10 +169,84 @@ export async function semanticSearch(options: SemanticSearchOptions): Promise<Se
       };
     }
 
+    const fileContentStmt = db.prepare('SELECT content FROM files WHERE path = ?');
+    const fileCache = new Map<string, FileCacheEntry>();
+    const rowByKey = new Map<string, ChunkRow>();
+
+    const getFileEntry = (filePath: string): FileCacheEntry => {
+      const cached = fileCache.get(filePath);
+      if (cached) {
+        return cached;
+      }
+
+      const row = fileContentStmt.get(filePath) as { content: string | null } | undefined;
+      const content = row?.content ?? null;
+      const lines = content ? content.split(/\r?\n/) : null;
+      const trimmed = content ? content.trim() : null;
+      const trimmedLines = trimmed ? trimmed.split(/\r?\n/) : null;
+      const entry: FileCacheEntry = {
+        content,
+        lines,
+        trimmed,
+        trimmedLines
+      };
+      fileCache.set(filePath, entry);
+      return entry;
+    };
+
+    const deriveMetadataFromContent = (
+      entry: FileCacheEntry,
+      snippet: string
+    ): { byteStart: number | null; byteEnd: number | null; lineStart: number | null; lineEnd: number | null } => {
+      if (!entry.trimmed) {
+        return { byteStart: null, byteEnd: null, lineStart: null, lineEnd: null };
+      }
+
+      const startIndex = entry.trimmed.indexOf(snippet);
+      if (startIndex === -1) {
+        return { byteStart: null, byteEnd: null, lineStart: null, lineEnd: null };
+      }
+
+      const endIndex = startIndex + snippet.length;
+      const byteStart = Buffer.byteLength(entry.trimmed.slice(0, startIndex), 'utf8');
+      const byteEnd = Buffer.byteLength(entry.trimmed.slice(0, endIndex), 'utf8');
+
+      const preSnippet = entry.trimmed.slice(0, startIndex);
+      const lineStart = preSnippet ? preSnippet.split('\n').length : 1;
+      const snippetLineCount = snippet ? snippet.split('\n').length : 1;
+      const lineEnd = lineStart + Math.max(0, snippetLineCount - 1);
+
+      return { byteStart, byteEnd, lineStart, lineEnd };
+    };
+
+    const extractContext = (
+      entry: FileCacheEntry,
+      startLine: number | null,
+      endLine: number | null
+    ): { before: string | null; after: string | null } => {
+      if (!entry.trimmedLines || startLine === null || endLine === null) {
+        return { before: null, after: null };
+      }
+
+      const beforeStart = Math.max(0, startLine - 1 - CONTEXT_LINE_PADDING);
+      const beforeEnd = Math.max(0, startLine - 1);
+      const afterStart = Math.min(entry.trimmedLines.length, endLine);
+      const afterEnd = Math.min(entry.trimmedLines.length, endLine + CONTEXT_LINE_PADDING);
+
+      const beforeLines = beforeEnd > beforeStart ? entry.trimmedLines.slice(beforeStart, beforeEnd) : [];
+      const afterLines = afterEnd > afterStart ? entry.trimmedLines.slice(afterStart, afterEnd) : [];
+
+      return {
+        before: beforeLines.length > 0 ? beforeLines.join('\n') : null,
+        after: afterLines.length > 0 ? afterLines.join('\n') : null
+      };
+    };
+
     const [queryEmbedding] = await embedTexts([trimmedQuery], { model: requestedModel });
 
     const topMatches: SemanticSearchMatch[] = [];
     for (const row of modelRows) {
+      rowByKey.set(`${row.path}::${row.chunkIndex}`, row);
       const chunkEmbedding = bufferToFloat32Array(row.embedding);
       const score = dotProduct(queryEmbedding, chunkEmbedding);
       insertIntoTopMatches(
@@ -154,13 +256,39 @@ export async function semanticSearch(options: SemanticSearchOptions): Promise<Se
           chunkIndex: row.chunkIndex,
           content: row.content,
           score,
-          embeddingModel: row.embeddingModel
+          embeddingModel: row.embeddingModel,
+          byteStart: row.byteStart ?? null,
+          byteEnd: row.byteEnd ?? null,
+          lineStart: row.lineStart ?? null,
+          lineEnd: row.lineEnd ?? null,
+          contextBefore: null,
+          contextAfter: null
         },
         limit
       );
     }
 
     const results = limit > 0 ? [...topMatches].reverse() : [];
+
+    for (const match of results) {
+      const sourceRow = rowByKey.get(`${match.path}::${match.chunkIndex}`);
+      const entry = getFileEntry(match.path);
+
+      const needsMetadataFallback =
+        match.byteStart === null || match.byteEnd === null || match.lineStart === null || match.lineEnd === null;
+
+      if (needsMetadataFallback && sourceRow) {
+        const derived = deriveMetadataFromContent(entry, sourceRow.content);
+        match.byteStart = match.byteStart ?? derived.byteStart;
+        match.byteEnd = match.byteEnd ?? derived.byteEnd;
+        match.lineStart = match.lineStart ?? derived.lineStart;
+        match.lineEnd = match.lineEnd ?? derived.lineEnd;
+      }
+
+      const context = extractContext(entry, match.lineStart, match.lineEnd);
+      match.contextBefore = context.before;
+      match.contextAfter = context.after;
+    }
 
     return {
       databasePath: dbPath,
