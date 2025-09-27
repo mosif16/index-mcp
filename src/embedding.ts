@@ -7,7 +7,7 @@ import {
 
 env.allowRemoteModels = true;
 
-const DEFAULT_MODEL = 'Xenova/bge-base-en-v1.5';
+const DEFAULT_MODEL = 'Xenova/all-MiniLM-L6-v2';
 
 type EmbeddingPipeline = FeatureExtractionPipeline;
 

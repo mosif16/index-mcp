@@ -131,7 +131,7 @@ Walks a target directory, stores the metadata and (optionally) UTF-8 content for
 | `maxFileSizeBytes` | `number` | Skip files larger than this size (default 512 KiB). |
 | `storeFileContent` | `boolean` | When `false`, only metadata is stored; content is omitted. |
 | `contentSanitizer` | `{ module: string, exportName?: string, options?: unknown }` | Dynamically import a sanitizer to scrub or redact content before it is persisted. |
-| `embedding` | `{ enabled?: boolean, model?: string, chunkSizeTokens?: number, batchSize?: number, chunkOverlapTokens?: number }` | Configure semantic chunking/embedding (defaults use `Xenova/bge-base-en-v1.5`, 256-token chunks). |
+| `embedding` | `{ enabled?: boolean, model?: string, chunkSizeTokens?: number, batchSize?: number, chunkOverlapTokens?: number }` | Configure semantic chunking/embedding (defaults use `Xenova/all-MiniLM-L6-v2`, 256-token chunks). |
 | `graph` | `{ enabled?: boolean }` | Toggle structural graph extraction. Disable if you only need file metadata and embeddings. |
 | `paths` | `string[]` | Optional relative paths to re-ingest incrementally (useful for watcher-driven updates). |
 

@@ -166,7 +166,7 @@ During repeat runs the ingestor compares size + mtime against the existing datab
 
 Relative `root` values are resolved against the caller-supplied working directory metadata (such as `_meta.cwd`), common headers (`x-mcp-cwd`, `x-mcp-root`, `x-workspace-*`), and environment overrides like `MCP_CALLER_CWD` or `MCP_WORKSPACE_ROOT` when available, so CLI clients can safely pass `"."` to target their active workspace. If no caller context is provided the path falls back to the server process directory.
 
-Embeddings default to the `Xenova/bge-base-en-v1.5` model provided by `@xenova/transformers`. The server downloads and caches the model on first use; set `embedding.model` in tool inputs if you need an alternative.
+Embeddings default to the `Xenova/all-MiniLM-L6-v2` model provided by `@xenova/transformers`. The server downloads and caches the model on first use; set `embedding.model` in tool inputs if you need an alternative.
 
 The tool response returns both text (a summary) and `structuredContent` matching the `ingestToolOutputShape` schema.
 
