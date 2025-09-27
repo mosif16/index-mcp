@@ -1,4 +1,9 @@
-import { pipeline, env, type FeatureExtractionPipeline } from '@xenova/transformers';
+import {
+  pipeline,
+  env,
+  type FeatureExtractionPipeline,
+  type PipelineType
+} from '@xenova/transformers';
 
 env.allowRemoteModels = true;
 
@@ -13,7 +18,7 @@ type TensorLike = {
   dims?: number[];
 };
 
-type PipelineFactory = (task: string, model: string) => Promise<EmbeddingPipeline>;
+type PipelineFactory = (task: PipelineType, model: string) => Promise<EmbeddingPipeline>;
 
 const pipelineCache = new Map<string, Promise<EmbeddingPipeline>>();
 

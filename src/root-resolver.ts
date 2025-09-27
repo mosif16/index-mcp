@@ -1,9 +1,10 @@
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { ProcessEnv } from 'node:process';
 
 type UnknownRecord = Record<string, unknown>;
+
+type ProcessEnv = Record<string, string | undefined>;
 
 const PATH_KEY_PATTERN = /(cwd|workingdir|workingdirectory|workspace|project|root|path|directory)$/i;
 const HEADER_CANDIDATES = ['x-mcp-cwd', 'x-mcp-root', 'x-workspace-cwd', 'x-workspace-root'];

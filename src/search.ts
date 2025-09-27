@@ -52,8 +52,25 @@ function dotProduct(a: Float32Array, b: Float32Array): number {
   return sum;
 }
 
-function sortByScoreDescending(matches: SemanticSearchMatch[]): SemanticSearchMatch[] {
-  return matches.sort((left, right) => right.score - left.score);
+function insertIntoTopMatches(
+  sortedMatches: SemanticSearchMatch[],
+  candidate: SemanticSearchMatch,
+  limit: number
+): void {
+  if (limit <= 0) {
+    return;
+  }
+
+  const insertionIndex = sortedMatches.findIndex((match) => match.score > candidate.score);
+  if (insertionIndex === -1) {
+    sortedMatches.push(candidate);
+  } else {
+    sortedMatches.splice(insertionIndex, 0, candidate);
+  }
+
+  if (sortedMatches.length > limit) {
+    sortedMatches.shift();
+  }
 }
 
 export async function semanticSearch(options: SemanticSearchOptions): Promise<SemanticSearchResult> {
@@ -73,24 +90,25 @@ export async function semanticSearch(options: SemanticSearchOptions): Promise<Se
 
   const db = new Database(dbPath, { readonly: true });
   try {
-    const chunkRows = db
-      .prepare(
-        `SELECT id, path, chunk_index as chunkIndex, content, embedding, embedding_model as embeddingModel
-         FROM file_chunks`
-      )
-      .all() as ChunkRow[];
+    const totalChunkRow = db
+      .prepare('SELECT COUNT(*) as count FROM file_chunks')
+      .get() as { count: number } | undefined;
+    const totalChunks = totalChunkRow?.count ?? 0;
 
-    if (!chunkRows.length) {
+    if (totalChunks === 0) {
       return {
         databasePath: dbPath,
         embeddingModel: options.model ?? null,
-        totalChunks: 0,
+        totalChunks,
         evaluatedChunks: 0,
         results: []
       };
     }
 
-    const availableModels = new Set(chunkRows.map((row) => row.embeddingModel));
+    const availableModelRows = db
+      .prepare('SELECT DISTINCT embedding_model as embeddingModel FROM file_chunks')
+      .all() as { embeddingModel: string }[];
+    const availableModels = new Set(availableModelRows.map((row) => row.embeddingModel));
     const requestedModel = options.model ?? (availableModels.size === 1 ? [...availableModels][0] : null);
 
     if (!requestedModel) {
@@ -105,13 +123,19 @@ export async function semanticSearch(options: SemanticSearchOptions): Promise<Se
       );
     }
 
-    const modelRows = chunkRows.filter((row) => row.embeddingModel === requestedModel);
+    const modelRows = db
+      .prepare(
+        `SELECT id, path, chunk_index as chunkIndex, content, embedding, embedding_model as embeddingModel
+         FROM file_chunks
+         WHERE embedding_model = ?`
+      )
+      .all(requestedModel) as ChunkRow[];
 
     if (!modelRows.length) {
       return {
         databasePath: dbPath,
         embeddingModel: requestedModel,
-        totalChunks: chunkRows.length,
+        totalChunks,
         evaluatedChunks: 0,
         results: []
       };
@@ -119,26 +143,31 @@ export async function semanticSearch(options: SemanticSearchOptions): Promise<Se
 
     const [queryEmbedding] = await embedTexts([trimmedQuery], { model: requestedModel });
 
-    const matches: SemanticSearchMatch[] = modelRows.map((row) => {
+    const topMatches: SemanticSearchMatch[] = [];
+    for (const row of modelRows) {
       const chunkEmbedding = bufferToFloat32Array(row.embedding);
       const score = dotProduct(queryEmbedding, chunkEmbedding);
-      return {
-        path: row.path,
-        chunkIndex: row.chunkIndex,
-        content: row.content,
-        score,
-        embeddingModel: row.embeddingModel
-      };
-    });
+      insertIntoTopMatches(
+        topMatches,
+        {
+          path: row.path,
+          chunkIndex: row.chunkIndex,
+          content: row.content,
+          score,
+          embeddingModel: row.embeddingModel
+        },
+        limit
+      );
+    }
 
-    const sorted = sortByScoreDescending(matches).slice(0, limit);
+    const results = limit > 0 ? [...topMatches].reverse() : [];
 
     return {
       databasePath: dbPath,
       embeddingModel: requestedModel,
-      totalChunks: chunkRows.length,
+      totalChunks,
       evaluatedChunks: modelRows.length,
-      results: sorted
+      results
     };
   } finally {
     db.close();
