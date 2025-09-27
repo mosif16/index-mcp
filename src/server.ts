@@ -33,6 +33,7 @@ const ingestToolOutputShape = {
 const ingestToolOutputSchema = z.object(ingestToolOutputShape);
 
 const SERVER_INSTRUCTIONS = [
+  'Tools available: ingest_codebase (index the current codebase into SQLite) and indexing_guidance (prompt describing when to reindex).',
   'Always run ingest_codebase on a new or freshly checked out codebase before asking for help.',
   'Any time you or the agent edits files, re-run ingest_codebase so the SQLite index stays current.'
 ].join(' ');
@@ -43,7 +44,7 @@ const INDEXING_GUIDANCE_PROMPT: GetPromptResult = {
       role: 'assistant',
       content: {
         type: 'text',
-        text: 'Always run ingest_codebase on a new codebase before requesting analysis, and run it again after you or I modify files so the SQLite index reflects the latest code.'
+        text: 'Tools: ingest_codebase (index the repository) and indexing_guidance (show these reminders). Always run ingest_codebase on a new codebase before requesting analysis, and run it again after you or I modify files so the SQLite index reflects the latest code.'
       }
     }
   ]
