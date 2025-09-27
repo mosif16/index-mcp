@@ -167,6 +167,7 @@ The tool response returns both text (a summary) and `structuredContent` matching
 
 - **Node binding error:** If the MCP server complains about missing `better_sqlite3.node`, ensure `npm install` was run with a Node version >= 18. Prebuilt binaries are available beginning with `better-sqlite3@12.x`.
 - **Index not updating:** Re-run `ingest_codebase` as soon as files are added/changed. The server reminder text emphasizes this.
+- **Repeated ingest failures after a transient embedding error:** The embedding pipeline cache in `src/embedding.ts` stores the first failed promise. If the initial model download fails (e.g., due to a network hiccup), every subsequent `ingest_codebase` call will reuse that rejected promise and fail until the process restarts. Restart the MCP server or set `{"embedding": {"enabled": false}}` on the tool call as a stopgap, then rerun ingest once connectivity is stable.
 - **Large repos:** Increase `maxFileSizeBytes` or adjust `include`/`exclude` to limit scope.
 - **Manual rebuild:** `npm run build` regenerates `dist/` if `start.sh` ever reports a missing bundle.
 

@@ -9,6 +9,13 @@ import { semanticSearch } from './search.js';
 import { graphNeighbors } from './graph-query.js';
 import { startIngestWatcher } from './watcher.js';
 
+function rethrowWithContext(toolName: string, error: unknown): never {
+  if (error instanceof Error) {
+    throw Object.assign(new Error(`${toolName} failed: ${error.message}`), { cause: error });
+  }
+  throw new Error(`${toolName} failed: ${String(error)}`);
+}
+
 const ingestToolArgs = {
   root: z.string().min(1, 'root directory is required'),
   include: z.array(z.string()).optional(),
@@ -191,20 +198,24 @@ async function main() {
       outputSchema: ingestToolOutputShape
     },
     async (args) => {
-      const parsedInput = ingestToolSchema.parse(args);
-      const result = ingestToolOutputSchema.parse(await ingestCodebase(parsedInput));
+      try {
+        const parsedInput = ingestToolSchema.parse(args);
+        const result = ingestToolOutputSchema.parse(await ingestCodebase(parsedInput));
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Indexed ${result.ingestedFileCount} files in ${(result.durationMs / 1000).toFixed(
-              2
-            )}s. Database: ${result.databasePath}. Re-run ingest_codebase after any edits to keep the index fresh.`
-          }
-        ],
-        structuredContent: result
-      };
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Indexed ${result.ingestedFileCount} files in ${(result.durationMs / 1000).toFixed(
+                2
+              )}s. Database: ${result.databasePath}. Re-run ingest_codebase after any edits to keep the index fresh.`
+            }
+          ],
+          structuredContent: result
+        };
+      } catch (error) {
+        return rethrowWithContext('ingest_codebase', error);
+      }
     }
   );
 
@@ -216,21 +227,25 @@ async function main() {
       outputSchema: semanticSearchOutputShape
     },
     async (args) => {
-      const parsedInput = semanticSearchSchema.parse(args);
-      const result = semanticSearchOutputSchema.parse(await semanticSearch(parsedInput));
-      const modelDescriptor = result.embeddingModel ? `model ${result.embeddingModel}` : 'stored embeddings';
-      const summary = result.results.length
-        ? `Semantic search scanned ${result.evaluatedChunks} chunks and returned ${result.results.length} matches (${modelDescriptor}).`
-        : 'Semantic search evaluated the index but did not return any matches.';
-      return {
-        content: [
-          {
-            type: 'text',
-            text: summary
-          }
-        ],
-        structuredContent: result
-      };
+      try {
+        const parsedInput = semanticSearchSchema.parse(args);
+        const result = semanticSearchOutputSchema.parse(await semanticSearch(parsedInput));
+        const modelDescriptor = result.embeddingModel ? `model ${result.embeddingModel}` : 'stored embeddings';
+        const summary = result.results.length
+          ? `Semantic search scanned ${result.evaluatedChunks} chunks and returned ${result.results.length} matches (${modelDescriptor}).`
+          : 'Semantic search evaluated the index but did not return any matches.';
+        return {
+          content: [
+            {
+              type: 'text',
+              text: summary
+            }
+          ],
+          structuredContent: result
+        };
+      } catch (error) {
+        return rethrowWithContext('semantic_search', error);
+      }
     }
   );
 
@@ -242,22 +257,26 @@ async function main() {
       outputSchema: graphNeighborOutputShape
     },
     async (args) => {
-      const parsedInput = graphNeighborSchema.parse(args);
-      const result = graphNeighborOutputSchema.parse(await graphNeighbors(parsedInput));
-      const neighborCount = result.neighbors.length;
-      const directionDescriptor = parsedInput.direction ?? 'outgoing';
-      const summary = neighborCount
-        ? `Graph query found ${neighborCount} ${neighborCount === 1 ? 'neighbor' : 'neighbors'} (${directionDescriptor}) for node '${result.node.name}'.`
-        : `Graph query found no ${directionDescriptor} neighbors for node '${result.node.name}'.`;
-      return {
-        content: [
-          {
-            type: 'text',
-            text: summary
-          }
-        ],
-        structuredContent: result
-      };
+      try {
+        const parsedInput = graphNeighborSchema.parse(args);
+        const result = graphNeighborOutputSchema.parse(await graphNeighbors(parsedInput));
+        const neighborCount = result.neighbors.length;
+        const directionDescriptor = parsedInput.direction ?? 'outgoing';
+        const summary = neighborCount
+          ? `Graph query found ${neighborCount} ${neighborCount === 1 ? 'neighbor' : 'neighbors'} (${directionDescriptor}) for node '${result.node.name}'.`
+          : `Graph query found no ${directionDescriptor} neighbors for node '${result.node.name}'.`;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: summary
+            }
+          ],
+          structuredContent: result
+        };
+      } catch (error) {
+        return rethrowWithContext('graph_neighbors', error);
+      }
     }
   );
 

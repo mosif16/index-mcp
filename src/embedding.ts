@@ -13,14 +13,22 @@ type TensorLike = {
   dims?: number[];
 };
 
+type PipelineFactory = (task: string, model: string) => Promise<EmbeddingPipeline>;
+
 const pipelineCache = new Map<string, Promise<EmbeddingPipeline>>();
+
+const defaultPipelineFactory: PipelineFactory = (task, model) =>
+  pipeline(task, model) as Promise<EmbeddingPipeline>;
+
+let currentPipelineFactory: PipelineFactory = defaultPipelineFactory;
 
 async function getEmbeddingPipeline(model = DEFAULT_MODEL): Promise<EmbeddingPipeline> {
   if (!pipelineCache.has(model)) {
-    pipelineCache.set(
-      model,
-      pipeline('feature-extraction', model) as Promise<EmbeddingPipeline>
-    );
+    const pipelinePromise = currentPipelineFactory('feature-extraction', model).catch((error) => {
+      pipelineCache.delete(model);
+      throw error;
+    });
+    pipelineCache.set(model, pipelinePromise);
   }
   return pipelineCache.get(model)!;
 }
@@ -115,3 +123,24 @@ export function bufferToFloat32Array(buffer: Buffer): Float32Array {
 export function getDefaultEmbeddingModel(): string {
   return DEFAULT_MODEL;
 }
+
+function clearPipelineCache(): void {
+  pipelineCache.clear();
+}
+
+function resetPipelineFactory(): void {
+  currentPipelineFactory = defaultPipelineFactory;
+  clearPipelineCache();
+}
+
+function setPipelineFactory(factory: PipelineFactory): void {
+  currentPipelineFactory = factory;
+  clearPipelineCache();
+}
+
+export const __testing = {
+  clearPipelineCache,
+  resetPipelineFactory,
+  setPipelineFactory,
+  getEmbeddingPipeline
+};
