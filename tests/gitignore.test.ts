@@ -2,10 +2,9 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
+import Database from 'better-sqlite3';
 
 import { ingestCodebase } from '../src/ingest.js';
-
-import Database from 'better-sqlite3';
 
 async function createTempWorkspace(prefix: string): Promise<string> {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), prefix));

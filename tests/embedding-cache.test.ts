@@ -8,7 +8,7 @@ async function run() {
   let factoryCalls = 0;
 
   const successfulPipeline = Object.assign(
-    async (..._args: unknown[]) => new Float32Array([1]),
+    async () => new Float32Array([1]),
     {}
   ) as FeatureExtractionPipeline;
 

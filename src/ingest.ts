@@ -2,15 +2,18 @@ import Database from 'better-sqlite3';
 import type { Database as DatabaseInstance } from 'better-sqlite3';
 import fg from 'fast-glob';
 import ignore, { type Ignore } from 'ignore';
-import { promises as fs } from 'node:fs';
+import { createReadStream, promises as fs } from 'node:fs';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { StringDecoder } from 'node:string_decoder';
 
 import { embedTexts, float32ArrayToBuffer, getDefaultEmbeddingModel } from './embedding.js';
 import { extractGraphMetadata, type GraphExtractionResult } from './graph.js';
 import { DEFAULT_DB_FILENAME, DEFAULT_INCLUDE_GLOBS, DEFAULT_EXCLUDE_GLOBS } from './constants.js';
-const DEFAULT_MAX_FILE_SIZE_BYTES = 512 * 1024; // 512 KiB
+const DEFAULT_MAX_FILE_SIZE_BYTES = 8 * 1024 * 1024; // 8 MiB
+
+const STREAM_READER_HIGH_WATER_MARK = 256 * 1024; // 256 KiB
 
 const DEFAULT_CHUNK_SIZE_TOKENS = 256;
 const DEFAULT_CHUNK_OVERLAP_TOKENS = 32;
@@ -104,7 +107,7 @@ function toPosixPath(relativePath: string): string {
   return relativePath.split(path.sep).join('/');
 }
 
-function isProbablyBinary(buffer: Buffer): boolean {
+function bufferContainsNullByte(buffer: Buffer): boolean {
   const lengthToCheck = Math.min(buffer.length, 1024);
   for (let i = 0; i < lengthToCheck; i += 1) {
     if (buffer[i] === 0) {
@@ -112,6 +115,59 @@ function isProbablyBinary(buffer: Buffer): boolean {
     }
   }
   return false;
+}
+
+interface ReadFileResult {
+  hash: string;
+  content: string | null;
+  isBinary: boolean;
+}
+
+async function readFileContentAndHash(absPath: string, needsContent: boolean): Promise<ReadFileResult> {
+  const hash = crypto.createHash('sha256');
+  const stream = createReadStream(absPath, { highWaterMark: STREAM_READER_HIGH_WATER_MARK });
+  const decoder = needsContent ? new StringDecoder('utf8') : null;
+
+  let collectedText = '';
+  let collecting = needsContent;
+  let isBinary = false;
+
+  try {
+    for await (const chunk of stream) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      hash.update(buffer);
+
+      if (!collecting) {
+        continue;
+      }
+
+      if (bufferContainsNullByte(buffer)) {
+        isBinary = true;
+        collecting = false;
+        collectedText = '';
+        continue;
+      }
+
+      collectedText += decoder!.write(buffer);
+    }
+
+    if (collecting) {
+      collectedText += decoder!.end();
+    } else if (decoder) {
+      decoder.end();
+    }
+  } finally {
+    stream.destroy();
+  }
+
+  const hashHex = hash.digest('hex');
+  const content = !isBinary && needsContent ? collectedText : null;
+
+  return {
+    hash: hashHex,
+    content,
+    isBinary
+  };
 }
 
 function ensureSchema(db: DatabaseInstance) {
@@ -533,9 +589,10 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
         continue;
       }
 
-      let fileBuffer: Buffer;
+      const needsTextContent = storeFileContent || embeddingConfig.enabled || graphConfig.enabled;
+      let fileData: ReadFileResult;
       try {
-        fileBuffer = await fs.readFile(absPath);
+        fileData = await readFileContentAndHash(absPath, needsTextContent);
       } catch (error) {
         skipped.push({
           path: normalizedPath,
@@ -547,20 +604,16 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
       }
 
       let content: string | null = null;
-      if (!isProbablyBinary(fileBuffer)) {
-        const rawContent = fileBuffer.toString('utf8');
+      if (!fileData.isBinary && fileData.content !== null) {
         content = await sanitizeContent({
           path: normalizedPath,
           absolutePath: absPath,
           root: absoluteRoot,
-          content: rawContent
+          content: fileData.content
         });
       }
 
-      const hash = crypto
-        .createHash('sha256')
-        .update(fileBuffer)
-        .digest('hex');
+      const hash = fileData.hash;
 
       seenPaths.add(normalizedPath);
       chunkRefreshPaths.add(normalizedPath);

@@ -1,6 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { ProcessEnv } from 'node:process';
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -21,7 +22,7 @@ const ENV_CANDIDATES = [
 export interface RootResolutionContext {
   meta?: UnknownRecord;
   headers?: Record<string, string>;
-  env?: NodeJS.ProcessEnv;
+  env?: ProcessEnv;
 }
 
 function expandHome(input: string): string {
@@ -38,7 +39,7 @@ function looksLikePath(candidate: string): boolean {
   return candidate.includes('/') || candidate.includes('\\') || candidate.startsWith('file://') || candidate.startsWith('~');
 }
 
-function normalizeCandidate(candidate: string, env: NodeJS.ProcessEnv): string | undefined {
+function normalizeCandidate(candidate: string): string | undefined {
   if (!candidate) {
     return undefined;
   }
@@ -49,7 +50,7 @@ function normalizeCandidate(candidate: string, env: NodeJS.ProcessEnv): string |
   if (normalized.startsWith('file://')) {
     try {
       normalized = fileURLToPath(normalized);
-    } catch (error) {
+    } catch {
       return undefined;
     }
   }
@@ -60,7 +61,7 @@ function normalizeCandidate(candidate: string, env: NodeJS.ProcessEnv): string |
   return undefined;
 }
 
-function collectFromMeta(meta: UnknownRecord | undefined, env: NodeJS.ProcessEnv): string[] {
+function collectFromMeta(meta: UnknownRecord | undefined): string[] {
   if (!meta) {
     return [];
   }
@@ -79,7 +80,7 @@ function collectFromMeta(meta: UnknownRecord | undefined, env: NodeJS.ProcessEnv
     for (const [key, entryValue] of entries) {
       if (typeof entryValue === 'string') {
         if (PATH_KEY_PATTERN.test(key) && looksLikePath(entryValue)) {
-          const normalized = normalizeCandidate(entryValue, env);
+          const normalized = normalizeCandidate(entryValue);
           if (normalized) {
             candidates.push(normalized);
           }
@@ -88,7 +89,7 @@ function collectFromMeta(meta: UnknownRecord | undefined, env: NodeJS.ProcessEnv
         for (const item of entryValue) {
           if (typeof item === 'string') {
             if (PATH_KEY_PATTERN.test(key) && looksLikePath(item)) {
-              const normalized = normalizeCandidate(item, env);
+              const normalized = normalizeCandidate(item);
               if (normalized) {
                 candidates.push(normalized);
               }
@@ -107,7 +108,7 @@ function collectFromMeta(meta: UnknownRecord | undefined, env: NodeJS.ProcessEnv
   return candidates;
 }
 
-function collectFromHeaders(headers: Record<string, string> | undefined, env: NodeJS.ProcessEnv): string[] {
+function collectFromHeaders(headers: Record<string, string> | undefined): string[] {
   if (!headers) {
     return [];
   }
@@ -115,7 +116,7 @@ function collectFromHeaders(headers: Record<string, string> | undefined, env: No
   for (const key of HEADER_CANDIDATES) {
     const value = headers[key];
     if (typeof value === 'string') {
-      const normalized = normalizeCandidate(value, env);
+      const normalized = normalizeCandidate(value);
       if (normalized) {
         candidates.push(normalized);
       }
@@ -124,12 +125,12 @@ function collectFromHeaders(headers: Record<string, string> | undefined, env: No
   return candidates;
 }
 
-function collectFromEnv(env: NodeJS.ProcessEnv): string[] {
+function collectFromEnv(env: ProcessEnv): string[] {
   const candidates: string[] = [];
   for (const key of ENV_CANDIDATES) {
     const value = env[key];
     if (typeof value === 'string') {
-      const normalized = normalizeCandidate(value, env);
+      const normalized = normalizeCandidate(value);
       if (normalized) {
         candidates.push(normalized);
       }
@@ -141,8 +142,8 @@ function collectFromEnv(env: NodeJS.ProcessEnv): string[] {
 function resolveBaseDirectory(context: RootResolutionContext): string | undefined {
   const env = context.env ?? process.env;
   const sources = [
-    ...collectFromMeta(context.meta, env),
-    ...collectFromHeaders(context.headers, env),
+    ...collectFromMeta(context.meta),
+    ...collectFromHeaders(context.headers),
     ...collectFromEnv(env)
   ];
   return sources.find(Boolean);
@@ -152,7 +153,7 @@ function normalizeRootValue(value: string): string {
   if (value.startsWith('file://')) {
     try {
       return path.normalize(fileURLToPath(value));
-    } catch (error) {
+    } catch {
       // fall through
     }
   }
@@ -161,7 +162,6 @@ function normalizeRootValue(value: string): string {
 }
 
 export function resolveRootPath(root: string, context: RootResolutionContext = {}): string {
-  const env = context.env ?? process.env;
   if (!root) {
     return path.resolve('.');
   }
