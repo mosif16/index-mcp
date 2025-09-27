@@ -8,6 +8,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { embedTexts, float32ArrayToBuffer, getDefaultEmbeddingModel } from './embedding.js';
+import { extractGraphMetadata, type GraphExtractionResult } from './graph.js';
 import { DEFAULT_DB_FILENAME, DEFAULT_INCLUDE_GLOBS, DEFAULT_EXCLUDE_GLOBS } from './constants.js';
 const DEFAULT_MAX_FILE_SIZE_BYTES = 512 * 1024; // 512 KiB
 
@@ -43,6 +44,10 @@ export interface EmbeddingOptions {
   batchSize?: number;
 }
 
+export interface GraphOptions {
+  enabled?: boolean;
+}
+
 export interface IngestOptions {
   root: string;
   include?: string[];
@@ -52,6 +57,8 @@ export interface IngestOptions {
   storeFileContent?: boolean;
   contentSanitizer?: ContentSanitizerSpec;
   embedding?: EmbeddingOptions;
+  graph?: GraphOptions;
+  paths?: string[];
 }
 
 export interface SkippedFile {
@@ -71,6 +78,8 @@ export interface IngestResult {
   durationMs: number;
   embeddedChunkCount: number;
   embeddingModel: string | null;
+  graphNodeCount: number;
+  graphEdgeCount: number;
 }
 
 interface FileRow {
@@ -137,6 +146,31 @@ function ensureSchema(db: DatabaseInstance) {
     );
     CREATE INDEX IF NOT EXISTS files_hash_idx ON files(hash);
     CREATE INDEX IF NOT EXISTS file_chunks_path_idx ON file_chunks(path);
+    CREATE TABLE IF NOT EXISTS code_graph_nodes (
+      id TEXT PRIMARY KEY,
+      path TEXT,
+      kind TEXT NOT NULL,
+      name TEXT NOT NULL,
+      signature TEXT,
+      range_start INTEGER,
+      range_end INTEGER,
+      metadata TEXT,
+      UNIQUE(path, kind, name)
+    );
+    CREATE TABLE IF NOT EXISTS code_graph_edges (
+      id TEXT PRIMARY KEY,
+      source_id TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      source_path TEXT,
+      target_path TEXT,
+      metadata TEXT,
+      FOREIGN KEY (source_id) REFERENCES code_graph_nodes(id) ON DELETE CASCADE,
+      FOREIGN KEY (target_id) REFERENCES code_graph_nodes(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS code_graph_nodes_path_idx ON code_graph_nodes(path);
+    CREATE INDEX IF NOT EXISTS code_graph_edges_source_idx ON code_graph_edges(source_id);
+    CREATE INDEX IF NOT EXISTS code_graph_edges_target_idx ON code_graph_edges(target_id);
   `);
 }
 
@@ -255,6 +289,46 @@ function resolveEmbeddingDefaults(options?: EmbeddingOptions) {
   };
 }
 
+function resolveGraphDefaults(options?: GraphOptions) {
+  return {
+    enabled: options?.enabled ?? true
+  };
+}
+
+function normalizeTargetPaths(root: string, paths?: string[]): string[] {
+  if (!paths || paths.length === 0) {
+    return [];
+  }
+
+  const absoluteRoot = path.resolve(root);
+  const normalizedRootWithSep = absoluteRoot.endsWith(path.sep)
+    ? absoluteRoot
+    : `${absoluteRoot}${path.sep}`;
+
+  const normalized = new Set<string>();
+
+  for (const candidate of paths) {
+    const absoluteCandidate = path.isAbsolute(candidate)
+      ? path.resolve(candidate)
+      : path.resolve(absoluteRoot, candidate);
+
+    if (
+      absoluteCandidate !== absoluteRoot &&
+      !absoluteCandidate.startsWith(normalizedRootWithSep)
+    ) {
+      continue;
+    }
+
+    const relative = path.relative(absoluteRoot, absoluteCandidate);
+    if (!relative || relative === '') {
+      continue;
+    }
+    normalized.add(toPosixPath(relative));
+  }
+
+  return [...normalized];
+}
+
 export async function ingestCodebase(options: IngestOptions): Promise<IngestResult> {
   const databaseName = options.databaseName ?? DEFAULT_DB_FILENAME;
   const includeGlobs = options.include ?? DEFAULT_INCLUDE_GLOBS;
@@ -268,8 +342,12 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
   const maxFileSizeBytes = options.maxFileSizeBytes ?? DEFAULT_MAX_FILE_SIZE_BYTES;
   const storeFileContent = options.storeFileContent ?? true;
   const embeddingConfig = resolveEmbeddingDefaults(options.embedding);
+  const graphConfig = resolveGraphDefaults(options.graph);
 
   const absoluteRoot = path.resolve(options.root);
+  const targetPaths = normalizeTargetPaths(absoluteRoot, options.paths);
+  const usingTargetPaths = targetPaths.length > 0;
+  const searchPatterns = usingTargetPaths ? targetPaths : includeGlobs;
   const rootStats = await fs.stat(absoluteRoot);
   if (!rootStats.isDirectory()) {
     throw new Error(`Ingest root must be a directory: ${absoluteRoot}`);
@@ -289,9 +367,8 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
       .prepare('SELECT path, size, modified, hash, last_indexed_at as lastIndexedAt, content FROM files')
       .all() as FileRow[];
     const existingByPath = new Map<string, FileRow>(existingRows.map((row) => [row.path, row]));
-    const existingPathsSet = new Set<string>(existingByPath.keys());
 
-    const matches = await fg(includeGlobs, {
+    const matches = await fg(searchPatterns, {
       cwd: absoluteRoot,
       dot: false,
       ignore: excludeGlobs,
@@ -305,6 +382,11 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
     const seenPaths = new Set<string>();
     const chunkJobs: PendingChunk[] = [];
     const chunkRefreshPaths = new Set<string>();
+    const graphUpdates = new Map<string, GraphExtractionResult | null>();
+
+    const existingPathsSet = usingTargetPaths
+      ? new Set<string>(targetPaths.filter((p) => existingByPath.has(p)))
+      : new Set<string>(existingByPath.keys());
 
     for (const relativePath of matches) {
       const normalizedPath = toPosixPath(relativePath);
@@ -318,6 +400,9 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
       try {
         stats = await fs.stat(absPath);
       } catch (error) {
+        if ((error as { code?: string }).code === 'ENOENT') {
+          continue;
+        }
         skipped.push({
           path: normalizedPath,
           reason: 'read-error',
@@ -411,9 +496,16 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
         lastIndexedAt: Date.now(),
         content: storeFileContent ? content : null
       });
+
+      if (graphConfig.enabled) {
+        const graphResult = content ? extractGraphMetadata(normalizedPath, content) : null;
+        graphUpdates.set(normalizedPath, graphResult);
+      }
     }
 
-    const deletedPaths = Array.from(existingPathsSet).filter((p) => !seenPaths.has(p));
+    const deletedPaths = usingTargetPaths
+      ? targetPaths.filter((p) => !seenPaths.has(p) && existingByPath.has(p))
+      : Array.from(existingPathsSet).filter((p) => !seenPaths.has(p));
     deletedPaths.forEach((p) => chunkRefreshPaths.add(p));
 
     let embeddedChunkCount = 0;
@@ -458,6 +550,30 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
       `INSERT INTO file_chunks (id, path, chunk_index, content, embedding, embedding_model)
        VALUES (@id, @path, @chunkIndex, @content, @embedding, @model)`
     );
+    const deleteGraphNodesStmt = db.prepare('DELETE FROM code_graph_nodes WHERE path = ?');
+    const insertGraphNodeStmt = db.prepare(
+      `INSERT INTO code_graph_nodes (id, path, kind, name, signature, range_start, range_end, metadata)
+       VALUES (@id, @path, @kind, @name, @signature, @rangeStart, @rangeEnd, @metadata)
+       ON CONFLICT(id) DO UPDATE SET
+         path = excluded.path,
+         kind = excluded.kind,
+         name = excluded.name,
+         signature = excluded.signature,
+         range_start = excluded.range_start,
+         range_end = excluded.range_end,
+         metadata = excluded.metadata`
+    );
+    const insertGraphEdgeStmt = db.prepare(
+      `INSERT INTO code_graph_edges (id, source_id, target_id, type, source_path, target_path, metadata)
+       VALUES (@id, @sourceId, @targetId, @type, @sourcePath, @targetPath, @metadata)
+       ON CONFLICT(id) DO UPDATE SET
+         source_id = excluded.source_id,
+         target_id = excluded.target_id,
+         type = excluded.type,
+         source_path = excluded.source_path,
+         target_path = excluded.target_path,
+         metadata = excluded.metadata`
+    );
 
     const insertIngestionStmt = db.prepare(
       `INSERT INTO ingestions (id, root, started_at, finished_at, file_count, skipped_count, deleted_count)
@@ -467,9 +583,13 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
     const ingestionId = crypto.randomUUID();
     const endTime = Date.now();
 
+    let graphNodeCount = 0;
+    let graphEdgeCount = 0;
+
     const transaction = db.transaction(() => {
       for (const pathToReset of chunkRefreshPaths) {
         deleteChunksStmt.run(pathToReset);
+        deleteGraphNodesStmt.run(pathToReset);
       }
       for (const file of files) {
         upsertStmt.run(file);
@@ -486,6 +606,38 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
           embedding: chunk.embedding,
           model: chunk.model
         });
+      }
+      if (graphConfig.enabled) {
+        for (const graphData of graphUpdates.values()) {
+          if (!graphData) {
+            continue;
+          }
+          for (const node of graphData.entities) {
+            insertGraphNodeStmt.run({
+              id: node.id,
+              path: node.path,
+              kind: node.kind,
+              name: node.name,
+              signature: node.signature ?? null,
+              rangeStart: node.rangeStart ?? null,
+              rangeEnd: node.rangeEnd ?? null,
+              metadata: node.metadata ? JSON.stringify(node.metadata) : null
+            });
+            graphNodeCount += 1;
+          }
+          for (const edge of graphData.edges) {
+            insertGraphEdgeStmt.run({
+              id: edge.id,
+              sourceId: edge.sourceId,
+              targetId: edge.targetId,
+              type: edge.type,
+              sourcePath: edge.sourcePath ?? null,
+              targetPath: edge.targetPath ?? null,
+              metadata: edge.metadata ? JSON.stringify(edge.metadata) : null
+            });
+            graphEdgeCount += 1;
+          }
+        }
       }
       for (const deleted of deletedPaths) {
         deleteStmt.run(deleted);
@@ -514,7 +666,9 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
       deletedPaths,
       durationMs: endTime - startTime,
       embeddedChunkCount,
-      embeddingModel: embeddingConfig.enabled ? embeddingConfig.model : null
+      embeddingModel: embeddingConfig.enabled ? embeddingConfig.model : null,
+      graphNodeCount,
+      graphEdgeCount
     };
   } finally {
     db.close();

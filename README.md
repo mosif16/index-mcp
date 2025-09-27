@@ -29,6 +29,24 @@ Use the `dev` script to run the TypeScript entrypoint directly while iterating:
 npm run dev
 ```
 
+### Watch mode
+
+To keep the SQLite index synchronized while you edit files, launch the watcher-enabled entrypoint:
+
+```bash
+npm run watch
+```
+
+or pass `--watch` through `npm run dev`:
+
+```bash
+npm run dev -- --watch
+```
+
+The watcher performs an initial ingest (unless you add `--watch-no-initial`) and then monitors the workspace for file additions, edits, and deletions. Detected changes trigger incremental `ingest_codebase` calls so only the touched paths are reprocessed.
+
+CLI flags such as `--watch-debounce=750`, `--watch-database=.custom-index.sqlite`, `--watch-quiet`, and `--watch-no-initial` control batching, database selection, logging, and the initial full scan.
+
 ## Run
 
 The server communicates over stdio per the MCP spec. After building, launch it with:
@@ -87,7 +105,7 @@ The bundled `start.sh` handles building on demand and then spawns `node dist/ser
 
 ### `ingest_codebase`
 
-Walks a target directory, stores the metadata and (optionally) UTF-8 content for each file in a SQLite database at the directory root, and prunes entries for files that no longer exist.
+Walks a target directory, stores the metadata and (optionally) UTF-8 content for each file in a SQLite database at the directory root, and prunes entries for files that no longer exist. When GraphRAG extraction is enabled (the default), the chunker also emits structural metadata (imports, classes, functions, and call edges) into dedicated graph tables.
 
 | Argument | Type | Description |
 |----------|------|-------------|
@@ -98,9 +116,11 @@ Walks a target directory, stores the metadata and (optionally) UTF-8 content for
 | `maxFileSizeBytes` | `number` | Skip files larger than this size (default 512 KiB). |
 | `storeFileContent` | `boolean` | When `false`, only metadata is stored; content is omitted. |
 | `contentSanitizer` | `{ module: string, exportName?: string, options?: unknown }` | Dynamically import a sanitizer to scrub or redact content before it is persisted. |
-| `embedding` | `{ enabled?: boolean, model?: string, chunkSizeTokens?: number, chunkOverlapTokens?: number, batchSize?: number }` | Configure semantic chunking/embedding (defaults use `Xenova/bge-small-en-v1.5`, 256-token chunks). |
+| `embedding` | `{ enabled?: boolean, model?: string, chunkSizeTokens?: number, batchSize?: number, chunkOverlapTokens?: number }` | Configure semantic chunking/embedding (defaults use `Xenova/bge-small-en-v1.5`, 256-token chunks). |
+| `graph` | `{ enabled?: boolean }` | Toggle structural graph extraction. Disable if you only need file metadata and embeddings. |
+| `paths` | `string[]` | Optional relative paths to re-ingest incrementally (useful for watcher-driven updates). |
 
-The tool response contains both a human-readable summary and structured content describing the ingestion (file count, skipped files, deleted paths, database size, embedded chunk count, etc.).
+The tool response contains both a human-readable summary and structured content describing the ingestion (file count, skipped files, deleted paths, database size, embedded chunk count, graph node/edge upserts, etc.).
 
 ### `semantic_search`
 
@@ -116,16 +136,33 @@ Queries the indexed `file_chunks` table using cosine similarity between the `bge
 
 Each response includes the evaluated chunk count, the embedding model used, and the top-ranked snippets (path, chunk index, score, and sanitized content).
 
+### `graph_neighbors`
+
+Queries the GraphRAG side index populated during ingestion to surface structural relationships (imports and call edges) around a specific node.
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `root` (required) | `string` | Absolute or relative path to the codebase root. |
+| `node` (required) | `{ id?: string, path?: string \| null, kind?: string, name: string }` | Identifies which graph node to inspect. Provide an `id` for an exact match, or combine `name` with `path`/`kind`. |
+| `direction` | `'incoming' \| 'outgoing' \| 'both'` | Edge direction to fetch (defaults to `'outgoing'`). |
+| `limit` | `number` | Maximum edges to return (default 16, capped at 100). |
+| `databaseName` | `string` | Override the SQLite filename if you changed it during ingestion. |
+
+The response echoes the resolved node and lists neighbors with edge metadata (direction, type, line numbers, and any resolved import paths), enabling multi-hop traversal strategies.
+
 ## Project structure
 
 ```
 ├── src/
-│   ├── constants.ts   # Shared defaults for tool configuration
-│   ├── embedding.ts   # Lightweight transformer utilities for embeddings
-│   ├── ingest.ts      # Code ingestion, chunking, and SQLite persistence
-│   ├── search.ts      # Semantic retrieval over stored embeddings
-│   └── server.ts      # MCP server wiring and tool registration
-├── dist/              # Build output (generated)
+│   ├── constants.ts    # Shared defaults for tool configuration
+│   ├── embedding.ts    # Lightweight transformer utilities for embeddings
+│   ├── graph-query.ts  # GraphRAG neighbor lookup helper
+│   ├── graph.ts        # Structural metadata extraction helpers
+│   ├── ingest.ts       # Code ingestion, chunking, graph extraction, SQLite persistence
+│   ├── search.ts       # Semantic retrieval over stored embeddings
+│   ├── server.ts       # MCP server wiring and tool registration
+│   └── watcher.ts      # File-watcher daemon for incremental ingests
+├── dist/               # Build output (generated)
 ├── package.json
 ├── tsconfig.json
 └── eslint.config.js
@@ -138,6 +175,7 @@ Each response includes the evaluated chunk count, the embedding model used, and 
 - The ingestion table keeps track of added, updated, and deleted entries so repeated runs stay fast, and unchanged files are skipped using mtime/size checks.
 - Provide a sanitizer module to strip secrets or redact sensitive payloads before they reach the index.
 - Semantic embeddings (BGE small) are computed for sanitized text chunks by default; disable or tune chunking via the `embedding` ingest option if you need to trade accuracy for speed.
+- Structural metadata is stored in `code_graph_nodes` and `code_graph_edges` tables to power GraphRAG queries; disable via `graph.enabled = false` if you only need file/embedding data.
 - Patterns from a root `.gitignore` file are honored automatically so ignored artifacts never enter the index.
 
 ## Troubleshooting

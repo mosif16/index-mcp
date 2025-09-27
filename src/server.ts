@@ -1,10 +1,13 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import type { GetPromptResult } from '@modelcontextprotocol/sdk/types.js';
+import { parseArgs } from 'node:util';
 import { z } from 'zod';
 
 import { ingestCodebase } from './ingest.js';
 import { semanticSearch } from './search.js';
+import { graphNeighbors } from './graph-query.js';
+import { startIngestWatcher } from './watcher.js';
 
 const ingestToolArgs = {
   root: z.string().min(1, 'root directory is required'),
@@ -28,7 +31,13 @@ const ingestToolArgs = {
       chunkOverlapTokens: z.number().int().min(0).optional(),
       batchSize: z.number().int().positive().optional()
     })
-    .optional()
+    .optional(),
+  graph: z
+    .object({
+      enabled: z.boolean().optional()
+    })
+    .optional(),
+  paths: z.array(z.string()).optional()
 } as const;
 const ingestToolSchema = z.object(ingestToolArgs);
 
@@ -47,7 +56,9 @@ const ingestToolOutputShape = {
   deletedPaths: z.array(z.string()),
   durationMs: z.number(),
   embeddedChunkCount: z.number().int().min(0),
-  embeddingModel: z.string().nullable()
+  embeddingModel: z.string().nullable(),
+  graphNodeCount: z.number().int().min(0),
+  graphEdgeCount: z.number().int().min(0)
 } as const;
 const ingestToolOutputSchema = z.object(ingestToolOutputShape);
 
@@ -76,8 +87,48 @@ const semanticSearchOutputShape = {
 } as const;
 const semanticSearchOutputSchema = z.object(semanticSearchOutputShape);
 
+const graphNeighborArgs = {
+  root: z.string().min(1, 'root directory is required'),
+  databaseName: z.string().min(1).optional(),
+  node: z
+    .object({
+      id: z.string().optional(),
+      path: z.string().nullable().optional(),
+      kind: z.string().optional(),
+      name: z.string().min(1, 'node name is required')
+    })
+    .strict(),
+  direction: z.enum(['incoming', 'outgoing', 'both']).optional(),
+  limit: z.number().int().positive().max(100).optional()
+} as const;
+const graphNeighborSchema = z.object(graphNeighborArgs);
+
+const graphNeighborNodeSchema = z.object({
+  id: z.string(),
+  path: z.string().nullable(),
+  kind: z.string(),
+  name: z.string(),
+  signature: z.string().nullable(),
+  metadata: z.record(z.any()).nullable()
+});
+
+const graphNeighborEdgeSchema = z.object({
+  id: z.string(),
+  type: z.string(),
+  direction: z.enum(['incoming', 'outgoing']),
+  metadata: z.record(z.any()).nullable(),
+  neighbor: graphNeighborNodeSchema
+});
+
+const graphNeighborOutputShape = {
+  databasePath: z.string(),
+  node: graphNeighborNodeSchema,
+  neighbors: z.array(graphNeighborEdgeSchema)
+} as const;
+const graphNeighborOutputSchema = z.object(graphNeighborOutputShape);
+
 const SERVER_INSTRUCTIONS = [
-  'Tools available: ingest_codebase (index the current codebase into SQLite), semantic_search (embedding-powered retrieval), and indexing_guidance (prompt describing when to reindex).',
+  'Tools available: ingest_codebase (index the current codebase into SQLite), semantic_search (embedding-powered retrieval), graph_neighbors (explore GraphRAG relationships), and indexing_guidance (prompt describing when to reindex).',
   'Always run ingest_codebase on a new or freshly checked out codebase before asking for help.',
   'Any time you or the agent edits files, re-run ingest_codebase so the SQLite index stays current.'
 ].join(' ');
@@ -88,13 +139,47 @@ const INDEXING_GUIDANCE_PROMPT: GetPromptResult = {
       role: 'assistant',
       content: {
         type: 'text',
-        text: 'Tools: ingest_codebase (index the repository), semantic_search (find relevant snippets), and indexing_guidance (show these reminders). Always run ingest_codebase on a new codebase before requesting analysis, and run it again after you or I modify files so the SQLite index reflects the latest code.'
+        text: 'Tools: ingest_codebase (index the repository), semantic_search (find relevant snippets), graph_neighbors (inspect code graph relationships), and indexing_guidance (show these reminders). Always run ingest_codebase on a new codebase before requesting analysis, and run it again after you or I modify files so the SQLite index reflects the latest code.'
       }
     }
   ]
 };
 
+const cli = parseArgs({
+  options: {
+    watch: { type: 'boolean' },
+    'watch-root': { type: 'string' },
+    'watch-debounce': { type: 'string' },
+    'watch-no-initial': { type: 'boolean' },
+    'watch-quiet': { type: 'boolean' },
+    'watch-database': { type: 'string' }
+  },
+  allowPositionals: true
+});
+
 async function main() {
+  if (cli.values.watch) {
+    const debounceValue = cli.values['watch-debounce'];
+    const debounceMs = typeof debounceValue === 'string' ? Number(debounceValue) : undefined;
+    const watchRoot = (cli.values['watch-root'] as string | undefined) ?? process.cwd();
+    const watchDatabase = cli.values['watch-database'] as string | undefined;
+    const runInitial = cli.values['watch-no-initial'] ? false : true;
+    const quiet = cli.values['watch-quiet'] ?? false;
+
+    try {
+      await startIngestWatcher({
+        root: watchRoot,
+        databaseName: watchDatabase,
+        debounceMs,
+        runInitial,
+        quiet: quiet === true,
+        graph: { enabled: true }
+      });
+    } catch (error) {
+      console.error('[server] Failed to start watch daemon:', error);
+    }
+  }
+
   const server = new McpServer({ name: 'index-mcp', version: '0.1.0' }, { instructions: SERVER_INSTRUCTIONS });
 
   server.registerTool(
@@ -137,6 +222,33 @@ async function main() {
       const summary = result.results.length
         ? `Semantic search scanned ${result.evaluatedChunks} chunks and returned ${result.results.length} matches (${modelDescriptor}).`
         : 'Semantic search evaluated the index but did not return any matches.';
+      return {
+        content: [
+          {
+            type: 'text',
+            text: summary
+          }
+        ],
+        structuredContent: result
+      };
+    }
+  );
+
+  server.registerTool(
+    'graph_neighbors',
+    {
+      description: 'Explore structural relationships captured during ingestion to support GraphRAG workflows.',
+      inputSchema: graphNeighborArgs,
+      outputSchema: graphNeighborOutputShape
+    },
+    async (args) => {
+      const parsedInput = graphNeighborSchema.parse(args);
+      const result = graphNeighborOutputSchema.parse(await graphNeighbors(parsedInput));
+      const neighborCount = result.neighbors.length;
+      const directionDescriptor = parsedInput.direction ?? 'outgoing';
+      const summary = neighborCount
+        ? `Graph query found ${neighborCount} ${neighborCount === 1 ? 'neighbor' : 'neighbors'} (${directionDescriptor}) for node '${result.node.name}'.`
+        : `Graph query found no ${directionDescriptor} neighbors for node '${result.node.name}'.`;
       return {
         content: [
           {
