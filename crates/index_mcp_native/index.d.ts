@@ -53,6 +53,23 @@ export interface NativeReadResult {
   files: Array<NativeFileEntry>
   skipped: Array<NativeSkippedFile>
 }
+export interface NativeChunkFragment {
+  content: string
+  byteStart: number
+  byteEnd: number
+  lineStart: number
+  lineEnd: number
+}
+export interface AnalyzeOptions {
+  path: string
+  content: string
+  chunkSizeTokens?: number
+  chunkOverlapTokens?: number
+}
+export interface NativeAnalysisResult {
+  chunks: Array<NativeChunkFragment>
+}
 export declare function scanRepo(options: ScanOptions): NativeScanResult
 export declare function scanRepoMetadata(options: MetadataOptions): NativeMetadataResult
 export declare function readRepoFiles(options: ReadRepoOptions): NativeReadResult
+export declare function analyzeFileContent(options: AnalyzeOptions): NativeAnalysisResult

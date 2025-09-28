@@ -30,6 +30,14 @@ function hasNativeMetadataFlow(
   return typeof module.scanRepoMetadata === 'function' && typeof module.readRepoFiles === 'function';
 }
 
+function hasNativeAnalysisFlow(
+  module: NativeModule
+): module is NativeModule & {
+  analyzeFileContent: NonNullable<NativeModule['analyzeFileContent']>;
+} {
+  return typeof module.analyzeFileContent === 'function';
+}
+
 export interface ContentSanitizerSpec {
   module: string;
   exportName?: string;
@@ -388,34 +396,6 @@ function chunkText(content: string, chunkSizeTokens: number, overlapTokens: numb
   return fragments;
 }
 
-function createFallbackFragment(content: string): ChunkFragment {
-  const snippet = content.trim();
-  if (!snippet) {
-    return {
-      content: '',
-      start: 0,
-      end: 0,
-      byteStart: 0,
-      byteEnd: 0,
-      lineStart: 1,
-      lineEnd: 1
-    };
-  }
-
-  const byteLength = Buffer.byteLength(snippet, 'utf8');
-  const lineCount = snippet.split('\n').length;
-
-  return {
-    content: snippet,
-    start: 0,
-    end: snippet.length,
-    byteStart: 0,
-    byteEnd: byteLength,
-    lineStart: 1,
-    lineEnd: lineCount
-  };
-}
-
 function resolveEmbeddingDefaults(options?: EmbeddingOptions) {
   const model = options?.model ?? getDefaultEmbeddingModel();
   return {
@@ -439,6 +419,7 @@ type GraphConfig = ReturnType<typeof resolveGraphDefaults>;
 interface ProcessNativeEntriesParams {
   absoluteRoot: string;
   nativeResult: NativeScanResult;
+  nativeModule: NativeModule;
   existingByPath: Map<string, FileRow>;
   files: FileRow[];
   seenPaths: Set<string>;
@@ -463,12 +444,14 @@ async function processNativeEntries({
   sanitizeContent,
   embeddingConfig,
   graphConfig,
-  storeFileContent
+  storeFileContent,
+  nativeModule
 }: ProcessNativeEntriesParams): Promise<void> {
   for (const entry of nativeResult.files) {
     await processNativeEntry({
       absoluteRoot,
       entry,
+      nativeModule,
       existingByPath,
       files,
       seenPaths,
@@ -486,6 +469,7 @@ async function processNativeEntries({
 interface ProcessNativeEntryParams {
   absoluteRoot: string;
   entry: NativeFileEntry;
+  nativeModule: NativeModule;
   existingByPath: Map<string, FileRow>;
   files: FileRow[];
   seenPaths: Set<string>;
@@ -501,6 +485,7 @@ interface ProcessNativeEntryParams {
 async function processNativeEntry({
   absoluteRoot,
   entry,
+  nativeModule,
   existingByPath,
   files,
   seenPaths,
@@ -547,12 +532,68 @@ async function processNativeEntry({
   if (embeddingConfig.enabled && content) {
     const trimmedContent = content.trim();
     if (trimmedContent) {
-      const fragments = chunkText(
-        trimmedContent,
-        embeddingConfig.chunkSizeTokens,
-        embeddingConfig.chunkOverlapTokens
-      );
-      const targetFragments = fragments.length > 0 ? fragments : [createFallbackFragment(trimmedContent)];
+      let chunkFragments: Array<{
+        content: string;
+        byteStart: number | null;
+        byteEnd: number | null;
+        lineStart: number | null;
+        lineEnd: number | null;
+      }> = [];
+
+      if (hasNativeAnalysisFlow(nativeModule)) {
+        try {
+          const analysis = await nativeModule.analyzeFileContent({
+            path: normalizedPath,
+            content,
+            chunkSizeTokens: embeddingConfig.chunkSizeTokens,
+            chunkOverlapTokens: embeddingConfig.chunkOverlapTokens
+          });
+          chunkFragments = analysis.chunks.map((fragment) => ({
+            content: fragment.content,
+            byteStart: fragment.byteStart ?? null,
+            byteEnd: fragment.byteEnd ?? null,
+            lineStart: fragment.lineStart ?? null,
+            lineEnd: fragment.lineEnd ?? null
+          }));
+        } catch {
+          const fallbackFragments = chunkText(
+            trimmedContent,
+            embeddingConfig.chunkSizeTokens,
+            embeddingConfig.chunkOverlapTokens
+          );
+          chunkFragments = fallbackFragments.map((fragment) => ({
+            content: fragment.content,
+            byteStart: fragment.byteStart,
+            byteEnd: fragment.byteEnd,
+            lineStart: fragment.lineStart,
+            lineEnd: fragment.lineEnd
+          }));
+        }
+      } else {
+        const fallbackFragments = chunkText(
+          trimmedContent,
+          embeddingConfig.chunkSizeTokens,
+          embeddingConfig.chunkOverlapTokens
+        );
+        chunkFragments = fallbackFragments.map((fragment) => ({
+          content: fragment.content,
+          byteStart: fragment.byteStart,
+          byteEnd: fragment.byteEnd,
+          lineStart: fragment.lineStart,
+          lineEnd: fragment.lineEnd
+        }));
+      }
+
+      const targetFragments = chunkFragments.length > 0
+        ? chunkFragments
+        : [{
+            content: trimmedContent.trimEnd(),
+            byteStart: 0,
+            byteEnd: Buffer.byteLength(trimmedContent, 'utf8'),
+            lineStart: 1,
+            lineEnd: trimmedContent ? trimmedContent.split('\n').length : 1
+          }];
+
       targetFragments.forEach((fragment, index) => {
         if (!fragment.content) {
           return;
@@ -563,10 +604,10 @@ async function processNativeEntry({
           chunkIndex: index,
           content: fragment.content,
           model: embeddingConfig.model,
-          byteStart: fragment.byteStart,
-          byteEnd: fragment.byteEnd,
-          lineStart: fragment.lineStart,
-          lineEnd: fragment.lineEnd
+          byteStart: fragment.byteStart ?? null,
+          byteEnd: fragment.byteEnd ?? null,
+          lineStart: fragment.lineStart ?? null,
+          lineEnd: fragment.lineEnd ?? null
         });
       });
     }
@@ -710,6 +751,7 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
               content: existing.content,
               isBinary: existing.content === null
             },
+            nativeModule,
             existingByPath,
             files,
             seenPaths,
@@ -752,6 +794,7 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
           await processNativeEntry({
             absoluteRoot,
             entry: normalizedEntry,
+            nativeModule,
             existingByPath,
             files,
             seenPaths,
@@ -787,6 +830,7 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
       await processNativeEntries({
         absoluteRoot,
         nativeResult,
+        nativeModule,
         existingByPath,
         files,
         seenPaths,

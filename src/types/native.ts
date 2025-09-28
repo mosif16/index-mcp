@@ -59,8 +59,28 @@ export interface NativeReadResult {
   skipped: NativeSkippedFile[];
 }
 
+export interface NativeChunkFragment {
+  content: string;
+  byteStart: number;
+  byteEnd: number;
+  lineStart: number;
+  lineEnd: number;
+}
+
+export interface NativeAnalyzeOptions {
+  path: string;
+  content: string;
+  chunkSizeTokens?: number;
+  chunkOverlapTokens?: number;
+}
+
+export interface NativeAnalysisResult {
+  chunks: NativeChunkFragment[];
+}
+
 export interface NativeModule {
   scanRepo(options: NativeScanOptions): Promise<NativeScanResult>;
   scanRepoMetadata?(options: NativeMetadataOptions): Promise<NativeMetadataResult>;
   readRepoFiles?(options: NativeReadOptions): Promise<NativeReadResult>;
+  analyzeFileContent?(options: NativeAnalyzeOptions): Promise<NativeAnalysisResult>;
 }

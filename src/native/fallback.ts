@@ -5,11 +5,14 @@ import fg from 'fast-glob';
 import ignore, { type Ignore } from 'ignore';
 
 import type {
+  NativeAnalyzeOptions,
+  NativeAnalysisResult,
   NativeFileEntry,
   NativeMetadataEntry,
   NativeMetadataOptions,
   NativeMetadataResult,
   NativeModule,
+  NativeChunkFragment,
   NativeReadOptions,
   NativeReadResult,
   NativeScanOptions,
@@ -211,8 +214,213 @@ export const fallbackNativeModule: NativeModule = {
   },
   async readRepoFiles(options: NativeReadOptions): Promise<NativeReadResult> {
     return fallbackReadRepoFiles(options);
+  },
+  async analyzeFileContent(options: NativeAnalyzeOptions): Promise<NativeAnalysisResult> {
+    return fallbackAnalyzeFileContent(options);
   }
 };
+
+async function fallbackAnalyzeFileContent(options: NativeAnalyzeOptions): Promise<NativeAnalysisResult> {
+  const chunkSizeTokens = Math.max(0, Math.floor(options.chunkSizeTokens ?? 256));
+  const chunkOverlapTokens = Math.max(0, Math.floor(options.chunkOverlapTokens ?? 32));
+  const fragments = chunkText(options.content, chunkSizeTokens, chunkOverlapTokens);
+
+  const chunks: NativeChunkFragment[] = fragments.map((fragment) => ({
+    content: fragment.content,
+    byteStart: fragment.byteStart,
+    byteEnd: fragment.byteEnd,
+    lineStart: fragment.lineStart,
+    lineEnd: fragment.lineEnd
+  }));
+
+  return { chunks };
+}
+
+interface ChunkFragment {
+  content: string;
+  byteStart: number;
+  byteEnd: number;
+  lineStart: number;
+  lineEnd: number;
+}
+
+function chunkText(content: string, chunkSizeTokens: number, overlapTokens: number): ChunkFragment[] {
+  const sanitized = content.trim();
+  if (!sanitized) {
+    return [];
+  }
+
+  const chunkCharLimit = Math.max(256, chunkSizeTokens * 4);
+  const overlapCharLimit = overlapTokens * 4;
+
+  const lineStarts = computeLineStarts(sanitized);
+  const newlineIndices = collectNewlineIndices(sanitized);
+  const charToByte = computeCharByteOffsets(sanitized);
+
+  const fragments: ChunkFragment[] = [];
+  let start = 0;
+
+  while (start < sanitized.length) {
+    let end = Math.min(sanitized.length, start + chunkCharLimit);
+
+    if (end < sanitized.length) {
+      const minBreak = start + 200;
+      const breakIndex = findBreakIndex(newlineIndices, end, minBreak);
+      if (breakIndex !== null) {
+        end = breakIndex + 1;
+      }
+    }
+
+    const rawSlice = sanitized.slice(start, end);
+    const snippet = rawSlice.trimEnd();
+
+    if (!snippet) {
+      if (end <= start) {
+        break;
+      }
+      start = end;
+      continue;
+    }
+
+    const effectiveEnd = start + snippet.length;
+    const byteStart = charToByte(start);
+    const byteEnd = charToByte(effectiveEnd);
+    const lineStart = findLineNumber(lineStarts, start);
+    const lineEnd = findLineNumber(lineStarts, Math.max(effectiveEnd - 1, start));
+
+    fragments.push({
+      content: snippet,
+      byteStart,
+      byteEnd,
+      lineStart,
+      lineEnd
+    });
+
+    if (effectiveEnd >= sanitized.length) {
+      break;
+    }
+
+    const overlapStart = Math.max(effectiveEnd - overlapCharLimit, 0);
+    start = overlapStart > start ? overlapStart : effectiveEnd;
+  }
+
+  if (fragments.length === 0) {
+    return [createFallbackFragment(sanitized)];
+  }
+
+  return fragments;
+}
+
+function computeLineStarts(text: string): number[] {
+  const indices: number[] = [0];
+  for (let i = 0; i < text.length; i += 1) {
+    if (text.charCodeAt(i) === 10) {
+      indices.push(i + 1);
+    }
+  }
+  return indices;
+}
+
+function collectNewlineIndices(text: string): number[] {
+  const indices: number[] = [];
+  for (let i = 0; i < text.length; i += 1) {
+    if (text.charCodeAt(i) === 10) {
+      indices.push(i);
+    }
+  }
+  return indices;
+}
+
+function computeCharByteOffsets(text: string): (index: number) => number {
+  const cache = new Map<number, number>();
+  cache.set(0, 0);
+
+  return (index: number): number => {
+    if (index <= 0) {
+      return 0;
+    }
+    if (cache.has(index)) {
+      return cache.get(index)!;
+    }
+    const value = Buffer.byteLength(text.slice(0, index), 'utf8');
+    cache.set(index, value);
+    return value;
+  };
+}
+
+function findBreakIndex(newlines: number[], end: number, minBreak: number): number | null {
+  if (newlines.length === 0) {
+    return null;
+  }
+
+  let low = 0;
+  let high = newlines.length - 1;
+  let candidate: number | null = null;
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const value = newlines[mid];
+    if (value < end) {
+      candidate = value;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  if (candidate !== null && candidate >= minBreak) {
+    return candidate;
+  }
+
+  return null;
+}
+
+function findLineNumber(lineStarts: number[], index: number): number {
+  if (lineStarts.length === 0) {
+    return 1;
+  }
+
+  let low = 0;
+  let high = lineStarts.length - 1;
+  let candidate = 0;
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const value = lineStarts[mid];
+    if (value <= index) {
+      candidate = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  return candidate + 1;
+}
+
+function createFallbackFragment(content: string): ChunkFragment {
+  const snippet = content.trim();
+  if (!snippet) {
+    return {
+      content: '',
+      byteStart: 0,
+      byteEnd: 0,
+      lineStart: 1,
+      lineEnd: 1
+    };
+  }
+
+  const byteLength = Buffer.byteLength(snippet, 'utf8');
+  const lineCount = snippet.split('\n').length;
+
+  return {
+    content: snippet,
+    byteStart: 0,
+    byteEnd: byteLength,
+    lineStart: 1,
+    lineEnd: lineCount
+  };
+}
 
 async function loadGitignoreMatcher(root: string, exclude: string[]): Promise<Ignore> {
   const matcher = ignore();

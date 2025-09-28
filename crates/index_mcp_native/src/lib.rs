@@ -11,6 +11,8 @@ use napi_derive::napi;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
+mod chunk;
+
 #[napi(object)]
 pub struct ScanOptions {
     pub root: String,
@@ -77,6 +79,28 @@ pub struct NativeMetadataResult {
 pub struct NativeReadResult {
     pub files: Vec<NativeFileEntry>,
     pub skipped: Vec<NativeSkippedFile>,
+}
+
+#[napi(object)]
+pub struct NativeChunkFragment {
+    pub content: String,
+    pub byte_start: f64,
+    pub byte_end: f64,
+    pub line_start: f64,
+    pub line_end: f64,
+}
+
+#[napi(object)]
+pub struct AnalyzeOptions {
+    pub path: String,
+    pub content: String,
+    pub chunk_size_tokens: Option<f64>,
+    pub chunk_overlap_tokens: Option<f64>,
+}
+
+#[napi(object)]
+pub struct NativeAnalysisResult {
+    pub chunks: Vec<NativeChunkFragment>,
 }
 
 struct ScanJob {
@@ -211,6 +235,31 @@ pub fn read_repo_files(options: ReadRepoOptions) -> Result<NativeReadResult> {
     files.sort_by(|a, b| a.path.cmp(&b.path));
 
     Ok(NativeReadResult { files, skipped })
+}
+
+#[napi]
+pub fn analyze_file_content(options: AnalyzeOptions) -> Result<NativeAnalysisResult> {
+    let chunk_size = options.chunk_size_tokens.unwrap_or(256.0).max(0.0).floor() as usize;
+    let chunk_overlap = options
+        .chunk_overlap_tokens
+        .unwrap_or(32.0)
+        .max(0.0)
+        .floor() as usize;
+
+    let fragments = chunk::chunk_content(&options.content, chunk_size, chunk_overlap);
+
+    let chunks = fragments
+        .into_iter()
+        .map(|fragment| NativeChunkFragment {
+            content: fragment.content,
+            byte_start: fragment.byte_start as f64,
+            byte_end: fragment.byte_end as f64,
+            line_start: fragment.line_start as f64,
+            line_end: fragment.line_end as f64,
+        })
+        .collect();
+
+    Ok(NativeAnalysisResult { chunks })
 }
 
 fn collect_scan_jobs(
@@ -449,7 +498,10 @@ fn extract_error_path<'a>(error: &'a IgnoreError) -> Option<&'a Path> {
         IgnoreError::WithPath { path, .. } => Some(path.as_path()),
         IgnoreError::WithDepth { err, .. } => extract_error_path(err),
         IgnoreError::Loop { child, .. } => Some(child.as_path()),
-        IgnoreError::Io(_) | IgnoreError::Glob { .. } | IgnoreError::UnrecognizedFileType(_) | IgnoreError::InvalidDefinition => None,
+        IgnoreError::Io(_)
+        | IgnoreError::Glob { .. }
+        | IgnoreError::UnrecognizedFileType(_)
+        | IgnoreError::InvalidDefinition => None,
     }
 }
 

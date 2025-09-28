@@ -20,8 +20,7 @@ if [[ ! -f "$DIST_ENTRY" ]]; then
 fi
 
 NATIVE_DIR="$SCRIPT_DIR/crates/index_mcp_native"
-NATIVE_BINARY="$NATIVE_DIR/index.node"
-if [[ ! -f "$NATIVE_BINARY" ]]; then
+if ! compgen -G "$NATIVE_DIR"/index*.node > /dev/null; then
   echo "[index-mcp] Native addon missing; provisioning @index-mcp/native..." >&2
   if ! command -v npm >/dev/null 2>&1; then
     echo "[index-mcp] Error: npm is not on PATH to build the native addon." >&2
