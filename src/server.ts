@@ -11,9 +11,16 @@ import { startIngestWatcher } from './watcher.js';
 import { resolveRootPath, type RootResolutionContext } from './root-resolver.js';
 import { getPackageMetadata } from './package-metadata.js';
 import { logger } from './logger.js';
-import { normalizeGraphArgs, normalizeIngestArgs, normalizeSearchArgs, normalizeStatusArgs } from './input-normalizer.js';
+import {
+  normalizeContextBundleArgs,
+  normalizeGraphArgs,
+  normalizeIngestArgs,
+  normalizeSearchArgs,
+  normalizeStatusArgs
+} from './input-normalizer.js';
 import { getNativeModuleStatus, loadNativeModule } from './native/index.js';
 import { getIndexStatus } from './status.js';
+import { getContextBundle } from './context-bundle.js';
 
 function rethrowWithContext(toolName: string, error: unknown): never {
   if (error instanceof Error) {
@@ -414,6 +421,159 @@ const graphNeighborOutputShape = {
 } as const;
 const graphNeighborOutputSchema = z.object(graphNeighborOutputShape);
 
+const contextBundleJsonSchema = {
+  type: 'object',
+  title: 'Context Bundle Parameters',
+  description: 'Return a compact summary of file metadata, definitions, snippets, and related symbols.',
+  properties: {
+    root: {
+      type: 'string',
+      description: 'Absolute or relative path to the indexed workspace (aliases: path, workspace_root).'
+    },
+    databaseName: {
+      type: 'string',
+      description: 'Optional SQLite filename (aliases: database, database_path, db). Defaults to .mcp-index.sqlite.'
+    },
+    file: {
+      type: 'string',
+      description: 'Relative file path to summarize (aliases: file_path, target_path).'
+    },
+    symbol: {
+      type: ['object', 'string'],
+      description: 'Optional symbol selector (aliases: target_symbol, symbol_selector). When a string, treated as the symbol name.',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Symbol name to focus on.'
+        },
+        kind: {
+          type: 'string',
+          description: 'Optional graph node kind to disambiguate (e.g., function, class).'
+        }
+      },
+      required: ['name'],
+      additionalProperties: false
+    },
+    maxSnippets: {
+      type: 'integer',
+      description: 'Maximum snippets to include (aliases: snippet_limit, max_chunks). Defaults to 3, max 10.',
+      minimum: 0,
+      maximum: 10
+    },
+    maxNeighbors: {
+      type: 'integer',
+      description: 'Maximum related edges to include per direction (aliases: neighbor_limit, edge_limit). Defaults to 12, max 50.',
+      minimum: 0,
+      maximum: 50
+    }
+  },
+  required: ['root', 'file'],
+  additionalProperties: false
+} as const;
+
+const contextBundleSymbolSchema = z
+  .object({
+    name: z.string({ required_error: 'symbol name is required' }).min(1, 'symbol name is required'),
+    kind: z.string().min(1).optional()
+  })
+  .strict();
+
+const contextBundleInputSchema = z
+  .object({
+    root: z
+      .string({ required_error: 'root directory is required' })
+      .min(1, 'root directory is required')
+      .describe('Absolute or relative path to the indexed workspace.'),
+    databaseName: z.string().min(1).optional().describe('Optional SQLite filename.'),
+    file: z
+      .string({ required_error: 'file path is required' })
+      .min(1, 'file path is required')
+      .describe('Relative file path to summarize.'),
+    symbol: contextBundleSymbolSchema.optional().describe('Optional symbol selector to focus the bundle.'),
+    maxSnippets: z
+      .number()
+      .int()
+      .min(0)
+      .max(10)
+      .optional()
+      .describe('Maximum snippets to include (defaults to 3, caps at 10).'),
+    maxNeighbors: z
+      .number()
+      .int()
+      .min(0)
+      .max(50)
+      .optional()
+      .describe('Maximum related edges per direction (defaults to 12, caps at 50).')
+  })
+  .strict();
+
+const contextBundleDefinitionSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  kind: z.string(),
+  signature: z.string().nullable(),
+  rangeStart: z.number().int().nullable(),
+  rangeEnd: z.number().int().nullable(),
+  metadata: z.record(z.any()).nullable()
+});
+
+const contextBundleFileSchema = z.object({
+  path: z.string(),
+  size: z.number(),
+  modified: z.number(),
+  hash: z.string(),
+  lastIndexedAt: z.number()
+});
+
+const contextBundleNeighborNodeSchema = z.object({
+  id: z.string(),
+  path: z.string().nullable(),
+  kind: z.string(),
+  name: z.string(),
+  signature: z.string().nullable(),
+  metadata: z.record(z.any()).nullable()
+});
+
+const contextBundleNeighborSchema = z.object({
+  id: z.string(),
+  type: z.string(),
+  direction: z.enum(['incoming', 'outgoing']),
+  metadata: z.record(z.any()).nullable(),
+  fromNodeId: z.string(),
+  toNodeId: z.string(),
+  neighbor: contextBundleNeighborNodeSchema
+});
+
+const contextBundleSnippetSchema = z.object({
+  source: z.enum(['chunk', 'content']),
+  chunkIndex: z.number().int().nullable(),
+  content: z.string(),
+  byteStart: z.number().int().nullable(),
+  byteEnd: z.number().int().nullable(),
+  lineStart: z.number().int().nullable(),
+  lineEnd: z.number().int().nullable()
+});
+
+const contextBundleIngestionSchema = z.object({
+  id: z.string(),
+  finishedAt: z.number(),
+  durationMs: z.number(),
+  fileCount: z.number()
+});
+
+const contextBundleOutputShape = {
+  databasePath: z.string(),
+  file: contextBundleFileSchema,
+  definitions: z.array(contextBundleDefinitionSchema),
+  focusDefinition: contextBundleDefinitionSchema.nullable(),
+  related: z.array(contextBundleNeighborSchema),
+  snippets: z.array(contextBundleSnippetSchema),
+  latestIngestion: contextBundleIngestionSchema.nullable(),
+  warnings: z.array(z.string())
+} as const;
+
+const contextBundleOutputSchema = z.object(contextBundleOutputShape);
+
 const indexStatusJsonSchema = {
   type: 'object',
   title: 'Index Status Parameters',
@@ -493,6 +653,14 @@ const infoToolJsonSchema = {
   additionalProperties: false
 } as const;
 
+const indexingGuidanceToolJsonSchema = {
+  type: 'object',
+  title: 'Indexing Guidance Parameters',
+  description: 'No parameters required.',
+  properties: {},
+  additionalProperties: false
+} as const;
+
 const nativeStatusSchema = z.object({
   status: z.enum(['ready', 'unavailable', 'error']),
   message: z.string().optional()
@@ -514,9 +682,15 @@ const infoToolOutputShape = {
 
 const infoToolOutputSchema = z.object(infoToolOutputShape);
 
+const indexingGuidanceOutputShape = {
+  guidance: z.string()
+} as const;
+
+const indexingGuidanceOutputSchema = z.object(indexingGuidanceOutputShape);
+
 const SERVER_INSTRUCTIONS = [
-  `Tools available from ${serverName} v${serverVersion}: ingest_codebase (index the current codebase into SQLite), semantic_search (embedding-powered retrieval with byte/line metadata and nearby context), graph_neighbors (explore GraphRAG relationships), index_status (summarize index coverage and recent ingestions), info (report server diagnostics), and indexing_guidance (prompt describing when to reindex).`,
-  'Use this MCP server for all repository-aware searches: run ingest_codebase to refresh context, rely on semantic_search for locating code or docs, inspect graph_neighbors for structural call/import details, and call index_status when you need to confirm how fresh or comprehensive the existing index is before considering any other lookup method.',
+  `Tools available from ${serverName} v${serverVersion}: ingest_codebase (index the current codebase into SQLite), semantic_search (embedding-powered retrieval with byte/line metadata and nearby context), graph_neighbors (explore GraphRAG relationships), context_bundle (assemble file-level definitions, snippets, and related symbols), index_status (summarize index coverage and recent ingestions), info (report server diagnostics), indexing_guidance_tool (return the indexing reminders as a tool), and indexing_guidance (prompt describing when to reindex).`,
+  'Use this MCP server for all repository-aware searches: run ingest_codebase to refresh context, rely on semantic_search for locating code or docs, inspect graph_neighbors for structural call/import details, request context_bundle when the agent needs a compact summary of a file or symbol, call index_status to confirm coverage, and use indexing_guidance_tool when the client cannot invoke prompts directly.',
   'Always run ingest_codebase on a new or freshly checked out codebase before asking for help.',
   'When running ingest_codebase, always exclude files and folders matched by .gitignore patterns so ignored content never enters the index.',
   'Any time you or the agent edits files—or after upgrading this server—re-run ingest_codebase so the SQLite index stays current and backfills the latest metadata.'
@@ -686,6 +860,58 @@ async function main() {
   );
 
   server.registerTool(
+    'context_bundle',
+    {
+      description: 'Bundle file metadata, definitions, snippets, and related symbols into an agent-friendly payload.',
+      inputSchema: contextBundleInputSchema.shape,
+      outputSchema: contextBundleOutputShape,
+      annotations: {
+        jsonSchema: contextBundleJsonSchema
+      }
+    },
+    async (args, extra) => {
+      try {
+        const normalizedInput = normalizeContextBundleArgs(args);
+        const parsedInput = contextBundleInputSchema.parse(normalizedInput);
+        const context = createRootResolutionContext(extra);
+        const resolvedRoot = resolveRootPath(parsedInput.root, context);
+        const bundleInput = { ...parsedInput, root: resolvedRoot };
+        const result = contextBundleOutputSchema.parse(await getContextBundle(bundleInput));
+
+        const summaryPieces: string[] = [
+          `Context bundle for ${result.file.path} includes ${result.definitions.length} definition(s)`
+        ];
+        if (result.focusDefinition) {
+          summaryPieces.push(`focused on ${result.focusDefinition.kind} '${result.focusDefinition.name}'`);
+        }
+        if (result.related.length) {
+          summaryPieces.push(`${result.related.length} related edge(s)`);
+        }
+        if (result.snippets.length) {
+          summaryPieces.push(`${result.snippets.length} snippet(s)`);
+        }
+        if (result.warnings.length) {
+          summaryPieces.push('warnings present');
+        }
+
+        const summary = `${summaryPieces.join(', ')}.`;
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: summary
+            }
+          ],
+          structuredContent: result
+        };
+      } catch (error) {
+        return rethrowWithContext('context_bundle', error);
+      }
+    }
+  );
+
+  server.registerTool(
     'index_status',
     {
       description: 'Summarize the SQLite index to reveal ingestion freshness, coverage, and graph/embedding availability.',
@@ -788,6 +1014,56 @@ async function main() {
     }
   );
 
+
+  server.registerTool(
+    'indexing_guidance_tool',
+    {
+      description: 'Return indexing reminders as a tool for clients that cannot invoke prompts.',
+      inputSchema: {},
+      outputSchema: indexingGuidanceOutputShape,
+      annotations: {
+        jsonSchema: indexingGuidanceToolJsonSchema
+      }
+    },
+    async () => {
+      const guidanceText = INDEXING_GUIDANCE_PROMPT.messages
+        .map((message) => {
+          const { content } = message;
+          if (typeof content === 'string') {
+            return content;
+          }
+          if (Array.isArray(content)) {
+            return content
+              .map((item) => (item && typeof item === 'object' && 'type' in item && item.type === 'text' ? item.text ?? '' : ''))
+              .filter((text) => typeof text === 'string' && text.trim().length > 0)
+              .join('\n');
+          }
+          if (content && typeof content === 'object' && 'type' in content && (content as { type?: string }).type === 'text') {
+            const textValue = (content as { text?: string }).text;
+            return typeof textValue === 'string' ? textValue : '';
+          }
+          return '';
+        })
+        .filter((snippet) => snippet.trim().length > 0)
+        .join('\n');
+
+      const payload = indexingGuidanceOutputSchema.parse({
+        guidance:
+          guidanceText ||
+          'Always run ingest_codebase on new or freshly checked out codebases and after file edits so the SQLite index stays current.'
+      });
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: 'Indexing guidance provided. See structured guidance field for full reminders.'
+          }
+        ],
+        structuredContent: payload
+      };
+    }
+  );
 
   server.registerPrompt(
     'indexing_guidance',

@@ -169,6 +169,31 @@ Queries the GraphRAG side index populated during ingestion to surface structural
 
 The response echoes the resolved node and lists neighbors with edge metadata (direction, type, line numbers, and any resolved import paths), enabling multi-hop traversal strategies.
 
+### `context_bundle`
+
+Returns a single payload that combines file metadata, discovered definitions, related graph edges, and representative content snippets. Use it when an MCP client needs a concise “cheat sheet” for a file or a specific symbol without issuing multiple tool calls.
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `root` (required) | `string` | Absolute or relative path to the codebase root. |
+| `file` (required) | `string` | Relative path (POSIX) to the file to summarize. Aliases such as `file_path` and `target_path` are accepted. |
+| `symbol` | `{ name: string, kind?: string } \| string` | Optional symbol selector. When provided, `context_bundle` highlights the matching graph node and filters related edges. |
+| `maxSnippets` | `number` | Maximum snippets to return (default 3, capped at 10). |
+| `maxNeighbors` | `number` | Maximum related edges per direction (default 12, capped at 50). |
+| `databaseName` | `string` | Override the SQLite filename if you changed it during ingestion. |
+
+Snippets come from embedded chunks when available; otherwise the tool falls back to stored file content so clients always receive at least one preview. Warnings surface when graph metadata or snippets are missing, helping agents decide whether a fresh ingest is needed.
+
+### `indexing_guidance_tool`
+
+Returns the same reminders surfaced by the `indexing_guidance` prompt, but wrapped as a tool response for clients that do not expose prompt invocation yet. The tool accepts no parameters.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `guidance` | `string` | Full text of the current indexing reminders (mirrors the prompt output). |
+
+MCP clients can surface this string directly or store it for quick reference next to the other tool results. The textual summary included in the MCP response simply notes that guidance is available; use the structured `guidance` field for the complete instructions.
+
 ### `index_status`
 
 Surfaces high-signal diagnostics about the on-disk SQLite index so agents can understand how fresh and complete their context is before issuing expensive search calls. The tool reports database size, total files/chunks captured, available embedding models, graph coverage, and the most recent ingestion runs.

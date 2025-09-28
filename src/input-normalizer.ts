@@ -1,4 +1,5 @@
 import { type GraphNodeDescriptor } from './graph-query.js';
+import type { ContextBundleSymbolSelector } from './context-bundle.js';
 
 export type UnknownRecord = Record<string, unknown>;
 
@@ -204,6 +205,39 @@ export function normalizeStatusArgs(raw: unknown): UnknownRecord {
   });
 
   coerceNumber(record, 'historyLimit');
+
+  return record;
+}
+
+export function normalizeContextBundleArgs(raw: unknown): UnknownRecord {
+  if (!raw || typeof raw !== 'object') {
+    return {};
+  }
+
+  const record = cloneRecord(raw as UnknownRecord);
+
+  applyAliases(record, {
+    root: ['path', 'project_path', 'workspace_root', 'working_directory'],
+    databaseName: ['database', 'database_path', 'db'],
+    file: ['file_path', 'relative_path', 'target_path'],
+    symbol: ['symbol_selector', 'target_symbol'],
+    maxSnippets: ['snippet_limit', 'max_chunks'],
+    maxNeighbors: ['neighbor_limit', 'edge_limit', 'max_edges']
+  });
+
+  coerceNumber(record, 'maxSnippets');
+  coerceNumber(record, 'maxNeighbors');
+
+  const symbolValue = record.symbol;
+  if (typeof symbolValue === 'string') {
+    record.symbol = { name: symbolValue } satisfies ContextBundleSymbolSelector;
+  } else if (symbolValue && typeof symbolValue === 'object') {
+    const symbolRecord = symbolValue as UnknownRecord;
+    applyAliases(symbolRecord, {
+      name: ['symbol_name'],
+      kind: ['symbol_kind', 'type']
+    });
+  }
 
   return record;
 }

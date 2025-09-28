@@ -87,6 +87,8 @@ After editing the config, restart the Codex CLI agent so the new MCP server regi
 | `ingest_codebase` | Tool  | Walks a directory, stores metadata + optional UTF-8 content for each file in `.mcp-index.sqlite`, and prunes deleted entries. Accepts optional glob include/exclude, custom database name, file-size limits, and `storeFileContent` toggle. |
 | `semantic_search` | Tool  | Embedding-powered retrieval across stored `file_chunks` for natural-language or code queries. Returns scored snippets along with byte offsets, line spans, and nearby context so agents can understand matches without opening the source file. |
 | `graph_neighbors` | Tool  | Query GraphRAG nodes/edges produced during ingestion to inspect imports and call relationships. |
+| `context_bundle` | Tool  | Package file metadata, definitions, related edges, and representative snippets into a single response so agents can bootstrap context quickly. |
+| `indexing_guidance_tool` | Tool  | Deliver the same reminders as the `indexing_guidance` prompt so clients without prompt support can fetch indexing guidance. |
 | `index_status`    | Tool  | Summarizes database freshness (file counts, chunk totals, graph coverage) and recent ingestion runs so callers know whether they need to re-index before querying. |
 | `info`            | Tool  | Reports server diagnostics including package version, instruction banner, platform, native addon status, and other environment details useful for debugging deployments. |
 
@@ -102,7 +104,9 @@ After editing the config, restart the Codex CLI agent so the new MCP server regi
 
 When the client connects, it receives this message:
 
-> Tools available: ingest_codebase (index the current codebase into SQLite), semantic_search (embedding-powered retrieval), graph_neighbors (GraphRAG neighbor explorer), and indexing_guidance (prompt describing when to reindex). Always run ingest_codebase on a new or freshly checked out codebase before asking for help. Any time you or the agent edits files, re-run ingest_codebase so the SQLite index stays current.
+> Tools available: ingest_codebase (index the current codebase into SQLite), semantic_search (embedding-powered retrieval), graph_neighbors (GraphRAG neighbor explorer), context_bundle (assemble file-level definitions, snippets, and related symbols), indexing_guidance_tool (fetch the reminders without prompt support), and indexing_guidance (prompt describing when to reindex). Always run ingest_codebase on a new or freshly checked out codebase before asking for help. Any time you or the agent edits files, re-run ingest_codebase so the SQLite index stays current.
+
+If your client does not yet support MCP prompts, call `indexing_guidance_tool` to retrieve the guidance text in the response’s `guidance` field; the tool mirrors the prompt content exactly so both entry points stay in sync.
 
 ## 7. Typical Workflow
 
