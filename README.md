@@ -182,7 +182,7 @@ Walks a target directory, stores the metadata and (optionally) UTF-8 content for
 | `maxFileSizeBytes` | `number` | Skip files larger than this size (default 8 MiB). |
 | `storeFileContent` | `boolean` | When `false`, only metadata is stored; content is omitted. Accepts string booleans (`"true"`/`"false"`). |
 | `contentSanitizer` | `{ module: string, exportName?: string, options?: unknown }` | Dynamically import a sanitizer to scrub or redact content before it is persisted. |
-| `embedding` | `{ enabled?: boolean, model?: string, chunkSizeTokens?: number, batchSize?: number, chunkOverlapTokens?: number }` | Configure semantic chunking/embedding (defaults use `Xenova/all-MiniLM-L6-v2`, 256-token chunks, batch size 32). Aliases like `embedding_model`, `chunk_overlap`, and `batch_size` are accepted. |
+| `embedding` | `{ enabled?: boolean, model?: string, chunkSizeTokens?: number, batchSize?: number, chunkOverlapTokens?: number }` | Configure semantic chunking/embedding (defaults use `Xenova/bge-small-en-v1.5`, 256-token chunks, batch size 32). Aliases like `embedding_model`, `chunk_overlap`, and `batch_size` are accepted. |
 | `graph` | `{ enabled?: boolean }` | Toggle structural graph extraction (aliases such as `graph_options.active` are supported). Disable if you only need file metadata and embeddings. |
 | `paths` | `string[]` | Optional relative paths to re-ingest incrementally (aliases: `target_paths`, `changed_paths`). |
 
