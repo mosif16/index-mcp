@@ -80,7 +80,7 @@ A helper script `start.sh` (at the project root) ensures the TypeScript is built
 {
   "mcpServers": {
     "index-mcp": {
-      "command": "/Users/mohammedsayf/Desktop/index-mcp/start.sh"
+      "command": "/absolute/path/to/index-mcp/start.sh"
     }
   }
 }
@@ -97,7 +97,7 @@ During iterative development you can swap the command for `npx tsx` and point at
         "tsx",
         "src/server.ts"
       ],
-      "cwd": "/Users/mohammedsayf/Desktop/index-mcp"
+      "cwd": "/absolute/path/to/index-mcp"
     }
   }
 }
@@ -109,10 +109,10 @@ If you use `agent.toml`, mirror the JSON config and set any log overrides you ne
 
 ```toml
 [mcp_servers.index_mcp]
-command = "/Users/mohammedsayf/Desktop/index-mcp/start.sh"
+command = "/absolute/path/to/index-mcp/start.sh"
 env = {
   INDEX_MCP_LOG_LEVEL = "info",
-  INDEX_MCP_LOG_DIR = "/Users/mohammedsayf/.index-mcp/logs",
+  INDEX_MCP_LOG_DIR = "/absolute/path/to/.index-mcp/logs",
   INDEX_MCP_LOG_CONSOLE = "false"
 }
 ```
