@@ -189,3 +189,21 @@ export function normalizeGraphArgs(raw: unknown): UnknownRecord {
 
   return record;
 }
+
+export function normalizeStatusArgs(raw: unknown): UnknownRecord {
+  if (!raw || typeof raw !== 'object') {
+    return {};
+  }
+
+  const record = cloneRecord(raw as UnknownRecord);
+
+  applyAliases(record, {
+    root: ['path', 'project_path', 'workspace_root', 'working_directory'],
+    databaseName: ['database', 'database_path', 'db'],
+    historyLimit: ['history_limit', 'ingestion_limit', 'recent_runs']
+  });
+
+  coerceNumber(record, 'historyLimit');
+
+  return record;
+}

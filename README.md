@@ -169,6 +169,18 @@ Queries the GraphRAG side index populated during ingestion to surface structural
 
 The response echoes the resolved node and lists neighbors with edge metadata (direction, type, line numbers, and any resolved import paths), enabling multi-hop traversal strategies.
 
+### `index_status`
+
+Surfaces high-signal diagnostics about the on-disk SQLite index so agents can understand how fresh and complete their context is before issuing expensive search calls. The tool reports database size, total files/chunks captured, available embedding models, graph coverage, and the most recent ingestion runs.
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `root` (required) | `string` | Absolute or relative path to the codebase root. |
+| `databaseName` | `string` | Override the SQLite filename if you changed it during ingestion. |
+| `historyLimit` | `number` | Maximum number of recent ingestions to return (default 5, capped at 25). Accepts aliases like `history_limit` and `recent_runs`. |
+
+The response includes a concise summary plus a structured payload with database metadata and an array of recent ingestions (each showing timestamps, file counts, skipped/deleted entries, and duration). When the database is missing, the tool explicitly instructs the caller to run `ingest_codebase` first.
+
 ### `info`
 
 Reports MCP server diagnostics: the dynamically loaded package name/version, active instruction banner, native addon health, and basic runtime details. Use it to verify deployments before calling heavier tools.
@@ -194,6 +206,7 @@ The tool accepts no parameters and responds with a structured payload containing
 │   ├── input-normalizer.ts # Alias/coercion helpers for tool parameters
 │   ├── logger.ts           # Pino logger configured for file + optional console output
 │   ├── package-metadata.ts # Lazy loader for name/version/description from package.json
+│   ├── status.ts           # Inspect existing SQLite indexes for coverage and ingestion history
 │   ├── search.ts           # Semantic retrieval over stored embeddings
 │   ├── server.ts           # MCP server wiring and tool registration
 │   └── watcher.ts          # File-watcher daemon for incremental ingests

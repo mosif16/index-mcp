@@ -11,8 +11,9 @@ import { startIngestWatcher } from './watcher.js';
 import { resolveRootPath, type RootResolutionContext } from './root-resolver.js';
 import { getPackageMetadata } from './package-metadata.js';
 import { logger } from './logger.js';
-import { normalizeGraphArgs, normalizeIngestArgs, normalizeSearchArgs } from './input-normalizer.js';
-import { loadNativeModule } from './native/index.js';
+import { normalizeGraphArgs, normalizeIngestArgs, normalizeSearchArgs, normalizeStatusArgs } from './input-normalizer.js';
+import { getNativeModuleStatus, loadNativeModule } from './native/index.js';
+import { getIndexStatus } from './status.js';
 
 function rethrowWithContext(toolName: string, error: unknown): never {
   if (error instanceof Error) {
@@ -413,6 +414,77 @@ const graphNeighborOutputShape = {
 } as const;
 const graphNeighborOutputSchema = z.object(graphNeighborOutputShape);
 
+const indexStatusJsonSchema = {
+  type: 'object',
+  title: 'Index Status Parameters',
+  description: 'Summarize the SQLite index, including ingestion history and coverage metrics.',
+  properties: {
+    root: {
+      type: 'string',
+      description: 'Absolute or relative path to the workspace whose index should be inspected.'
+    },
+    databaseName: {
+      type: 'string',
+      description: 'Optional SQLite filename (aliases: database, database_path, db). Defaults to .mcp-index.sqlite.'
+    },
+    historyLimit: {
+      type: 'integer',
+      description: 'Number of recent ingestions to include (aliases: history_limit, ingestion_limit, recent_runs). Defaults to 5.',
+      minimum: 0,
+      maximum: 25
+    }
+  },
+  required: ['root'],
+  additionalProperties: false
+} as const;
+
+const indexStatusSchema = z
+  .object({
+    root: z
+      .string({ required_error: 'root directory is required' })
+      .min(1, 'root directory is required')
+      .describe('Absolute or relative path to the workspace whose index should be inspected.'),
+    databaseName: z
+      .string()
+      .min(1)
+      .describe('Optional SQLite filename (aliases: database, database_path, db).')
+      .optional(),
+    historyLimit: z
+      .number()
+      .int()
+      .min(0)
+      .max(25)
+      .describe('Number of recent ingestions to include (defaults to 5, capped at 25).')
+      .optional()
+  })
+  .strict();
+
+const indexStatusIngestionSchema = z.object({
+  id: z.string(),
+  root: z.string(),
+  startedAt: z.number(),
+  finishedAt: z.number(),
+  durationMs: z.number(),
+  fileCount: z.number(),
+  skippedCount: z.number(),
+  deletedCount: z.number()
+});
+
+const indexStatusOutputShape = {
+  databasePath: z.string(),
+  databaseExists: z.boolean(),
+  databaseSizeBytes: z.number().nullable(),
+  totalFiles: z.number(),
+  totalChunks: z.number(),
+  embeddingModels: z.array(z.string()),
+  totalGraphNodes: z.number(),
+  totalGraphEdges: z.number(),
+  latestIngestion: indexStatusIngestionSchema.nullable(),
+  recentIngestions: z.array(indexStatusIngestionSchema)
+} as const;
+
+const indexStatusOutputSchema = z.object(indexStatusOutputShape);
+
 const infoToolJsonSchema = {
   type: 'object',
   title: 'Info Parameters',
@@ -443,8 +515,8 @@ const infoToolOutputShape = {
 const infoToolOutputSchema = z.object(infoToolOutputShape);
 
 const SERVER_INSTRUCTIONS = [
-  `Tools available from ${serverName} v${serverVersion}: ingest_codebase (index the current codebase into SQLite), semantic_search (embedding-powered retrieval with byte/line metadata and nearby context), graph_neighbors (explore GraphRAG relationships), info (report server diagnostics), and indexing_guidance (prompt describing when to reindex).`,
-  'Use this MCP server for all repository-aware searches: run ingest_codebase to refresh context, rely on semantic_search for locating code or docs, and use graph_neighbors when you need structural call/import details before considering any other lookup method.',
+  `Tools available from ${serverName} v${serverVersion}: ingest_codebase (index the current codebase into SQLite), semantic_search (embedding-powered retrieval with byte/line metadata and nearby context), graph_neighbors (explore GraphRAG relationships), index_status (summarize index coverage and recent ingestions), info (report server diagnostics), and indexing_guidance (prompt describing when to reindex).`,
+  'Use this MCP server for all repository-aware searches: run ingest_codebase to refresh context, rely on semantic_search for locating code or docs, inspect graph_neighbors for structural call/import details, and call index_status when you need to confirm how fresh or comprehensive the existing index is before considering any other lookup method.',
   'Always run ingest_codebase on a new or freshly checked out codebase before asking for help.',
   'Always exclude files and folders matched by .gitignore patterns so ignored content never enters the index.',
   'Any time you or the agent edits files—or after upgrading this server—re-run ingest_codebase so the SQLite index stays current and backfills the latest metadata.'
@@ -456,7 +528,7 @@ const INDEXING_GUIDANCE_PROMPT: GetPromptResult = {
       role: 'assistant',
       content: {
         type: 'text',
-        text: 'Tools: ingest_codebase (index the repository), semantic_search (find relevant snippets), graph_neighbors (inspect code graph relationships), and indexing_guidance (show these reminders). Always run ingest_codebase on a new codebase before requesting analysis, and run it again after you or I modify files so the SQLite index reflects the latest code.'
+        text: 'Tools: ingest_codebase (index the repository), semantic_search (find relevant snippets), graph_neighbors (inspect code graph relationships), index_status (check ingestion freshness and coverage), and indexing_guidance (show these reminders). Always run ingest_codebase on a new codebase before requesting analysis, and run it again after you or I modify files so the SQLite index reflects the latest code.'
       }
     }
   ]
@@ -613,6 +685,49 @@ async function main() {
     }
   );
 
+  server.registerTool(
+    'index_status',
+    {
+      description: 'Summarize the SQLite index to reveal ingestion freshness, coverage, and graph/embedding availability.',
+      inputSchema: indexStatusSchema.shape,
+      outputSchema: indexStatusOutputShape,
+      annotations: {
+        jsonSchema: indexStatusJsonSchema
+      }
+    },
+    async (args, extra) => {
+      try {
+        const normalizedInput = normalizeStatusArgs(args);
+        const parsedInput = indexStatusSchema.parse(normalizedInput);
+        const context = createRootResolutionContext(extra);
+        const resolvedRoot = resolveRootPath(parsedInput.root, context);
+        const statusInput = { ...parsedInput, root: resolvedRoot };
+        const result = indexStatusOutputSchema.parse(await getIndexStatus(statusInput));
+
+        let summary: string;
+        if (!result.databaseExists) {
+          summary = `No SQLite index found at ${result.databasePath}. Run ingest_codebase to create a fresh index.`;
+        } else if (!result.latestIngestion) {
+          summary = `Index file ${result.databasePath} exists but no ingestion history is recorded yet. Run ingest_codebase to populate it.`;
+        } else {
+          const finishedIso = new Date(result.latestIngestion.finishedAt).toISOString();
+          summary = `Index at ${result.databasePath} covers ${result.totalFiles} files and ${result.totalChunks} chunks. Last ingest finished ${finishedIso} after processing ${result.latestIngestion.fileCount} files.`;
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: summary
+            }
+          ],
+          structuredContent: result
+        };
+      } catch (error) {
+        return rethrowWithContext('index_status', error);
+      }
+    }
+  );
 
   server.registerTool(
     'info',
@@ -628,7 +743,17 @@ async function main() {
       let nativeModuleStatus: z.infer<typeof nativeStatusSchema> = { status: 'unavailable' };
       try {
         await loadNativeModule();
-        nativeModuleStatus = { status: 'ready' };
+        const nativeStatus = getNativeModuleStatus();
+        if (nativeStatus.state === 'native') {
+          nativeModuleStatus = { status: 'ready' };
+        } else if (nativeStatus.state === 'fallback') {
+          const message = nativeStatus.message
+            ? `${nativeStatus.message} (using JS fallback scanner)`
+            : 'Using JS fallback scanner because native bindings were unavailable.';
+          nativeModuleStatus = { status: 'error', message };
+        } else {
+          nativeModuleStatus = { status: 'unavailable' };
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         nativeModuleStatus = { status: 'error', message };

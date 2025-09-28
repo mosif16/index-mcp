@@ -87,6 +87,8 @@ After editing the config, restart the Codex CLI agent so the new MCP server regi
 | `ingest_codebase` | Tool  | Walks a directory, stores metadata + optional UTF-8 content for each file in `.mcp-index.sqlite`, and prunes deleted entries. Accepts optional glob include/exclude, custom database name, file-size limits, and `storeFileContent` toggle. |
 | `semantic_search` | Tool  | Embedding-powered retrieval across stored `file_chunks` for natural-language or code queries. Returns scored snippets along with byte offsets, line spans, and nearby context so agents can understand matches without opening the source file. |
 | `graph_neighbors` | Tool  | Query GraphRAG nodes/edges produced during ingestion to inspect imports and call relationships. |
+| `index_status`    | Tool  | Summarizes database freshness (file counts, chunk totals, graph coverage) and recent ingestion runs so callers know whether they need to re-index before querying. |
+| `info`            | Tool  | Reports server diagnostics including package version, instruction banner, platform, native addon status, and other environment details useful for debugging deployments. |
 
 `semantic_search` responses now surface the top matches with their sanitized content, cosine score, byte offsets, line spans, and two lines of context before/after the hit. Re-run `ingest_codebase` after updating this server so existing databases backfill the new metadata columns.
 
