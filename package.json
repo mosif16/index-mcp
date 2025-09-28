@@ -2,6 +2,7 @@
   "name": "index-mcp",
   "version": "0.1.0",
   "description": "MCP server that ingests a codebase into a local SQLite index at the repo root.",
+  "license": "MIT",
   "type": "module",
   "main": "dist/server.js",
   "exports": {
