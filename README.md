@@ -112,7 +112,7 @@ env = {
 }
 ```
 
-The bundled `start.sh` builds on demand, verifies the native addon, and then launches `node dist/server.js`. Adjust the paths and environment variables (including the optional `INDEX_MCP_LOG_*` values) to match your machine.
+The bundled `start.sh` builds on demand, rebuilds the Rust addon in release mode on every launch, and then runs `node dist/server.js`. Adjust the paths and environment variables (including the optional `INDEX_MCP_LOG_*` values) to match your machine.
 
 
 ## Exposed tools
@@ -151,11 +151,13 @@ Walks a target directory, stores the metadata and (optionally) UTF-8 content for
 | `maxFileSizeBytes` | `number` | Skip files larger than this size (default 8 MiB). |
 | `storeFileContent` | `boolean` | When `false`, only metadata is stored; content is omitted. Accepts string booleans (`"true"`/`"false"`). |
 | `contentSanitizer` | `{ module: string, exportName?: string, options?: unknown }` | Dynamically import a sanitizer to scrub or redact content before it is persisted. |
-| `embedding` | `{ enabled?: boolean, model?: string, chunkSizeTokens?: number, batchSize?: number, chunkOverlapTokens?: number }` | Configure semantic chunking/embedding (defaults use `Xenova/all-MiniLM-L6-v2`, 256-token chunks). Aliases like `embedding_model`, `chunk_overlap`, and `batch_size` are accepted. |
+| `embedding` | `{ enabled?: boolean, model?: string, chunkSizeTokens?: number, batchSize?: number, chunkOverlapTokens?: number }` | Configure semantic chunking/embedding (defaults use `Xenova/all-MiniLM-L6-v2`, 256-token chunks, batch size 32). Aliases like `embedding_model`, `chunk_overlap`, and `batch_size` are accepted. |
 | `graph` | `{ enabled?: boolean }` | Toggle structural graph extraction (aliases such as `graph_options.active` are supported). Disable if you only need file metadata and embeddings. |
 | `paths` | `string[]` | Optional relative paths to re-ingest incrementally (aliases: `target_paths`, `changed_paths`). |
 
 The tool response contains both a human-readable summary and structured content describing the ingestion (file count, skipped files, deleted paths, database size, embedded chunk count, graph node/edge upserts, etc.).
+
+When `paths` are omitted the server inspects MCP request metadata, headers, and environment variables for change lists (for example `MCP_CHANGED_PATHS` or `x-mcp-changed-paths`) and restricts the ingest to those files when possible, reducing unnecessary rescans.
 
 ### `semantic_search`
 

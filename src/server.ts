@@ -9,6 +9,7 @@ import { semanticSearch } from './search.js';
 import { graphNeighbors, type GraphNodeDescriptor } from './graph-query.js';
 import { startIngestWatcher } from './watcher.js';
 import { resolveRootPath, type RootResolutionContext } from './root-resolver.js';
+import { resolveIngestPaths } from './changed-paths.js';
 import { getPackageMetadata } from './package-metadata.js';
 import { logger } from './logger.js';
 import {
@@ -940,7 +941,12 @@ async function main() {
         const parsedInput = ingestToolSchema.parse(normalizedInput);
         const context = createRootResolutionContext(extra);
         const resolvedRoot = resolveRootPath(parsedInput.root, context);
-        const ingestInput = { ...parsedInput, root: resolvedRoot };
+        const resolvedPaths = resolveIngestPaths(resolvedRoot, context, parsedInput.paths);
+        const ingestInput = {
+          ...parsedInput,
+          root: resolvedRoot,
+          paths: resolvedPaths.length ? resolvedPaths : undefined
+        };
         const result = ingestToolOutputSchema.parse(await ingestCodebase(ingestInput));
 
         return {

@@ -19,7 +19,7 @@ const DEFAULT_MAX_FILE_SIZE_BYTES = 8 * 1024 * 1024; // 8 MiB
 
 const DEFAULT_CHUNK_SIZE_TOKENS = 256;
 const DEFAULT_CHUNK_OVERLAP_TOKENS = 32;
-const DEFAULT_EMBED_BATCH_SIZE = 12;
+const DEFAULT_EMBED_BATCH_SIZE = 32;
 
 function hasNativeMetadataFlow(
   module: NativeModule

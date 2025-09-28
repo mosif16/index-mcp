@@ -7,7 +7,7 @@ This document explains how to run and use the **index-mcp** server with the Code
 - **Purpose:** Index a codebase into a root-level SQLite database (`.mcp-index.sqlite`) so agents can perform fast metadata/content queries.
 - **Primary tool:** `ingest_codebase` – scans files, stores hashes, metadata, and optionally UTF-8 content.
 - **Supporting prompt:** `indexing_guidance` – returns reminders about when to run the ingestor.
-- **Helper script:** `start.sh` – builds the project (if needed) and launches the MCP server over stdio.
+- **Helper script:** `start.sh` – builds the project (if needed), rebuilds the native addon in release mode, and launches the MCP server over stdio.
 - **GraphRAG side index:** Structural relationships (imports, functions, calls) are captured automatically and can be explored via `graph_neighbors`.
 - **Watch mode:** `npm run watch` streams incremental ingests so the SQLite database stays aligned with live edits.
 
@@ -174,15 +174,17 @@ If your client does not yet support MCP prompts, call `indexing_guidance_tool` t
 | `maxFileSizeBytes` | `8388608` (8 MiB)     | Larger files are skipped and logged in `skipped`. |
 | `storeFileContent` | `true`                | If `false`, only metadata is stored. Binary detection uses a null-byte heuristic. |
 | `contentSanitizer` | `undefined`           | Optional `{ module, exportName?, options? }` descriptor that loads a sanitizer to redact or strip contents before storage. |
-| `embedding`        | defaults enabled       | Configure semantic chunking (`enabled`, `model`, `chunkSizeTokens`, `chunkOverlapTokens`, `batchSize`). |
+| `embedding`        | defaults enabled       | Configure semantic chunking (`enabled`, `model`, `chunkSizeTokens`, `chunkOverlapTokens`, `batchSize`, default batch size 32). |
 | `graph`            | `true`                 | Toggle structural graph extraction (`{ enabled?: boolean }`). |
 | `paths`            | `undefined`            | Provide specific relative paths to update incrementally (skips scanning untouched files). |
 
 During repeat runs the ingestor compares size + mtime against the existing database, reusing prior entries when nothing changed and skipping unnecessary file reads. A `.gitignore` located at the root is parsed automatically so ignored paths never enter the index.
 
+When clients omit `paths`, the server inspects MCP metadata, headers, and environment variables (for example `MCP_CHANGED_PATHS` or `x-mcp-changed-paths`) to infer the changed files and limit ingestion to those paths whenever possible.
+
 Relative `root` values are resolved against the caller-supplied working directory metadata (such as `_meta.cwd`), common headers (`x-mcp-cwd`, `x-mcp-root`, `x-workspace-*`), and environment overrides like `MCP_CALLER_CWD` or `MCP_WORKSPACE_ROOT` when available, so CLI clients can safely pass `"."` to target their active workspace. If no caller context is provided the path falls back to the server process directory.
 
-Embeddings default to the `Xenova/all-MiniLM-L6-v2` model provided by `@xenova/transformers`. The server downloads and caches the model on first use; set `embedding.model` in tool inputs if you need an alternative.
+Embeddings default to the `Xenova/all-MiniLM-L6-v2` model provided by `@xenova/transformers` with a batch size of 32. The server downloads and caches the model on first use; set `embedding.model` in tool inputs if you need an alternative.
 
 The tool response returns both text (a summary) and `structuredContent` matching the `ingestToolOutputShape` schema.
 

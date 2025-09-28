@@ -20,15 +20,18 @@ if [[ ! -f "$DIST_ENTRY" ]]; then
 fi
 
 NATIVE_DIR="$SCRIPT_DIR/crates/index_mcp_native"
-if ! compgen -G "$NATIVE_DIR"/index*.node > /dev/null; then
-  echo "[index-mcp] Native addon missing; provisioning @index-mcp/native..." >&2
-  if ! command -v npm >/dev/null 2>&1; then
-    echo "[index-mcp] Error: npm is not on PATH to build the native addon." >&2
-    exit 1
-  fi
-  (cd "$NATIVE_DIR" && npm install) >&2
-  (cd "$NATIVE_DIR" && npm run build) >&2
+if ! command -v npm >/dev/null 2>&1; then
+  echo "[index-mcp] Error: npm is not on PATH to build the native addon." >&2
+  exit 1
 fi
+
+if [[ ! -d "$NATIVE_DIR/node_modules" ]]; then
+  echo "[index-mcp] Installing native addon dependencies..." >&2
+  (cd "$NATIVE_DIR" && npm install) >&2
+fi
+
+echo "[index-mcp] Building native addon in release mode..." >&2
+(cd "$NATIVE_DIR" && npm run build) >&2
 
 echo "[index-mcp] Launching MCP server from $DIST_ENTRY" >&2
 exec "$NODE_BIN" "$DIST_ENTRY"

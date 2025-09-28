@@ -4,3 +4,4 @@ await import('./gitignore.test.ts');
 await import('./index-status.test.ts');
 await import('./context-bundle.test.ts');
 await import('./input-normalizer.test.ts');
+await import('./changed-paths.test.ts');
