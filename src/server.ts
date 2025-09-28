@@ -518,7 +518,7 @@ const SERVER_INSTRUCTIONS = [
   `Tools available from ${serverName} v${serverVersion}: ingest_codebase (index the current codebase into SQLite), semantic_search (embedding-powered retrieval with byte/line metadata and nearby context), graph_neighbors (explore GraphRAG relationships), index_status (summarize index coverage and recent ingestions), info (report server diagnostics), and indexing_guidance (prompt describing when to reindex).`,
   'Use this MCP server for all repository-aware searches: run ingest_codebase to refresh context, rely on semantic_search for locating code or docs, inspect graph_neighbors for structural call/import details, and call index_status when you need to confirm how fresh or comprehensive the existing index is before considering any other lookup method.',
   'Always run ingest_codebase on a new or freshly checked out codebase before asking for help.',
-  'Always exclude files and folders matched by .gitignore patterns so ignored content never enters the index.',
+  'When running ingest_codebase, always exclude files and folders matched by .gitignore patterns so ignored content never enters the index.',
   'Any time you or the agent edits files—or after upgrading this server—re-run ingest_codebase so the SQLite index stays current and backfills the latest metadata.'
 ].join(' ');
 
@@ -528,7 +528,7 @@ const INDEXING_GUIDANCE_PROMPT: GetPromptResult = {
       role: 'assistant',
       content: {
         type: 'text',
-        text: 'Tools: ingest_codebase (index the repository), semantic_search (find relevant snippets), graph_neighbors (inspect code graph relationships), index_status (check ingestion freshness and coverage), and indexing_guidance (show these reminders). Always run ingest_codebase on a new codebase before requesting analysis, and run it again after you or I modify files so the SQLite index reflects the latest code.'
+        text: 'Tools: ingest_codebase (index the repository), semantic_search (find relevant snippets), graph_neighbors (inspect code graph relationships), index_status (check ingestion freshness and coverage), and indexing_guidance (show these reminders). Always run ingest_codebase on a new codebase before requesting analysis, ensure .gitignore-matched files stay excluded whenever you index, and run ingest_codebase again after you or I modify files so the SQLite index reflects the latest code.'
       }
     }
   ]
