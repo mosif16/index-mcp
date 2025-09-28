@@ -154,6 +154,95 @@ export function normalizeSearchArgs(raw: unknown): UnknownRecord {
   return record;
 }
 
+export function normalizeLookupArgs(raw: unknown): UnknownRecord {
+  if (!raw || typeof raw !== 'object') {
+    return {};
+  }
+
+  const record = cloneRecord(raw as UnknownRecord);
+
+  applyAliases(record, {
+    root: ['path', 'project_path', 'workspace_root', 'working_directory'],
+    mode: ['intent', 'action'],
+    query: ['text', 'search', 'search_query'],
+    file: ['file_path', 'target_path'],
+    symbol: ['symbol_selector', 'target_symbol', 'focus_symbol'],
+    node: ['graph_node', 'graph_target', 'target', 'entity'],
+    databaseName: ['database', 'database_path', 'db'],
+    limit: ['max_results', 'top_k', 'max_neighbors'],
+    maxSnippets: ['snippet_limit', 'max_chunks'],
+    maxNeighbors: ['neighbor_limit', 'edge_limit'],
+    direction: ['edge_direction'],
+    model: ['embedding_model']
+  });
+
+  if (typeof record.mode === 'string') {
+    record.mode = record.mode.trim().toLowerCase();
+  }
+
+  if (typeof record.query === 'string') {
+    const queryText = record.query.trim();
+    if (queryText) {
+      record.query = queryText;
+    } else {
+      delete record.query;
+    }
+  }
+
+  if (typeof record.file === 'string') {
+    const filePath = record.file.trim();
+    if (filePath) {
+      record.file = filePath;
+    } else {
+      delete record.file;
+    }
+  }
+
+  if (record.symbol && typeof record.symbol === 'object') {
+    applyAliases(record.symbol as UnknownRecord, {
+      name: ['identifier'],
+      kind: ['type'],
+      path: ['file', 'file_path']
+    });
+  }
+
+  if (typeof record.symbol === 'string') {
+    const symbolName = record.symbol.trim();
+    if (symbolName) {
+      record.symbol = { name: symbolName } as ContextBundleSymbolSelector;
+    } else {
+      delete record.symbol;
+    }
+  }
+
+  if (record.node && typeof record.node === 'object') {
+    applyAliases(record.node as UnknownRecord, {
+      name: ['identifier'],
+      path: ['file', 'file_path'],
+      kind: ['type']
+    });
+  }
+
+  if (typeof record.node === 'string') {
+    const nodeName = record.node.trim();
+    if (nodeName) {
+      record.node = { name: nodeName };
+    } else {
+      delete record.node;
+    }
+  }
+
+  coerceNumber(record, 'limit');
+  coerceNumber(record, 'maxSnippets');
+  coerceNumber(record, 'maxNeighbors');
+
+  if (typeof record.direction === 'string') {
+    record.direction = record.direction.trim().toLowerCase();
+  }
+
+  return record;
+}
+
 export function normalizeGraphArgs(raw: unknown): UnknownRecord {
   if (!raw || typeof raw !== 'object') {
     return {};

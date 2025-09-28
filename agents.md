@@ -89,6 +89,7 @@ Environment variables scoped in the `env` table support both the `INDEX_MCP_*` n
 
 | Name             | Type  | Description |
 |------------------|-------|-------------|
+| `code_lookup`     | Tool  | Unified entry point that auto-routes queries to semantic search, context bundles, or graph neighbors so Codex doesn’t need to pick a specialist tool manually. |
 | `ingest_codebase` | Tool  | Walks a directory, stores metadata + optional UTF-8 content for each file in `.mcp-index.sqlite`, and prunes deleted entries. Accepts optional glob include/exclude, custom database name, file-size limits, and `storeFileContent` toggle. |
 | `semantic_search` | Tool  | Embedding-powered retrieval across stored `file_chunks` for natural-language or code queries. Returns scored snippets along with byte offsets, line spans, and nearby context so agents can understand matches without opening the source file. |
 | `graph_neighbors` | Tool  | Query GraphRAG nodes/edges produced during ingestion to inspect imports and call relationships. |
@@ -109,7 +110,7 @@ Environment variables scoped in the `env` table support both the `INDEX_MCP_*` n
 
 When the client connects, it receives this message:
 
-> Tools available: ingest_codebase (index the current codebase into SQLite), semantic_search (embedding-powered retrieval), graph_neighbors (GraphRAG neighbor explorer), context_bundle (assemble file-level definitions, snippets, and related symbols), indexing_guidance_tool (fetch the reminders without prompt support), and indexing_guidance (prompt describing when to reindex). Always run ingest_codebase on a new or freshly checked out codebase before asking for help. Any time you or the agent edits files, re-run ingest_codebase so the SQLite index stays current.
+> Tools available: code_lookup (single entry point that routes to semantic_search, context_bundle, or graph_neighbors), ingest_codebase (index the current codebase into SQLite), semantic_search (embedding-powered retrieval), graph_neighbors (GraphRAG neighbor explorer), context_bundle (assemble file-level definitions, snippets, and related symbols), indexing_guidance_tool (fetch the reminders without prompt support), and indexing_guidance (prompt describing when to reindex). Always run ingest_codebase on a new or freshly checked out codebase before asking for help. Any time you or the agent edits files, re-run ingest_codebase so the SQLite index stays current, then prefer code_lookup for follow-up lookups.
 
 If your client does not yet support MCP prompts, call `indexing_guidance_tool` to retrieve the guidance text in the response’s `guidance` field; the tool mirrors the prompt content exactly so both entry points stay in sync.
 
@@ -117,10 +118,14 @@ If your client does not yet support MCP prompts, call `indexing_guidance_tool` t
 
 1. **Start the MCP server** via Codex (`start.sh` handles build & launch).
 2. **Initial indexing:** call `ingest_codebase` with `{"root": "."}` (or another path) before requesting analysis.
-3. *(Optional)* **Run the watcher:** `npm run watch` keeps the database fresh by triggering incremental ingests when files change.
-4. **Perform agent tasks** (editing files, searching, etc.).
-5. **Re-index after edits:** call `ingest_codebase` again (or rely on the watcher) so `.mcp-index.sqlite` reflects the latest changes.
-6. **Optional inspection:** use `sqlite3 .mcp-index.sqlite` to run ad-hoc queries if needed.
+3. **Reach for `code_lookup` first:**
+   - `query="..."` -> semantic search results.
+   - `file="..."` (optionally `symbol`) -> context bundle summary + related edges/snippets.
+   - `mode="graph"` plus `symbol`/`node` -> graph neighbor exploration.
+4. *(Optional)* **Run the watcher:** `npm run watch` keeps the database fresh by triggering incremental ingests when files change.
+5. **Use specialist tools** directly when you need their structured responses without routing (e.g. `index_status` or `info`).
+6. **Re-index after edits:** call `ingest_codebase` again (or rely on the watcher) so `.mcp-index.sqlite` reflects the latest changes.
+7. **Optional inspection:** use `sqlite3 .mcp-index.sqlite` to run ad-hoc queries if needed.
 
 ## 8. Database Schema (summary)
 

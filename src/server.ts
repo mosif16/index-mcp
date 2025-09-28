@@ -6,7 +6,7 @@ import { z } from 'zod';
 
 import { ingestCodebase } from './ingest.js';
 import { semanticSearch } from './search.js';
-import { graphNeighbors } from './graph-query.js';
+import { graphNeighbors, type GraphNodeDescriptor } from './graph-query.js';
 import { startIngestWatcher } from './watcher.js';
 import { resolveRootPath, type RootResolutionContext } from './root-resolver.js';
 import { getPackageMetadata } from './package-metadata.js';
@@ -15,6 +15,7 @@ import {
   normalizeContextBundleArgs,
   normalizeGraphArgs,
   normalizeIngestArgs,
+  normalizeLookupArgs,
   normalizeSearchArgs,
   normalizeStatusArgs
 } from './input-normalizer.js';
@@ -474,7 +475,8 @@ const contextBundleJsonSchema = {
 const contextBundleSymbolSchema = z
   .object({
     name: z.string({ required_error: 'symbol name is required' }).min(1, 'symbol name is required'),
-    kind: z.string().min(1).optional()
+    kind: z.string().min(1).optional(),
+    path: z.string().min(1).nullable().optional()
   })
   .strict();
 
@@ -573,6 +575,181 @@ const contextBundleOutputShape = {
 } as const;
 
 const contextBundleOutputSchema = z.object(contextBundleOutputShape);
+
+const codeLookupJsonSchema = {
+  type: 'object',
+  title: 'Code Lookup Parameters',
+  description:
+    'Choose between semantic search, context bundle, or graph neighbor queries with a single entry point.',
+  properties: {
+    root: {
+      type: 'string',
+      description: 'Absolute or relative path to the indexed workspace (aliases: path, workspace_root).'
+    },
+    mode: {
+      type: 'string',
+      enum: ['search', 'bundle', 'graph'],
+      description: 'Optional explicit mode override. Defaults to search when query is present, bundle when file is provided, otherwise graph.'
+    },
+    query: {
+      type: 'string',
+      description: 'Natural language or code query for semantic search (aliases: text, search, search_query).'
+    },
+    file: {
+      type: 'string',
+      description: 'Relative file path to summarize (aliases: file_path, target_path).'
+    },
+    symbol: {
+      type: ['object', 'string'],
+      description: 'Optional symbol selector for bundles or graph lookups (aliases: target_symbol, symbol_selector). String values are treated as the symbol name.',
+      properties: {
+        name: { type: 'string', description: 'Symbol name.' },
+        kind: { type: 'string', description: 'Optional symbol kind (e.g., function, class).' },
+        path: {
+          type: ['string', 'null'],
+          description: 'Optional file path override (aliases: file, file_path).'
+        }
+      },
+      required: ['name'],
+      additionalProperties: false
+    },
+    node: {
+      type: ['object', 'string'],
+      description: 'Graph node descriptor (aliases: graph_node, graph_target, entity). String values are treated as the node name.',
+      properties: {
+        id: { type: 'string', description: 'Exact graph node id.' },
+        name: { type: 'string', description: 'Node name.' },
+        kind: { type: 'string', description: 'Optional node kind.' },
+        path: { type: ['string', 'null'], description: 'Optional node path.' }
+      },
+      additionalProperties: false
+    },
+    direction: {
+      type: 'string',
+      enum: ['incoming', 'outgoing', 'both'],
+      description: 'Graph neighbor direction (alias: edge_direction). Defaults to outgoing.'
+    },
+    limit: {
+      type: 'integer',
+      description: 'Result limit for search or graph queries (aliases: max_results, top_k, max_neighbors). Defaults to tool defaults, capped at 100.'
+    },
+    maxSnippets: {
+      type: 'integer',
+      description: 'Maximum snippets in context bundle responses (aliases: snippet_limit, max_chunks). Defaults to 3, max 10.'
+    },
+    maxNeighbors: {
+      type: 'integer',
+      description: 'Maximum related edges in context bundle responses (aliases: neighbor_limit, edge_limit). Defaults to 12, max 50.'
+    },
+    databaseName: {
+      type: 'string',
+      description: 'Optional SQLite filename (aliases: database, database_path, db). Defaults to .mcp-index.sqlite.'
+    },
+    model: {
+      type: 'string',
+      description: 'Embedding model filter for semantic search (alias: embedding_model). Required when multiple models exist.'
+    }
+  },
+  required: ['root'],
+  additionalProperties: false
+} as const;
+
+const codeLookupModeSchema = z.enum(['search', 'bundle', 'graph']);
+
+const graphNodeInputSchema = z
+  .object({
+    id: z.string().optional(),
+    name: z.string().optional(),
+    kind: z.string().optional(),
+    path: z.string().nullable().optional()
+  })
+  .strict();
+
+const codeLookupInputBaseSchema = z
+  .object({
+    root: z
+      .string({ required_error: 'root directory is required' })
+      .min(1, 'root directory is required')
+      .describe('Absolute or relative path to the indexed workspace.'),
+    mode: codeLookupModeSchema.optional().describe('Optional explicit mode override.'),
+    query: z.string().optional().describe('Semantic search query text.'),
+    file: z.string().optional().describe('Relative file path to summarize.'),
+    symbol: contextBundleSymbolSchema.optional().describe('Optional symbol selector.'),
+    node: graphNodeInputSchema.optional().describe('Optional graph node descriptor.'),
+    direction: z.enum(['incoming', 'outgoing', 'both']).optional().describe('Graph neighbor direction.'),
+    limit: z
+      .number()
+      .int()
+      .positive()
+      .max(100)
+      .optional()
+      .describe('Result limit for search or graph queries.'),
+    maxSnippets: z
+      .number()
+      .int()
+      .min(0)
+      .max(10)
+      .optional()
+      .describe('Maximum snippets to include (defaults to 3, caps at 10).'),
+    maxNeighbors: z
+      .number()
+      .int()
+      .min(0)
+      .max(50)
+      .optional()
+      .describe('Maximum related edges per direction (defaults to 12, caps at 50).'),
+    databaseName: z.string().min(1).optional().describe('Optional SQLite filename.'),
+    model: z.string().min(1).optional().describe('Embedding model filter for semantic search.')
+  })
+  .strict();
+
+const codeLookupInputSchema = codeLookupInputBaseSchema.superRefine((value, ctx) => {
+  const requestedMode = value.mode;
+  const hasQuery = typeof value.query === 'string' && value.query.trim().length > 0;
+  const hasFile = typeof value.file === 'string' && value.file.trim().length > 0;
+  const hasGraphDescriptor = Boolean(
+    (value.node && (value.node.id || value.node.name)) || (value.symbol && value.symbol.name)
+    );
+
+    if (!requestedMode && !hasQuery && !hasFile && !hasGraphDescriptor) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Provide a query, file, or graph node to look up.'
+      });
+    }
+
+    if (requestedMode === 'search' && !hasQuery) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['query'],
+        message: 'code_lookup mode "search" requires a query.'
+      });
+    }
+    if (requestedMode === 'bundle' && !hasFile) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['file'],
+        message: 'code_lookup mode "bundle" requires a file path.'
+      });
+    }
+    if (requestedMode === 'graph' && !hasGraphDescriptor) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['node'],
+        message: 'code_lookup mode "graph" requires a node or symbol.'
+      });
+    }
+  });
+
+const codeLookupOutputShape = {
+  mode: codeLookupModeSchema,
+  summary: z.string(),
+  searchResult: semanticSearchOutputSchema.optional(),
+  bundleResult: contextBundleOutputSchema.optional(),
+  graphResult: graphNeighborOutputSchema.optional()
+} as const;
+
+const codeLookupOutputSchema = z.object(codeLookupOutputShape);
 
 const indexStatusJsonSchema = {
   type: 'object',
@@ -689,11 +866,10 @@ const indexingGuidanceOutputShape = {
 const indexingGuidanceOutputSchema = z.object(indexingGuidanceOutputShape);
 
 const SERVER_INSTRUCTIONS = [
-  `Tools available from ${serverName} v${serverVersion}: ingest_codebase (index the current codebase into SQLite), semantic_search (embedding-powered retrieval with byte/line metadata and nearby context), graph_neighbors (explore GraphRAG relationships), context_bundle (assemble file-level definitions, snippets, and related symbols), index_status (summarize index coverage and recent ingestions), info (report server diagnostics), indexing_guidance_tool (return the indexing reminders as a tool), and indexing_guidance (prompt describing when to reindex).`,
-  'Use this MCP server for all repository-aware searches: run ingest_codebase to refresh context, rely on semantic_search for locating code or docs, inspect graph_neighbors for structural call/import details, request context_bundle when the agent needs a compact summary of a file or symbol, call index_status to confirm coverage, and use indexing_guidance_tool when the client cannot invoke prompts directly.',
-  'Always run ingest_codebase on a new or freshly checked out codebase before asking for help.',
-  'When running ingest_codebase, always exclude files and folders matched by .gitignore patterns so ignored content never enters the index.',
-  'Any time you or the agent edits files—or after upgrading this server—re-run ingest_codebase so the SQLite index stays current and backfills the latest metadata.'
+  `Tools available from ${serverName} v${serverVersion}: code_lookup (single entry point that routes to semantic search, context bundles, or graph neighbors), ingest_codebase (index the current codebase into SQLite), semantic_search (embedding-powered retrieval with byte/line metadata and nearby context), graph_neighbors (explore GraphRAG relationships), context_bundle (assemble file-level definitions, snippets, and related symbols), index_status (summarize index coverage and recent ingestions), info (report server diagnostics), indexing_guidance_tool (return the indexing reminders as a tool), and indexing_guidance (prompt describing when to reindex).`,
+  'Start new tasks by confirming the index: run ingest_codebase on a fresh checkout, then prefer code_lookup query="..." for discovery, code_lookup file="..." (with optional symbol) for file context, and code_lookup mode="graph" when you need structural neighbors.',
+  'Use index_status before searching if you are unsure whether the SQLite index is current, and fall back to ingest_codebase whenever files change so downstream lookups stay accurate.',
+  'Keep .gitignore exclusions in place during ingest so ignored content never enters the index, and remember that semantic_search, graph_neighbors, and context_bundle remain available when you need direct access to those specialized responses.'
 ].join(' ');
 
 const INDEXING_GUIDANCE_PROMPT: GetPromptResult = {
@@ -780,6 +956,184 @@ async function main() {
         };
       } catch (error) {
         return rethrowWithContext('ingest_codebase', error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'code_lookup',
+    {
+      description:
+        'Single entry point that routes repository lookups to semantic search, context bundles, or graph neighbors.',
+      inputSchema: codeLookupInputBaseSchema.shape,
+      outputSchema: codeLookupOutputShape,
+      annotations: {
+        jsonSchema: codeLookupJsonSchema
+      }
+    },
+    async (args: unknown, extra: unknown) => {
+      try {
+        const normalizedInput = normalizeLookupArgs(args);
+        const parsedInput = codeLookupInputSchema.parse(normalizedInput);
+        const context = createRootResolutionContext(extra);
+        const resolvedRoot = resolveRootPath(parsedInput.root, context);
+
+        const resolvedMode =
+          parsedInput.mode ?? (parsedInput.query ? 'search' : parsedInput.file ? 'bundle' : 'graph');
+
+        if (resolvedMode === 'search') {
+          if (!parsedInput.query) {
+            throw new Error('code_lookup search mode requires a query.');
+          }
+          const searchInput = {
+            root: resolvedRoot,
+            query: parsedInput.query,
+            databaseName: parsedInput.databaseName,
+            limit: parsedInput.limit,
+            model: parsedInput.model
+          };
+          const searchResult = semanticSearchOutputSchema.parse(await semanticSearch(searchInput));
+          const modelDescriptor = searchResult.embeddingModel ? `model ${searchResult.embeddingModel}` : 'stored embeddings';
+          const summary = searchResult.results.length
+            ? `Semantic search scanned ${searchResult.evaluatedChunks} chunks and returned ${searchResult.results.length} match(es) (${modelDescriptor}).`
+            : 'Semantic search evaluated the index but did not return any matches.';
+
+          const payload = codeLookupOutputSchema.parse({
+            mode: 'search',
+            summary,
+            searchResult
+          });
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: summary
+              }
+            ],
+            structuredContent: payload
+          };
+        }
+
+        if (resolvedMode === 'bundle') {
+          if (!parsedInput.file) {
+            throw new Error('code_lookup bundle mode requires a file path.');
+          }
+
+          const bundleInput = {
+            root: resolvedRoot,
+            databaseName: parsedInput.databaseName,
+            file: parsedInput.file,
+            symbol: parsedInput.symbol,
+            maxSnippets: parsedInput.maxSnippets,
+            maxNeighbors: parsedInput.maxNeighbors
+          };
+          const bundleResult = contextBundleOutputSchema.parse(await getContextBundle(bundleInput));
+          const summaryPieces: string[] = [
+            `Context bundle for ${bundleResult.file.path} includes ${bundleResult.definitions.length} definition(s)`
+          ];
+          if (bundleResult.focusDefinition) {
+            summaryPieces.push(`focused on ${bundleResult.focusDefinition.kind} '${bundleResult.focusDefinition.name}'`);
+          }
+          if (bundleResult.related.length) {
+            summaryPieces.push(`${bundleResult.related.length} related edge(s)`);
+          }
+          if (bundleResult.snippets.length) {
+            summaryPieces.push(`${bundleResult.snippets.length} snippet(s)`);
+          }
+          if (bundleResult.warnings.length) {
+            summaryPieces.push('warnings present');
+          }
+
+          const summary = `${summaryPieces.join(', ')}.`;
+
+          const payload = codeLookupOutputSchema.parse({
+            mode: 'bundle',
+            summary,
+            bundleResult
+          });
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: summary
+              }
+            ],
+            structuredContent: payload
+          };
+        }
+
+        let graphNode: GraphNodeDescriptor | undefined;
+
+        if (parsedInput.node) {
+          const { id, name, kind, path } = parsedInput.node;
+          const resolvedName =
+            name ?? parsedInput.symbol?.name ?? parsedInput.file ?? (id ? id : undefined);
+          if (!resolvedName) {
+            throw new Error('code_lookup graph mode requires node name when id is not provided.');
+          }
+          graphNode = {
+            name: resolvedName,
+            ...(id ? { id } : {}),
+            ...(kind ? { kind } : {})
+          };
+          if (path !== undefined) {
+            graphNode.path = path;
+          }
+        } else if (parsedInput.symbol) {
+          const symbolPath = parsedInput.symbol.path;
+          graphNode = {
+            name: parsedInput.symbol.name,
+            ...(parsedInput.symbol.kind ? { kind: parsedInput.symbol.kind } : {})
+          };
+          if (symbolPath !== undefined) {
+            graphNode.path = symbolPath;
+          } else if (parsedInput.file) {
+            graphNode.path = parsedInput.file;
+          }
+        } else if (parsedInput.file) {
+          graphNode = {
+            name: parsedInput.file,
+            path: parsedInput.file
+          };
+        }
+
+        if (!graphNode || (!graphNode.id && !graphNode.name)) {
+          throw new Error('code_lookup graph mode requires node or symbol with a name.');
+        }
+
+        const graphInput = {
+          root: resolvedRoot,
+          databaseName: parsedInput.databaseName,
+          node: graphNode,
+          direction: parsedInput.direction,
+          limit: parsedInput.limit
+        };
+        const graphResult = graphNeighborOutputSchema.parse(await graphNeighbors(graphInput));
+        const neighborCount = graphResult.neighbors.length;
+        const directionDescriptor = graphInput.direction ?? 'outgoing';
+        const summary = neighborCount
+          ? `Graph query found ${neighborCount} ${neighborCount === 1 ? 'neighbor' : 'neighbors'} (${directionDescriptor}) for node '${graphResult.node.name}'.`
+          : `Graph query found no ${directionDescriptor} neighbors for node '${graphResult.node.name}'.`;
+
+        const payload = codeLookupOutputSchema.parse({
+          mode: 'graph',
+          summary,
+          graphResult
+        });
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: summary
+            }
+          ],
+          structuredContent: payload
+        };
+      } catch (error) {
+        return rethrowWithContext('code_lookup', error);
       }
     }
   );

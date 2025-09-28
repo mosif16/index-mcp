@@ -117,6 +117,27 @@ The bundled `start.sh` builds on demand, verifies the native addon, and then lau
 
 ## Exposed tools
 
+### `code_lookup`
+
+Unified entry point that routes repository lookups to the appropriate specialist tool. Provide a `query` to perform semantic search, a `file` (and optional `symbol`) to return a context bundle, or set `mode="graph"` with a `node`/`symbol` descriptor to inspect structural neighbors. When omitted, the server infers the mode in the order `search -> bundle -> graph`. This reduces the amount of tool-selection logic the client needs to learn.
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `root` (required) | `string` | Absolute or relative path to the workspace. |
+| `mode` | `'search' \| 'bundle' \| 'graph'` | Override the inferred behavior. |
+| `query` | `string` | Natural-language or code query for semantic search. |
+| `file` | `string` | Relative file path to summarize via `context_bundle`. |
+| `symbol` | `{ name: string, kind?: string, path?: string \| null } \| string` | Optional symbol focus for bundles or graph lookups. Strings are treated as the symbol name. |
+| `node` | `{ id?: string, name?: string, kind?: string, path?: string \| null } \| string` | Direct graph node descriptor; strings map to the node name. |
+| `direction` | `'incoming' \| 'outgoing' \| 'both'` | Neighbor direction for graph mode (defaults to `outgoing`). |
+| `limit` | `number` | Result limit for search or graph queries (defaults to tool-specific values). |
+| `maxSnippets` | `number` | Cap the snippets in bundle responses (defaults to 3, max 10). |
+| `maxNeighbors` | `number` | Cap related edges in bundle responses (defaults to 12, max 50). |
+| `databaseName` | `string` | Optional SQLite filename override. |
+| `model` | `string` | Embedding model filter for semantic search when multiple models exist. |
+
+The response includes the resolved mode, a text summary, and the structured payload from the delegated tool (`semantic_search`, `context_bundle`, or `graph_neighbors`).
+
 ### `ingest_codebase`
 
 Walks a target directory, stores the metadata and (optionally) UTF-8 content for each file in a SQLite database at the directory root, and prunes entries for files that no longer exist. When GraphRAG extraction is enabled (the default), the chunker also emits structural metadata (imports, classes, functions, and call edges) into dedicated graph tables. The tool now tolerates common parameter aliases (for example `path`, `project_path`, `workspace_root`, `database_path`) and coerces string booleans/integers so agents can supply flexible inputs without failing validation.
