@@ -92,12 +92,7 @@ During iterative development you can swap the command for `npx tsx` and point at
 {
   "mcpServers": {
     "index-mcp": {
-      "command": "npx",
-      "args": [
-        "tsx",
-        "src/server.ts"
-      ],
-      "cwd": "/absolute/path/to/index-mcp"
+      "command": "/absolute/path/to/index-mcp/start.sh"
     }
   }
 }

@@ -3,9 +3,10 @@ import os from 'node:os';
 import path from 'node:path';
 import pino from 'pino';
 
-const logDirectory = process.env.INDEX_MCP_LOG_DIR ?? path.join(os.homedir(), '.index-mcp', 'logs');
-const logFileName = process.env.INDEX_MCP_LOG_FILE ?? 'server.log';
-const logLevel = process.env.INDEX_MCP_LOG_LEVEL ?? 'info';
+const logDirectory =
+  process.env.INDEX_MCP_LOG_DIR ?? process.env.LOG_DIR ?? path.join(os.homedir(), '.index-mcp', 'logs');
+const logFileName = process.env.INDEX_MCP_LOG_FILE ?? process.env.LOG_FILE ?? 'server.log';
+const logLevel = process.env.INDEX_MCP_LOG_LEVEL ?? process.env.LOG_LEVEL ?? 'info';
 const logToConsole = process.env.INDEX_MCP_LOG_CONSOLE === 'true';
 const consoleStreamFd = process.env.INDEX_MCP_LOG_CONSOLE_STREAM === 'stderr' ? 2 : 1;
 

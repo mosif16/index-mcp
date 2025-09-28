@@ -1,6 +1,6 @@
 # MCP Agent Guide
 
-This document explains how to run and use the **index-mcp** server with the Codex CLI (or any MCP-compatible client). It covers installation, configuration, exposed tools, recommended workflows, and troubleshooting.
+This document explains how to run and use the **index-mcp** server with the Codex CLI (or any MCP-compatible client). It covers installation, configuration, exposed tools, recommended workflows, and troubleshooting. Codex CLI automatically loads this `AGENTS.md` file at session start (see `docs/codex-cli-mcp.md`), so keep it concise and actionable for first-turn guidance.
 
 ## 1. Overview
 
@@ -73,10 +73,15 @@ These align with the `startIngestWatcher` options and make it easy to tune incre
 ```toml
 [mcp_servers.index_mcp]
 command = "/Users/mohammedsayf/Desktop/index-mcp/start.sh"
-env = { LOG_LEVEL = "INFO" }
+env = { INDEX_MCP_LOG_LEVEL = "INFO" }  # falls back to LOG_LEVEL if set
+# Optional timeouts highlighted in docs/codex-cli-mcp.md
+startup_timeout_sec = 20  # default 10
+tool_timeout_sec = 60     # default 60; set lower for faster failure feedback
 ```
 
-After editing the config, restart the Codex CLI agent so the new MCP server registers.
+After editing the config, restart the Codex CLI agent so the new MCP server registers. Refer to `docs/codex-cli-mcp.md` for additional options such as tuning `shell_environment_policy` (to control which env vars reach tool invocations) and `notify` (to forward Codex events to an external script).
+
+Environment variables scoped in the `env` table support both the `INDEX_MCP_*` names shown above and generic fallbacks (`LOG_LEVEL`, `LOG_DIR`, `LOG_FILE`) so the settings from Codex CLI configuration examples apply without changes.
 
 ## 6. Exposed Tools and Prompts
 

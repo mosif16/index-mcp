@@ -1,5 +1,8 @@
 import type { NativeModule } from '../types/native.js';
 import { fallbackNativeModule } from './fallback.js';
+import { createLogger } from '../logger.js';
+
+const log = createLogger('native');
 
 type NativeModuleState = 'uninitialized' | 'native' | 'fallback';
 
@@ -64,9 +67,9 @@ function normalizeError(error: unknown): string {
 
 function logWarning(message: string, error?: unknown): void {
   if (error) {
-    console.warn(`[index-mcp] ${message}`, error);
+    log.warn({ err: error, message }, 'Native module warning');
   } else {
-    console.warn(`[index-mcp] ${message}`);
+    log.warn({ message }, 'Native module warning');
   }
 }
 
