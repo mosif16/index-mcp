@@ -1,3 +1,43 @@
+# Codex MCP Best Practices
+
+Transport
+	•	Use stdio as the primary method. Codex CLI reliably supports stdio today.
+	•	If a server is HTTP/SSE-only, connect through a stdio↔HTTP/SSE proxy.
+
+Framing
+	•	Stdout must contain newline-delimited JSON-RPC only.
+	•	All logs and diagnostics go to stderr.
+
+Configuration
+	•	Use ~/.codex/config.toml with a top-level [mcp_servers.<name>] table.
+	•	Required keys: command, args (optional), env.
+	•	Consider setting startup_timeout_ms for servers with slow startup.
+
+Security
+	•	Secrets go into environment variables, passed as headers inside the server/proxy.
+	•	Enforce TLS for non-localhost servers; allow plain HTTP only with explicit opt-in.
+	•	Validate Origin headers to guard against DNS rebinding.
+
+Streaming
+	•	When using Streamable HTTP with SSE, maintain message ordering and preserve JSON-RPC IDs.
+	•	Implement reconnects with backoff and jitter.
+
+Observability
+	•	Bound buffers and enforce backpressure policies.
+	•	Use structured logs on stderr with fields like component, remote, event, latency_ms.
+
+Backward Compatibility
+	•	Ensure local MCP tools behave the same when no remote is mounted.
+	•	Namespace mirrored tools from remote servers, e.g. remoteName.tool_id.
+
+Testing Checklist
+	•	Stdout purity (no stray logs).
+	•	Cold start within startup_timeout_ms.
+	•	Streaming resilience: reconnect after stream failure.
+	•	Config validation: TOML structure correct and recognized by Codex.
+
+
+
 # MCP Agent Guide
 
 This document explains how to run and use the **index-mcp** server with the Codex CLI (or any MCP-compatible client). It covers installation, configuration, exposed tools, recommended workflows, and troubleshooting. Codex CLI automatically loads this `AGENTS.md` file at session start (see `docs/codex-cli-mcp.md`), so keep it concise and actionable for first-turn guidance.
@@ -76,10 +116,12 @@ command = "/Users/mohammedsayf/Desktop/index-mcp/start.sh"
 env = { INDEX_MCP_LOG_LEVEL = "INFO" }  # falls back to LOG_LEVEL if set
 # Optional timeouts highlighted in docs/codex-cli-mcp.md
 startup_timeout_sec = 20  # default 10
-tool_timeout_sec = 60     # default 60; set lower for faster failure feedback
+tool_timeout_sec = 180    # default 60; bump if long-running ingests or graph queries need more time
 ```
 
 After editing the config, restart the Codex CLI agent so the new MCP server registers. Refer to `docs/codex-cli-mcp.md` for additional options such as tuning `shell_environment_policy` (to control which env vars reach tool invocations) and `notify` (to forward Codex events to an external script).
+
+If you routinely run large ingests or wide graph traversals, increase `tool_timeout_sec` further (for example, 300) so Codex doesn’t cancel the tool before the server responds.
 
 Environment variables scoped in the `env` table support both the `INDEX_MCP_*` names shown above and generic fallbacks (`LOG_LEVEL`, `LOG_DIR`, `LOG_FILE`) so the settings from Codex CLI configuration examples apply without changes.
 

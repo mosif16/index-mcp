@@ -82,19 +82,30 @@ A helper script `start.sh` (at the project root) ensures the TypeScript is built
 {
   "mcpServers": {
     "index-mcp": {
-      "command": "/absolute/path/to/index-mcp/start.sh"
+      "command": "/absolute/path/to/index-mcp/start.sh",
+      "env": {
+        "INDEX_MCP_LOG_LEVEL": "info",
+        "INDEX_MCP_LOG_DIR": "/absolute/path/to/.index-mcp/logs",
+        "INDEX_MCP_REMOTE_SERVERS": "[]"
+      }
     }
   }
 }
 ```
 
-During iterative development you can swap the command for `npx tsx` and point at `src/server.ts` instead of the built artifact:
+For iterative development you can keep the same config and simply point the script at the TypeScript entrypoint instead:
 
 ```json
 {
   "mcpServers": {
     "index-mcp": {
-      "command": "/absolute/path/to/index-mcp/start.sh"
+      "command": "npx",
+      "args": ["tsx", "src/server.ts"],
+      "env": {
+        "INDEX_MCP_LOG_LEVEL": "debug",
+        "INDEX_MCP_LOG_CONSOLE": "true",
+        "INDEX_MCP_REMOTE_SERVERS": "[]"
+      }
     }
   }
 }
@@ -102,7 +113,7 @@ During iterative development you can swap the command for `npx tsx` and point at
 
 Restart your Codex agent after saving the configuration so it picks up the new MCP server.
 
-If you use `agent.toml`, mirror the JSON config and set any log overrides you need:
+If you use `agent.toml`, mirror the JSON config and set any log overrides you need. You can paste the block below directly into `~/.config/codex/agent.toml` (swap the absolute path for your checkout):
 
 ```toml
 [mcp_servers.index_mcp]
@@ -115,6 +126,24 @@ env = {
 ```
 
 The bundled `start.sh` builds on demand, rebuilds the Rust addon in release mode on every launch, and then runs `node dist/server.js`. Adjust the paths and environment variables (including the optional `INDEX_MCP_LOG_*` values) to match your machine.
+
+### Remote MCP proxying
+
+Set `INDEX_MCP_REMOTE_SERVERS` to a JSON array describing upstream MCP servers you want to mount locally. Each entry supports namespace configuration, per-request headers, bearer/header-based auth, and retry/backoff options. Example:
+
+```bash
+export INDEX_MCP_REMOTE_SERVERS='[
+  {
+    "name": "search-backend",
+    "namespace": "remote.search",
+    "url": "https://example.com/mcp",
+    "auth": { "type": "bearer", "tokenEnv": "REMOTE_SEARCH_TOKEN" },
+    "retry": { "maxAttempts": Infinity, "initialDelayMs": 500, "maxDelayMs": 30000 }
+  }
+]'
+```
+
+When the server starts it immediately tries to establish an SSE channel to every remote. Failures are retried in the background without blocking local tools, and any remote tools discovered after a reconnect are added under `${namespace}.${tool}` names automatically. The proxy forwards progress notifications, preserves MCP JSON-RPC framing on stdout, and routes its own logs exclusively to stderr so Codex-friendly transports keep working as-is.
 
 
 ## Exposed tools

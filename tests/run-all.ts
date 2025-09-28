@@ -6,3 +6,6 @@ await import('./context-bundle.test.ts');
 await import('./input-normalizer.test.ts');
 await import('./changed-paths.test.ts');
 await import('./cleanup.test.ts');
+await import('./remote-proxy-config.test.ts');
+await import('./remote-proxy-integration.test.ts');
+await import('./logger-config.test.ts');

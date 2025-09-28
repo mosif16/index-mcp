@@ -1,0 +1,19 @@
+[mcp_servers.index_mcp]
+command = "/Users/mohammedsayf/Desktop/index-mcp/start.sh"
+startup_timeout_sec = 30
+tool_timeout_sec = 300
+
+[mcp_servers.index_mcp.env]
+INDEX_MCP_LOG_LEVEL = "INFO"
+INDEX_MCP_LOG_DIR = "/Users/mohammedsayf/Desktop/index-mcp/logs"
+INDEX_MCP_LOG_CONSOLE = "false"
+INDEX_MCP_REMOTE_SERVERS = '''
+[
+  {
+    "name": "local-backend",
+    "namespace": "remote.local",
+    "url": "http://127.0.0.1:8765/mcp",
+    "retry": { "maxAttempts": 5, "initialDelayMs": 500, "maxDelayMs": 30000 }
+  }
+]
+'''

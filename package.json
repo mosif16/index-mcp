@@ -28,6 +28,7 @@
     "@modelcontextprotocol/sdk": "^1.18.2",
     "better-sqlite3": "^12.4.1",
     "chokidar": "^3.6.0",
+    "express": "^5.1.0",
     "fast-glob": "^3.3.2",
     "ignore": "^5.3.2",
     "typescript": "^5.6.2",
@@ -38,6 +39,7 @@
   "devDependencies": {
     "@eslint/js": "^9.36.0",
     "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.2",
     "@types/node": "^22.7.1",
     "@typescript-eslint/eslint-plugin": "^8.44.1",
     "@typescript-eslint/parser": "^8.44.1",

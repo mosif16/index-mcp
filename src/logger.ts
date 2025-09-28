@@ -1,34 +1,48 @@
-import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import pino from 'pino';
 
-const logDirectory =
-  process.env.INDEX_MCP_LOG_DIR ?? process.env.LOG_DIR ?? path.join(os.homedir(), '.index-mcp', 'logs');
-const logFileName = process.env.INDEX_MCP_LOG_FILE ?? process.env.LOG_FILE ?? 'server.log';
-const logLevel = process.env.INDEX_MCP_LOG_LEVEL ?? process.env.LOG_LEVEL ?? 'info';
-const logToConsole = process.env.INDEX_MCP_LOG_CONSOLE === 'true';
-const consoleStreamFd = process.env.INDEX_MCP_LOG_CONSOLE_STREAM === 'stderr' ? 2 : 1;
+import {
+  resolveLoggerConfiguration,
+  type LoggerConfiguration,
+  type LoggerSetupDiagnostic
+} from './logger-config.js';
 
-fs.mkdirSync(logDirectory, { recursive: true });
+const loggerConfiguration: LoggerConfiguration = resolveLoggerConfiguration(process.env);
 
-const destinations: pino.DestinationStream[] = [
-  pino.destination({ dest: path.join(logDirectory, logFileName), mkdir: true, sync: false })
-];
+const destinations: pino.DestinationStream[] = [];
 
-if (logToConsole) {
-  destinations.push(pino.destination({ dest: consoleStreamFd, sync: false }));
+if (loggerConfiguration.fileLoggingEnabled && loggerConfiguration.logDirectory) {
+  destinations.push(
+    pino.destination({
+      dest: path.join(loggerConfiguration.logDirectory, loggerConfiguration.logFileName),
+      mkdir: true,
+      sync: false
+    })
+  );
+}
+
+if (loggerConfiguration.logToConsole) {
+  destinations.push(pino.destination({ dest: loggerConfiguration.consoleStreamFd, sync: false }));
+}
+
+if (destinations.length === 0) {
+  destinations.push(pino.destination({ dest: 1, sync: false }));
 }
 
 const baseLogger = pino(
   {
-    level: logLevel,
+    level: loggerConfiguration.logLevel,
     messageKey: 'message',
     timestamp: pino.stdTimeFunctions.isoTime,
     base: null
   },
   pino.multistream(destinations)
 );
+
+for (const diagnostic of loggerConfiguration.diagnostics) {
+  const logLevel: 'warn' | 'error' = diagnostic.level;
+  baseLogger[logLevel]({ event: diagnostic.code, ...diagnostic.context }, diagnostic.message);
+}
 
 process.on('beforeExit', () => {
   try {
@@ -43,6 +57,17 @@ export function createLogger(scope: string) {
 }
 
 export const logger = createLogger('server');
+
+export function getLoggerConfiguration(): LoggerConfiguration {
+  return {
+    ...loggerConfiguration,
+    diagnostics: [...loggerConfiguration.diagnostics]
+  };
+}
+
+export function getLoggerDiagnostics(): LoggerSetupDiagnostic[] {
+  return [...loggerConfiguration.diagnostics];
+}
 
 let loggerShutdownPromise: Promise<void> | null = null;
 

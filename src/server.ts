@@ -24,6 +24,7 @@ import {
 import { getNativeModuleStatus, loadNativeModule } from './native/index.js';
 import { getIndexStatus } from './status.js';
 import { getContextBundle } from './context-bundle.js';
+import { registerRemoteServers } from './remote-proxy.js';
 
 function rethrowWithContext(toolName: string, error: unknown): never {
   if (error instanceof Error) {
@@ -1455,6 +1456,8 @@ async function main() {
     },
     async () => INDEXING_GUIDANCE_PROMPT
   );
+
+  await registerRemoteServers(server);
 
   const transport = new StdioServerTransport();
 
