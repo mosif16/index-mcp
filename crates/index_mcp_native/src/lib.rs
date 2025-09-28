@@ -21,6 +21,22 @@ pub struct ScanOptions {
 }
 
 #[napi(object)]
+pub struct MetadataOptions {
+    pub root: String,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub max_file_size_bytes: Option<f64>,
+}
+
+#[napi(object)]
+pub struct ReadRepoOptions {
+    pub root: String,
+    pub paths: Vec<String>,
+    pub max_file_size_bytes: Option<f64>,
+    pub needs_content: bool,
+}
+
+#[napi(object)]
 pub struct NativeFileEntry {
     pub path: String,
     pub size: f64,
@@ -28,6 +44,13 @@ pub struct NativeFileEntry {
     pub hash: String,
     pub content: Option<String>,
     pub is_binary: bool,
+}
+
+#[napi(object)]
+pub struct NativeMetadataEntry {
+    pub path: String,
+    pub size: f64,
+    pub modified: f64,
 }
 
 #[napi(object)]
@@ -44,12 +67,29 @@ pub struct NativeScanResult {
     pub skipped: Vec<NativeSkippedFile>,
 }
 
+#[napi(object)]
+pub struct NativeMetadataResult {
+    pub entries: Vec<NativeMetadataEntry>,
+    pub skipped: Vec<NativeSkippedFile>,
+}
+
+#[napi(object)]
+pub struct NativeReadResult {
+    pub files: Vec<NativeFileEntry>,
+    pub skipped: Vec<NativeSkippedFile>,
+}
+
 struct ScanJob {
     relative_path: String,
 }
 
 enum ScanOutcome {
     File(NativeFileEntry),
+    Skipped(NativeSkippedFile),
+}
+
+enum MetadataOutcome {
+    Entry(NativeMetadataEntry),
     Skipped(NativeSkippedFile),
 }
 
@@ -66,11 +106,123 @@ pub fn scan_repo(options: ScanOptions) -> Result<NativeScanResult> {
     let include_globset = build_globset(&options.include)?;
     let exclude_globset = build_globset(&options.exclude)?;
 
+    let (jobs, mut skipped) = collect_scan_jobs(&root_path, &include_globset, &exclude_globset);
+
+    let max_file_size = options.max_file_size_bytes.map(|value| value as u64);
+    let needs_content = options.needs_content;
+
+    let outcomes: Vec<ScanOutcome> = jobs
+        .into_par_iter()
+        .map(|job| process_file(&root_path, job, max_file_size, needs_content))
+        .collect();
+
+    let mut files: Vec<NativeFileEntry> = Vec::new();
+
+    for outcome in outcomes {
+        match outcome {
+            ScanOutcome::File(file) => files.push(file),
+            ScanOutcome::Skipped(file) => skipped.push(file),
+        }
+    }
+
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(NativeScanResult { files, skipped })
+}
+
+#[napi]
+pub fn scan_repo_metadata(options: MetadataOptions) -> Result<NativeMetadataResult> {
+    let root_path = PathBuf::from(&options.root);
+    if !root_path.is_dir() {
+        return Err(Error::from_reason(format!(
+            "scan_repo_metadata root must be a directory: {}",
+            options.root
+        )));
+    }
+
+    let include_globset = build_globset(&options.include)?;
+    let exclude_globset = build_globset(&options.exclude)?;
+
+    let (jobs, mut skipped) = collect_scan_jobs(&root_path, &include_globset, &exclude_globset);
+
+    let max_file_size = options.max_file_size_bytes.map(|value| value as u64);
+
+    let outcomes: Vec<MetadataOutcome> = jobs
+        .par_iter()
+        .map(|job| process_file_metadata(&root_path, job, max_file_size))
+        .collect();
+
+    let mut entries: Vec<NativeMetadataEntry> = Vec::new();
+
+    for outcome in outcomes {
+        match outcome {
+            MetadataOutcome::Entry(entry) => entries.push(entry),
+            MetadataOutcome::Skipped(file) => skipped.push(file),
+        }
+    }
+
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(NativeMetadataResult { entries, skipped })
+}
+
+#[napi]
+pub fn read_repo_files(options: ReadRepoOptions) -> Result<NativeReadResult> {
+    let root_path = PathBuf::from(&options.root);
+    if !root_path.is_dir() {
+        return Err(Error::from_reason(format!(
+            "read_repo_files root must be a directory: {}",
+            options.root
+        )));
+    }
+
+    let mut unique_paths: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
+
+    for path in options.paths.iter() {
+        if let Some(normalized) = sanitize_requested_path(path) {
+            if seen.insert(normalized.clone()) {
+                unique_paths.push(normalized);
+            }
+        }
+    }
+
+    let max_file_size = options.max_file_size_bytes.map(|value| value as u64);
+    let needs_content = options.needs_content;
+
+    let outcomes: Vec<ScanOutcome> = unique_paths
+        .into_par_iter()
+        .map(|relative_path| {
+            let job = ScanJob { relative_path };
+            process_file(&root_path, job, max_file_size, needs_content)
+        })
+        .collect();
+
+    let mut files: Vec<NativeFileEntry> = Vec::new();
+    let mut skipped: Vec<NativeSkippedFile> = Vec::new();
+
+    for outcome in outcomes {
+        match outcome {
+            ScanOutcome::File(file) => files.push(file),
+            ScanOutcome::Skipped(file) => skipped.push(file),
+        }
+    }
+
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(NativeReadResult { files, skipped })
+}
+
+fn collect_scan_jobs(
+    root_path: &Path,
+    include_globset: &Option<GlobSet>,
+    exclude_globset: &Option<GlobSet>,
+) -> (Vec<ScanJob>, Vec<NativeSkippedFile>) {
     let mut jobs: Vec<ScanJob> = Vec::new();
     let mut skipped: Vec<NativeSkippedFile> = Vec::new();
     let mut seen_paths: HashSet<String> = HashSet::new();
 
-    for result in WalkBuilder::new(&root_path)
+    for result in WalkBuilder::new(root_path)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
@@ -82,7 +234,7 @@ pub fn scan_repo(options: ScanOptions) -> Result<NativeScanResult> {
             Ok(entry) => entry,
             Err(err) => {
                 let path = extract_error_path(&err)
-                    .and_then(|p| to_relative_posix(&root_path, p))
+                    .and_then(|p| to_relative_posix(root_path, p))
                     .unwrap_or_else(|| String::from("."));
                 skipped.push(NativeSkippedFile {
                     path,
@@ -106,18 +258,18 @@ pub fn scan_repo(options: ScanOptions) -> Result<NativeScanResult> {
             continue;
         }
 
-        if let Some(relative) = to_relative_posix(&root_path, entry.path()) {
+        if let Some(relative) = to_relative_posix(root_path, entry.path()) {
             if seen_paths.contains(&relative) {
                 continue;
             }
 
-            if let Some(exclude) = &exclude_globset {
+            if let Some(exclude) = exclude_globset {
                 if exclude.is_match(&relative) {
                     continue;
                 }
             }
 
-            if let Some(include) = &include_globset {
+            if let Some(include) = include_globset {
                 if !include.is_match(&relative) {
                     continue;
                 }
@@ -130,26 +282,7 @@ pub fn scan_repo(options: ScanOptions) -> Result<NativeScanResult> {
         }
     }
 
-    let max_file_size = options.max_file_size_bytes.map(|value| value as u64);
-    let needs_content = options.needs_content;
-
-    let outcomes: Vec<ScanOutcome> = jobs
-        .into_par_iter()
-        .map(|job| process_file(&root_path, job, max_file_size, needs_content))
-        .collect();
-
-    let mut files: Vec<NativeFileEntry> = Vec::new();
-
-    for outcome in outcomes {
-        match outcome {
-            ScanOutcome::File(file) => files.push(file),
-            ScanOutcome::Skipped(file) => skipped.push(file),
-        }
-    }
-
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-
-    Ok(NativeScanResult { files, skipped })
+    (jobs, skipped)
 }
 
 fn process_file(
@@ -221,6 +354,86 @@ fn process_file(
         content,
         is_binary,
     })
+}
+
+fn process_file_metadata(
+    root: &Path,
+    job: &ScanJob,
+    max_file_size: Option<u64>,
+) -> MetadataOutcome {
+    let absolute_path = root.join(&job.relative_path);
+    let metadata = match fs::metadata(&absolute_path) {
+        Ok(meta) => meta,
+        Err(err) => {
+            return MetadataOutcome::Skipped(NativeSkippedFile {
+                path: job.relative_path.clone(),
+                reason: "read-error".to_string(),
+                size: None,
+                message: Some(err.to_string()),
+            });
+        }
+    };
+
+    let file_size = metadata.len();
+    if let Some(limit) = max_file_size {
+        if file_size > limit {
+            return MetadataOutcome::Skipped(NativeSkippedFile {
+                path: job.relative_path.clone(),
+                reason: "file-too-large".to_string(),
+                size: Some(file_size as f64),
+                message: None,
+            });
+        }
+    }
+
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(system_time_to_millis)
+        .unwrap_or(0);
+
+    MetadataOutcome::Entry(NativeMetadataEntry {
+        path: job.relative_path.clone(),
+        size: file_size as f64,
+        modified: modified as f64,
+    })
+}
+
+fn sanitize_requested_path(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut normalized = trimmed.replace('\\', "/");
+    while normalized.starts_with("./") {
+        normalized = normalized.trim_start_matches("./").to_string();
+    }
+    while normalized.starts_with('/') {
+        normalized.remove(0);
+    }
+
+    if normalized.is_empty() {
+        return None;
+    }
+
+    if normalized
+        .split('/')
+        .any(|segment| segment == ".." || segment.is_empty())
+    {
+        return None;
+    }
+
+    let filtered_segments: Vec<&str> = normalized
+        .split('/')
+        .filter(|segment| *segment != ".")
+        .collect();
+
+    if filtered_segments.is_empty() {
+        return None;
+    }
+
+    Some(filtered_segments.join("/"))
 }
 
 fn system_time_to_millis(time: SystemTime) -> Option<u64> {

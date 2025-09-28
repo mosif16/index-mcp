@@ -9,12 +9,26 @@ import { embedTexts, float32ArrayToBuffer, getDefaultEmbeddingModel } from './em
 import { extractGraphMetadata, type GraphExtractionResult } from './graph.js';
 import { DEFAULT_DB_FILENAME, DEFAULT_INCLUDE_GLOBS, DEFAULT_EXCLUDE_GLOBS } from './constants.js';
 import { loadNativeModule } from './native/index.js';
-import type { NativeFileEntry, NativeScanResult } from './types/native.js';
+import type {
+  NativeFileEntry,
+  NativeModule,
+  NativeScanResult,
+  NativeSkippedFile
+} from './types/native.js';
 const DEFAULT_MAX_FILE_SIZE_BYTES = 8 * 1024 * 1024; // 8 MiB
 
 const DEFAULT_CHUNK_SIZE_TOKENS = 256;
 const DEFAULT_CHUNK_OVERLAP_TOKENS = 32;
 const DEFAULT_EMBED_BATCH_SIZE = 12;
+
+function hasNativeMetadataFlow(
+  module: NativeModule
+): module is NativeModule & {
+  scanRepoMetadata: NonNullable<NativeModule['scanRepoMetadata']>;
+  readRepoFiles: NonNullable<NativeModule['readRepoFiles']>;
+} {
+  return typeof module.scanRepoMetadata === 'function' && typeof module.readRepoFiles === 'function';
+}
 
 export interface ContentSanitizerSpec {
   module: string;
@@ -116,6 +130,15 @@ interface ChunkFragment {
 
 function toPosixPath(relativePath: string): string {
   return relativePath.split(path.sep).join('/');
+}
+
+function convertSkippedFile(entry: NativeSkippedFile): SkippedFile {
+  return {
+    path: toPosixPath(entry.path),
+    reason: entry.reason,
+    size: entry.size ?? undefined,
+    message: entry.message ?? undefined
+  };
 }
 
 function ensureSchema(db: DatabaseInstance) {
@@ -506,13 +529,15 @@ async function processNativeEntry({
     return;
   }
 
+  const entryContent = entry.content ?? null;
+
   let content: string | null = null;
-  if (!entry.isBinary && entry.content !== null) {
+  if (!entry.isBinary && entryContent !== null) {
     content = await sanitizeContent({
       path: normalizedPath,
       absolutePath,
       root: absoluteRoot,
-      content: entry.content
+      content: entryContent
     });
   }
 
@@ -638,23 +663,9 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
 
     const needsTextContent = storeFileContent || embeddingConfig.enabled || graphConfig.enabled;
     const nativeModule = await loadNativeModule();
-    let nativeResult: NativeScanResult;
-
-    try {
-      nativeResult = await nativeModule.scanRepo({
-        root: absoluteRoot,
-        include: searchPatterns,
-        exclude: excludeGlobs,
-        maxFileSizeBytes: maxFileSizeBytes,
-        needsContent: needsTextContent
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`[index-mcp] Native scan failed: ${message}`);
-    }
 
     const files: FileRow[] = [];
-    const skipped: SkippedFile[] = nativeResult.skipped.map((entry) => ({ ...entry }));
+    const skipped: SkippedFile[] = [];
     const seenPaths = new Set<string>();
     const chunkJobs: PendingChunk[] = [];
     const chunkRefreshPaths = new Set<string>();
@@ -664,20 +675,130 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
       ? new Set<string>(targetPaths.filter((p) => existingByPath.has(p)))
       : new Set<string>(existingByPath.keys());
 
-    await processNativeEntries({
-      absoluteRoot,
-      nativeResult,
-      existingByPath,
-      files,
-      seenPaths,
-      chunkJobs,
-      chunkRefreshPaths,
-      graphUpdates,
-      sanitizeContent,
-      embeddingConfig,
-      graphConfig,
-      storeFileContent
-    });
+    if (hasNativeMetadataFlow(nativeModule)) {
+      let metadataResult;
+      try {
+        metadataResult = await nativeModule.scanRepoMetadata({
+          root: absoluteRoot,
+          include: searchPatterns,
+          exclude: excludeGlobs,
+          maxFileSizeBytes: maxFileSizeBytes
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`[index-mcp] Native metadata scan failed: ${message}`);
+      }
+
+      metadataResult.skipped.forEach((entry) => {
+        skipped.push(convertSkippedFile(entry));
+      });
+
+      const pendingReadPaths = new Set<string>();
+
+      for (const entry of metadataResult.entries) {
+        const normalizedPath = toPosixPath(entry.path);
+        const existing = existingByPath.get(normalizedPath);
+
+        if (existing && existing.size === entry.size && existing.modified === entry.modified) {
+          await processNativeEntry({
+            absoluteRoot,
+            entry: {
+              path: normalizedPath,
+              size: entry.size,
+              modified: entry.modified,
+              hash: existing.hash,
+              content: existing.content,
+              isBinary: existing.content === null
+            },
+            existingByPath,
+            files,
+            seenPaths,
+            chunkJobs,
+            chunkRefreshPaths,
+            graphUpdates,
+            sanitizeContent,
+            embeddingConfig,
+            graphConfig,
+            storeFileContent
+          });
+        } else {
+          pendingReadPaths.add(normalizedPath);
+        }
+      }
+
+      if (pendingReadPaths.size > 0) {
+        let readResult;
+        try {
+          readResult = await nativeModule.readRepoFiles({
+            root: absoluteRoot,
+            paths: Array.from(pendingReadPaths),
+            maxFileSizeBytes: maxFileSizeBytes,
+            needsContent: needsTextContent
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw new Error(`[index-mcp] Native file load failed: ${message}`);
+        }
+
+        readResult.skipped.forEach((entry) => {
+          skipped.push(convertSkippedFile(entry));
+        });
+
+        for (const entry of readResult.files) {
+          const normalizedEntry: NativeFileEntry = {
+            ...entry,
+            path: toPosixPath(entry.path)
+          };
+          await processNativeEntry({
+            absoluteRoot,
+            entry: normalizedEntry,
+            existingByPath,
+            files,
+            seenPaths,
+            chunkJobs,
+            chunkRefreshPaths,
+            graphUpdates,
+            sanitizeContent,
+            embeddingConfig,
+            graphConfig,
+            storeFileContent
+          });
+        }
+      }
+    } else {
+      let nativeResult: NativeScanResult;
+      try {
+        nativeResult = await nativeModule.scanRepo({
+          root: absoluteRoot,
+          include: searchPatterns,
+          exclude: excludeGlobs,
+          maxFileSizeBytes: maxFileSizeBytes,
+          needsContent: needsTextContent
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`[index-mcp] Native scan failed: ${message}`);
+      }
+
+      nativeResult.skipped.forEach((entry) => {
+        skipped.push(convertSkippedFile(entry));
+      });
+
+      await processNativeEntries({
+        absoluteRoot,
+        nativeResult,
+        existingByPath,
+        files,
+        seenPaths,
+        chunkJobs,
+        chunkRefreshPaths,
+        graphUpdates,
+        sanitizeContent,
+        embeddingConfig,
+        graphConfig,
+        storeFileContent
+      });
+    }
 
     const deletedPaths = usingTargetPaths
       ? targetPaths.filter((p) => !seenPaths.has(p) && existingByPath.has(p))

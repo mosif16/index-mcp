@@ -10,6 +10,18 @@ export interface ScanOptions {
   maxFileSizeBytes?: number
   needsContent: boolean
 }
+export interface MetadataOptions {
+  root: string
+  include: Array<string>
+  exclude: Array<string>
+  maxFileSizeBytes?: number
+}
+export interface ReadRepoOptions {
+  root: string
+  paths: Array<string>
+  maxFileSizeBytes?: number
+  needsContent: boolean
+}
 export interface NativeFileEntry {
   path: string
   size: number
@@ -17,6 +29,11 @@ export interface NativeFileEntry {
   hash: string
   content?: string
   isBinary: boolean
+}
+export interface NativeMetadataEntry {
+  path: string
+  size: number
+  modified: number
 }
 export interface NativeSkippedFile {
   path: string
@@ -28,4 +45,14 @@ export interface NativeScanResult {
   files: Array<NativeFileEntry>
   skipped: Array<NativeSkippedFile>
 }
+export interface NativeMetadataResult {
+  entries: Array<NativeMetadataEntry>
+  skipped: Array<NativeSkippedFile>
+}
+export interface NativeReadResult {
+  files: Array<NativeFileEntry>
+  skipped: Array<NativeSkippedFile>
+}
 export declare function scanRepo(options: ScanOptions): NativeScanResult
+export declare function scanRepoMetadata(options: MetadataOptions): NativeMetadataResult
+export declare function readRepoFiles(options: ReadRepoOptions): NativeReadResult

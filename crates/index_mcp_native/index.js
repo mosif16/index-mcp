@@ -310,6 +310,8 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { scanRepo } = nativeBinding
+const { scanRepo, scanRepoMetadata, readRepoFiles } = nativeBinding
 
 module.exports.scanRepo = scanRepo
+module.exports.scanRepoMetadata = scanRepoMetadata
+module.exports.readRepoFiles = readRepoFiles

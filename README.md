@@ -246,6 +246,7 @@ The tool accepts no parameters and responds with a structured payload containing
 - Files larger than `maxFileSizeBytes` are skipped to avoid ballooning the index. Adjust per codebase needs.
 - Binary files are detected heuristically (null-byte scan) and stored without content even when `storeFileContent` is true.
 - The ingestion table keeps track of added, updated, and deleted entries so repeated runs stay fast, and unchanged files are skipped using mtime/size checks.
+- When the native addon is available, ingestion now performs a metadata-only scan first and only re-reads files whose size or mtime changed. Large repos with minimal edits avoid rehashing unchanged files, dramatically reducing IO and memory pressure.
 - Provide a sanitizer module to strip secrets or redact sensitive payloads before they reach the index.
 - Semantic embeddings (BGE base) are computed for sanitized text chunks by default; disable or tune chunking via the `embedding` ingest option if you need to trade accuracy for speed.
 - Structural metadata is stored in `code_graph_nodes` and `code_graph_edges` tables to power GraphRAG queries; disable via `graph.enabled = false` if you only need file/embedding data.

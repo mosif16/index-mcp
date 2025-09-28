@@ -6,14 +6,25 @@ import ignore, { type Ignore } from 'ignore';
 
 import type {
   NativeFileEntry,
+  NativeMetadataEntry,
+  NativeMetadataOptions,
+  NativeMetadataResult,
   NativeModule,
+  NativeReadOptions,
+  NativeReadResult,
   NativeScanOptions,
   NativeScanResult,
   NativeSkippedFile
 } from '../types/native.js';
 
+const DEFAULT_INCLUDE_PATTERNS = ['**/*'];
+
 function toPosix(relativePath: string): string {
   return relativePath.split(path.sep).join('/');
+}
+
+function fromPosix(relativePath: string): string {
+  return relativePath.split('/').join(path.sep);
 }
 
 function isBinaryBuffer(buffer: Buffer): boolean {
@@ -52,37 +63,44 @@ async function readFileEntry(
   };
 }
 
-export async function fallbackScanRepo(options: NativeScanOptions): Promise<NativeScanResult> {
-  const maxBytes = options.maxFileSizeBytes ?? Number.POSITIVE_INFINITY;
-  const patterns = options.include.length > 0 ? options.include : ['**/*'];
-
-  const gitignoreMatcher = await loadGitignoreMatcher(options.root, options.exclude);
-
+async function listCandidateFiles(
+  root: string,
+  include: string[],
+  exclude: string[]
+): Promise<string[]> {
+  const patterns = include.length > 0 ? include : DEFAULT_INCLUDE_PATTERNS;
   const entries = await fg(patterns, {
-    cwd: options.root,
+    cwd: root,
     dot: true,
-    ignore: options.exclude,
+    ignore: exclude,
     onlyFiles: true,
     followSymbolicLinks: false,
     unique: true,
     suppressErrors: true
   });
+  return entries;
+}
 
-  const files: NativeFileEntry[] = [];
+async function fallbackScanRepoMetadata(
+  options: NativeMetadataOptions
+): Promise<NativeMetadataResult> {
+  const gitignoreMatcher = await loadGitignoreMatcher(options.root, options.exclude);
+  const candidates = await listCandidateFiles(options.root, options.include, options.exclude);
+  const maxBytes = options.maxFileSizeBytes ?? Number.POSITIVE_INFINITY;
+
+  const entries: NativeMetadataEntry[] = [];
   const skipped: NativeSkippedFile[] = [];
 
-  for (const entry of entries) {
-    const relativePath = entry;
-    const absolutePath = path.join(options.root, relativePath);
-    const posixPath = toPosix(relativePath);
-
+  for (const candidate of candidates) {
+    const posixPath = toPosix(candidate);
     if (path.posix.basename(posixPath) === '.gitignore') {
       continue;
     }
-
     if (gitignoreMatcher.ignores(posixPath)) {
       continue;
     }
+
+    const absolutePath = path.join(options.root, candidate);
 
     try {
       const stats = await fs.stat(absolutePath);
@@ -95,8 +113,11 @@ export async function fallbackScanRepo(options: NativeScanOptions): Promise<Nati
         continue;
       }
 
-      const fileEntry = await readFileEntry(options.root, relativePath, options.needsContent);
-      files.push(fileEntry);
+      entries.push({
+        path: posixPath,
+        size: stats.size,
+        modified: Math.trunc(stats.mtimeMs)
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       skipped.push({
@@ -107,21 +128,95 @@ export async function fallbackScanRepo(options: NativeScanOptions): Promise<Nati
     }
   }
 
-  files.sort((a, b) => a.path.localeCompare(b.path));
+  entries.sort((a, b) => a.path.localeCompare(b.path));
+
+  return { entries, skipped };
+}
+
+async function fallbackReadRepoFiles(options: NativeReadOptions): Promise<NativeReadResult> {
+  const uniquePaths = Array.from(new Set(options.paths.map((p) => toPosix(p)))).sort();
+  const files: NativeFileEntry[] = [];
+  const skipped: NativeSkippedFile[] = [];
+  const maxBytes = options.maxFileSizeBytes ?? Number.POSITIVE_INFINITY;
+
+  for (const relative of uniquePaths) {
+    const osRelative = fromPosix(relative);
+    const absolutePath = path.join(options.root, osRelative);
+
+    let stats; // re-use stats to avoid double conversions when possible.
+    try {
+      stats = await fs.stat(absolutePath);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      skipped.push({
+        path: toPosix(relative),
+        reason: 'read-error',
+        message
+      });
+      continue;
+    }
+
+    if (stats.size > maxBytes) {
+      skipped.push({
+        path: toPosix(relative),
+        reason: 'file-too-large',
+        size: stats.size
+      });
+      continue;
+    }
+
+    try {
+      const entry = await readFileEntry(options.root, osRelative, options.needsContent);
+      files.push(entry);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      skipped.push({
+        path: toPosix(relative),
+        reason: 'read-error',
+        message
+      });
+    }
+  }
 
   return { files, skipped };
+}
+
+export async function fallbackScanRepo(options: NativeScanOptions): Promise<NativeScanResult> {
+  const metadata = await fallbackScanRepoMetadata({
+    root: options.root,
+    include: options.include,
+    exclude: options.exclude,
+    maxFileSizeBytes: options.maxFileSizeBytes
+  });
+
+  const readResult = await fallbackReadRepoFiles({
+    root: options.root,
+    paths: metadata.entries.map((entry) => entry.path),
+    maxFileSizeBytes: options.maxFileSizeBytes,
+    needsContent: options.needsContent
+  });
+
+  return {
+    files: readResult.files,
+    skipped: [...metadata.skipped, ...readResult.skipped]
+  };
 }
 
 export const fallbackNativeModule: NativeModule = {
   async scanRepo(options: NativeScanOptions): Promise<NativeScanResult> {
     return fallbackScanRepo(options);
+  },
+  async scanRepoMetadata(options: NativeMetadataOptions): Promise<NativeMetadataResult> {
+    return fallbackScanRepoMetadata(options);
+  },
+  async readRepoFiles(options: NativeReadOptions): Promise<NativeReadResult> {
+    return fallbackReadRepoFiles(options);
   }
 };
 
 async function loadGitignoreMatcher(root: string, exclude: string[]): Promise<Ignore> {
   const matcher = ignore();
 
-  // Always ignore the .git directory by default.
   matcher.add('.git/');
 
   const gitignoreFiles = await fg('**/.gitignore', {
