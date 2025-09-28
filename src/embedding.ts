@@ -138,6 +138,10 @@ function resetPipelineFactory(): void {
   clearPipelineCache();
 }
 
+export function clearEmbeddingPipelineCache(): void {
+  clearPipelineCache();
+}
+
 function setPipelineFactory(factory: PipelineFactory): void {
   currentPipelineFactory = factory;
   clearPipelineCache();

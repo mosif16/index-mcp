@@ -62,6 +62,8 @@ The watcher performs an initial ingest (unless you add `--watch-no-initial`) and
 
 CLI flags such as `--watch-debounce=750`, `--watch-database=.custom-index.sqlite`, `--watch-quiet`, and `--watch-no-initial` control batching, database selection, logging, and the initial full scan. Watcher activity is logged via the shared Pino logger, so status messages land in the same log file instead of stdout by default.
 
+When you embed the server inside another process (for example, integration tests that spin up multiple instances), invoke `runCleanup()` from `src/cleanup.ts` once you are done. The cleanup routine stops active watchers, closes stdio transports, clears embedding pipelines, and resets native module caches so repeated runs don't accumulate memory.
+
 ## Run
 
 The server communicates over stdio per the MCP spec. After building, launch it with:

@@ -46,6 +46,19 @@ function coerceNumber(record: UnknownRecord, key: string): void {
   }
 }
 
+function normalizeRootField(record: UnknownRecord): void {
+  const value = record.root;
+  if (typeof value !== 'string') {
+    return;
+  }
+  const trimmed = value.trim();
+  if (trimmed) {
+    record.root = trimmed;
+  } else {
+    delete record.root;
+  }
+}
+
 function ensureArray(record: UnknownRecord, key: string): void {
   const value = record[key];
   if (value === undefined || value === null) {
@@ -108,6 +121,8 @@ export function normalizeIngestArgs(raw: unknown): UnknownRecord {
   ensureArray(record, 'exclude');
   ensureArray(record, 'paths');
 
+  normalizeRootField(record);
+
   coerceNumber(record, 'maxFileSizeBytes');
   coerceBoolean(record, 'storeFileContent');
 
@@ -149,6 +164,7 @@ export function normalizeSearchArgs(raw: unknown): UnknownRecord {
     model: ['embedding_model']
   });
 
+  normalizeRootField(record);
   coerceNumber(record, 'limit');
 
   return record;
@@ -175,6 +191,8 @@ export function normalizeLookupArgs(raw: unknown): UnknownRecord {
     direction: ['edge_direction'],
     model: ['embedding_model']
   });
+
+  normalizeRootField(record);
 
   if (typeof record.mode === 'string') {
     record.mode = record.mode.trim().toLowerCase();
@@ -257,6 +275,8 @@ export function normalizeGraphArgs(raw: unknown): UnknownRecord {
     limit: ['max_neighbors', 'top_k']
   });
 
+  normalizeRootField(record);
+
   if (typeof record.node === 'string') {
     const nodeName = record.node as string;
     record.node = { name: nodeName } as GraphNodeDescriptor;
@@ -293,6 +313,7 @@ export function normalizeStatusArgs(raw: unknown): UnknownRecord {
     historyLimit: ['history_limit', 'ingestion_limit', 'recent_runs']
   });
 
+  normalizeRootField(record);
   coerceNumber(record, 'historyLimit');
 
   return record;
@@ -314,6 +335,7 @@ export function normalizeContextBundleArgs(raw: unknown): UnknownRecord {
     maxNeighbors: ['neighbor_limit', 'edge_limit', 'max_edges']
   });
 
+  normalizeRootField(record);
   coerceNumber(record, 'maxSnippets');
   coerceNumber(record, 'maxNeighbors');
 

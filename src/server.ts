@@ -7,7 +7,8 @@ import { z } from 'zod';
 import { ingestCodebase } from './ingest.js';
 import { semanticSearch } from './search.js';
 import { graphNeighbors, type GraphNodeDescriptor } from './graph-query.js';
-import { startIngestWatcher } from './watcher.js';
+import { ensureCleanupHooks, registerCleanupTask, runCleanup } from './cleanup.js';
+import { startIngestWatcher, type WatcherHandle } from './watcher.js';
 import { resolveRootPath, type RootResolutionContext } from './root-resolver.js';
 import { resolveIngestPaths } from './changed-paths.js';
 import { getPackageMetadata } from './package-metadata.js';
@@ -153,16 +154,17 @@ const ingestToolJsonSchema = {
       items: { type: 'string' }
     }
   },
-  required: ['root'],
+  required: [],
   additionalProperties: false
 } as const;
 
 const ingestToolSchema = z
   .object({
     root: z
-      .string({ required_error: 'root directory is required' })
+      .string()
       .min(1, 'root directory is required')
-      .describe('Absolute or relative path to the workspace to index.'),
+      .describe('Absolute or relative path to the workspace to index.')
+      .optional(),
     include: z
       .array(z.string({ invalid_type_error: 'include patterns must be strings' }))
       .describe('Glob patterns to include (aliases: include_globs, globs).')
@@ -281,16 +283,17 @@ const semanticSearchJsonSchema = {
       description: 'Embedding model filter (alias: embedding_model). Required when multiple models are present.'
     }
   },
-  required: ['root', 'query'],
+  required: ['query'],
   additionalProperties: false
 } as const;
 
 const semanticSearchSchema = z
   .object({
     root: z
-      .string({ required_error: 'root directory is required' })
+      .string()
       .min(1, 'root directory is required')
-      .describe('Absolute or relative path to the indexed workspace.'),
+      .describe('Absolute or relative path to the indexed workspace.')
+      .optional(),
     query: z
       .string({ required_error: 'query text is required' })
       .min(1, 'query text is required')
@@ -368,16 +371,17 @@ const graphNeighborJsonSchema = {
       description: 'Maximum neighbors to return (aliases: max_neighbors, top_k). Defaults to 16, caps at 100.'
     }
   },
-  required: ['root', 'node'],
+  required: ['node'],
   additionalProperties: false
 } as const;
 
 const graphNeighborSchema = z
   .object({
     root: z
-      .string({ required_error: 'root directory is required' })
+      .string()
       .min(1, 'root directory is required')
-      .describe('Absolute or relative path to the indexed workspace.'),
+      .describe('Absolute or relative path to the indexed workspace.')
+      .optional(),
     databaseName: z.string().min(1).optional().describe('Optional SQLite filename.'),
     node: z
       .object({
@@ -469,7 +473,7 @@ const contextBundleJsonSchema = {
       maximum: 50
     }
   },
-  required: ['root', 'file'],
+  required: ['file'],
   additionalProperties: false
 } as const;
 
@@ -484,9 +488,10 @@ const contextBundleSymbolSchema = z
 const contextBundleInputSchema = z
   .object({
     root: z
-      .string({ required_error: 'root directory is required' })
+      .string()
       .min(1, 'root directory is required')
-      .describe('Absolute or relative path to the indexed workspace.'),
+      .describe('Absolute or relative path to the indexed workspace.')
+      .optional(),
     databaseName: z.string().min(1).optional().describe('Optional SQLite filename.'),
     file: z
       .string({ required_error: 'file path is required' })
@@ -651,7 +656,7 @@ const codeLookupJsonSchema = {
       description: 'Embedding model filter for semantic search (alias: embedding_model). Required when multiple models exist.'
     }
   },
-  required: ['root'],
+  required: [],
   additionalProperties: false
 } as const;
 
@@ -669,9 +674,10 @@ const graphNodeInputSchema = z
 const codeLookupInputBaseSchema = z
   .object({
     root: z
-      .string({ required_error: 'root directory is required' })
+      .string()
       .min(1, 'root directory is required')
-      .describe('Absolute or relative path to the indexed workspace.'),
+      .describe('Absolute or relative path to the indexed workspace.')
+      .optional(),
     mode: codeLookupModeSchema.optional().describe('Optional explicit mode override.'),
     query: z.string().optional().describe('Semantic search query text.'),
     file: z.string().optional().describe('Relative file path to summarize.'),
@@ -772,16 +778,17 @@ const indexStatusJsonSchema = {
       maximum: 25
     }
   },
-  required: ['root'],
+  required: [],
   additionalProperties: false
 } as const;
 
 const indexStatusSchema = z
   .object({
     root: z
-      .string({ required_error: 'root directory is required' })
+      .string()
       .min(1, 'root directory is required')
-      .describe('Absolute or relative path to the workspace whose index should be inspected.'),
+      .describe('Absolute or relative path to the workspace whose index should be inspected.')
+      .optional(),
     databaseName: z
       .string()
       .min(1)
@@ -898,6 +905,10 @@ const cli = parseArgs({
 });
 
 async function main() {
+  ensureCleanupHooks();
+
+  let watcherHandle: WatcherHandle | null = null;
+
   if (cli.values.watch) {
     const debounceValue = cli.values['watch-debounce'];
     const debounceMs = typeof debounceValue === 'string' ? Number(debounceValue) : undefined;
@@ -907,13 +918,25 @@ async function main() {
     const quiet = cli.values['watch-quiet'] ?? false;
 
     try {
-      await startIngestWatcher({
+      watcherHandle = await startIngestWatcher({
         root: watchRoot,
         databaseName: watchDatabase,
         debounceMs,
         runInitial,
         quiet: quiet === true,
         graph: { enabled: true }
+      });
+      registerCleanupTask(async () => {
+        if (!watcherHandle) {
+          return;
+        }
+        try {
+          await watcherHandle.stop();
+        } catch (error) {
+          logger.warn({ err: error }, '[server] Failed to stop watch daemon during cleanup');
+        } finally {
+          watcherHandle = null;
+        }
       });
     } catch (error) {
       logger.error({ err: error }, '[server] Failed to start watch daemon');
@@ -1434,6 +1457,50 @@ async function main() {
   );
 
   const transport = new StdioServerTransport();
+
+  const keepAliveInterval = setInterval(() => {}, 1 << 30);
+  registerCleanupTask(() => {
+    clearInterval(keepAliveInterval);
+  });
+
+  let transportClosed = false;
+  const closeTransport = async () => {
+    if (transportClosed) {
+      return;
+    }
+    transportClosed = true;
+    try {
+      await transport.close();
+    } catch (error) {
+      logger.warn({ err: error }, '[server] Failed to close stdio transport during cleanup');
+    }
+  };
+
+  let cleanupTriggered = false;
+  const triggerCleanup = async (reason: string) => {
+    if (cleanupTriggered) {
+      return;
+    }
+    cleanupTriggered = true;
+    logger.debug({ reason }, '[server] Running shutdown cleanup');
+    try {
+      await runCleanup();
+    } catch (error) {
+      logger.warn({ err: error }, '[server] Cleanup routine failed');
+    }
+  };
+
+  transport.onclose = () => {
+    transportClosed = true;
+    void triggerCleanup('transport-close');
+  };
+
+  server.server.onclose = () => {
+    void triggerCleanup('server-close');
+  };
+
+  registerCleanupTask(closeTransport);
+
   await server.connect(transport);
 }
 

@@ -43,3 +43,19 @@ export function createLogger(scope: string) {
 }
 
 export const logger = createLogger('server');
+
+let loggerShutdownPromise: Promise<void> | null = null;
+
+export function shutdownLogger(): Promise<void> {
+  if (!loggerShutdownPromise) {
+    loggerShutdownPromise = (async () => {
+      try {
+        baseLogger.flush();
+      } catch {
+        // ignore flush failures during shutdown
+      }
+    })();
+  }
+
+  return loggerShutdownPromise;
+}
