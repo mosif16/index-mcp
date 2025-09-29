@@ -779,14 +779,29 @@ async function runConcurrencyLimited<T>(
   const iterator = iterable[Symbol.iterator]();
   const workerCount = Math.max(1, Math.floor(concurrency));
   const tasks: Promise<void>[] = [];
+  let cancelled = false;
+  let failure: unknown | undefined;
 
   const runWorker = async (): Promise<void> => {
     for (;;) {
+      if (cancelled) {
+        return;
+      }
+
       const next = iterator.next();
       if (next.done) {
         return;
       }
-      await worker(next.value);
+
+      try {
+        await worker(next.value);
+      } catch (error) {
+        if (!cancelled) {
+          cancelled = true;
+          failure = error;
+        }
+        return;
+      }
     }
   };
 
@@ -795,14 +810,25 @@ async function runConcurrencyLimited<T>(
   }
 
   await Promise.all(tasks);
+
+  if (failure !== undefined) {
+    throw failure;
+  }
+}
+
+function normalizeChunkSize<T>(items: T[], chunkSize: number): number {
+  if (!Number.isFinite(chunkSize) || chunkSize <= 0) {
+    return items.length > 0 ? items.length : 1;
+  }
+
+  const integerSize = Math.floor(chunkSize);
+  return integerSize > 0 ? integerSize : 1;
 }
 
 function* chunkIterable<T>(items: T[], chunkSize: number): Iterable<T[]> {
-  if (chunkSize <= 0) {
-    chunkSize = items.length > 0 ? items.length : 1;
-  }
-  for (let i = 0; i < items.length; i += chunkSize) {
-    yield items.slice(i, i + chunkSize);
+  const normalizedSize = normalizeChunkSize(items, chunkSize);
+  for (let i = 0; i < items.length; i += normalizedSize) {
+    yield items.slice(i, i + normalizedSize);
   }
 }
 
