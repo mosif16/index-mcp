@@ -6,7 +6,7 @@ type NativeEmbeddingFn = (request: {
   texts: string[];
   model?: string;
   batchSize?: number;
-}) => Promise<number[][]>;
+}) => Promise<unknown>;
 
 type NativeClearFn = () => unknown;
 
@@ -20,7 +20,7 @@ type EmbeddingProvider = (texts: string[], config: EmbedConfig) => Promise<Float
 let cachedProvider: EmbeddingProvider | null = null;
 let overrideProvider: EmbeddingProvider | null = null;
 
-function normalizeVectors(vectors: number[][], expected: number): Float32Array[] {
+function normalizeVectors(vectors: unknown, expected: number): Float32Array[] {
   if (!Array.isArray(vectors)) {
     throw new Error('[index-mcp] Native embedding response is not an array of vectors');
   }
@@ -32,10 +32,27 @@ function normalizeVectors(vectors: number[][], expected: number): Float32Array[]
   }
 
   return vectors.map((vector, index) => {
-    if (!Array.isArray(vector)) {
-      throw new Error(`[index-mcp] Native embedding vector at index ${index} is not an array`);
+    if (vector instanceof Float32Array) {
+      return vector;
     }
-    return Float32Array.from(vector);
+
+    if (ArrayBuffer.isView(vector)) {
+      const view = vector as ArrayBufferView;
+      if (view.byteLength % Float32Array.BYTES_PER_ELEMENT !== 0) {
+        throw new Error(
+          `[index-mcp] Native embedding vector at index ${index} has an incompatible typed array length`
+        );
+      }
+      return new Float32Array(
+        view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength)
+      );
+    }
+
+    if (Array.isArray(vector)) {
+      return Float32Array.from(vector);
+    }
+
+    throw new Error(`[index-mcp] Native embedding vector at index ${index} is not a supported type`);
   });
 }
 

@@ -8,7 +8,7 @@ export interface NativeEmbeddingRequest {
   model?: string
   batchSize?: number
 }
-export declare function generateEmbeddings(request: NativeEmbeddingRequest): Array<Array<number>>
+export declare function generateEmbeddings(request: NativeEmbeddingRequest): Array<Float32Array>
 export declare function clearEmbeddingCache(): void
 export interface ScanOptions {
   root: string

@@ -3,7 +3,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
-use napi::{Error, Result};
+use napi::{bindgen_prelude::Float32Array, Error, Result};
 use napi_derive::napi;
 use once_cell::sync::Lazy;
 
@@ -88,7 +88,7 @@ pub struct NativeEmbeddingRequest {
 }
 
 #[napi]
-pub fn generate_embeddings(request: NativeEmbeddingRequest) -> Result<Vec<Vec<f32>>> {
+pub fn generate_embeddings(request: NativeEmbeddingRequest) -> Result<Vec<Float32Array>> {
     let NativeEmbeddingRequest {
         texts,
         model,
@@ -111,7 +111,7 @@ pub fn generate_embeddings(request: NativeEmbeddingRequest) -> Result<Vec<Vec<f3
         .embed(texts, batch_size)
         .map_err(|error| Error::from_reason(format!("Embedding generation failed: {error}")))?;
 
-    Ok(embeddings)
+    Ok(embeddings.into_iter().map(Float32Array::new).collect())
 }
 
 #[napi]

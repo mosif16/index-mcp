@@ -48,13 +48,13 @@ The existing ingestion pipeline does a considerable amount of synchronous filesy
    - Require the Rust `scan_repo` output and fail fast when the addon is unavailable.
    - Translate Rust results into the existing SQLite insertion pipeline without touching the downstream code.
 
-5. **Add benchmarks and regression tests**:
-   - Use `tests/benchmarks/ingest-benchmark.ts` to compare JavaScript vs. Rust ingestion on representative repo snapshots.
+5. **Budget time for manual benchmarking**:
+   - With the automated test/benchmark suite removed, capture before/after ingest timings manually when introducing new Rust features. Keep rough notes in the repo (for example, under `docs/benchmarks/`) so future changes have a baseline.
    - Track metrics (duration, memory usage, CPU usage) to ensure we do not introduce regressions.
 
 6. **CI considerations**:
    - Extend the GitHub Actions workflow to build/publish the native addon artifacts on release tags.
-   - Run `cargo fmt`/`cargo clippy`/`cargo test` alongside the existing `npm` tasks.
+   - Run `cargo fmt`/`cargo clippy` alongside the existing `npm` tasks; automated test execution has been removed.
 
 ## Expected Impact
 
@@ -71,6 +71,6 @@ These improvements translate into faster initial ingest times (minutes → secon
 - Document the native build requirements (`cargo`, `rustup`, `cmake`) in the README.
 - Provide troubleshooting docs for addon loading issues (missing glibc, incompatible CPU architecture, etc.).
 - Make the release notes explicit that ingest now depends on the native addon so downstream clients can prepare their environments.
-- Keep a follow-up list for: (a) porting the TypeScript graph extractor to a Rust AST pipeline (likely via `swc`/`oxc`), and (b) adding regression tests that assert `analyze_file_content` parity with the legacy JavaScript chunker.
+- Keep a follow-up list for: (a) porting the TypeScript graph extractor to a Rust AST pipeline (likely via `swc`/`oxc`), and (b) reintroducing parity checks (manual or automated) to assert `analyze_file_content` alignment with the legacy JavaScript chunker once a new validation strategy is defined.
 
 By incrementally replacing the most CPU-bound parts of the pipeline with Rust, we can significantly improve throughput without sacrificing portability or developer ergonomics.

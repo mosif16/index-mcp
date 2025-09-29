@@ -23,7 +23,9 @@ The transpiled output is emitted to `dist/`.
 
 ### Native acceleration
 
-The Rust module in `crates/index_mcp_native` now powers every ingest run. It parallelizes the filesystem walk, hashing, and text chunking steps. The JavaScript fallback has been removed, so the native addon must be available before the server starts.
+The Rust module in `crates/index_mcp_native` powers ingestion whenever the bindings load successfully. It parallelizes the filesystem walk, hashing, and text chunking steps so large scans finish much faster. If the addon fails to initialize (or you set `INDEX_MCP_NATIVE_DISABLE=true`), the server falls back to the TypeScript scanner and logs a warning—ingest still works, just without the native speed-up.
+
+`start.sh` rebuilds the addon in release mode on every launch, but you can build it manually if you prefer:
 
 1. Install Rust (`rustup`) and the [`@napi-rs/cli`](https://github.com/napi-rs/napi-rs/tree/main/cli) helper.
 2. Build the native addon:
@@ -34,7 +36,7 @@ The Rust module in `crates/index_mcp_native` now powers every ingest run. It par
    npm run build
    ```
 
-3. Restart the MCP server. On startup `ingest_codebase` attempts to load the native scanner and will throw if the addon cannot be initialized. Rebuild the crate if you see a load error.
+3. Restart the MCP server. On startup `ingest_codebase` attempts to load the native scanner; failures fall back to the JavaScript implementation and surface the error through the `info` tool.
 
 ## Develop
 
@@ -62,7 +64,7 @@ The watcher performs an initial ingest (unless you add `--watch-no-initial`) and
 
 CLI flags such as `--watch-debounce=750`, `--watch-database=.custom-index.sqlite`, `--watch-quiet`, and `--watch-no-initial` control batching, database selection, logging, and the initial full scan. Watcher activity is logged via the shared Pino logger, so status messages land in the same log file instead of stdout by default.
 
-When you embed the server inside another process (for example, integration tests that spin up multiple instances), invoke `runCleanup()` from `src/cleanup.ts` once you are done. The cleanup routine stops active watchers, closes stdio transports, clears embedding pipelines, and resets native module caches so repeated runs don't accumulate memory.
+When you embed the server inside another process (for example, automation scripts that spin up multiple instances), invoke `runCleanup()` from `src/cleanup.ts` once you are done. The cleanup routine stops active watchers, closes stdio transports, clears embedding pipelines, and resets native module caches so repeated runs don't accumulate memory.
 
 ## Run
 
@@ -76,7 +78,7 @@ You can also run the TypeScript source with `npm run dev` during development.
 
 ## Codex CLI Setup
 
-A helper script `start.sh` (at the project root) ensures the TypeScript is built before launching the server. Point your Codex CLI config at this script. Adjust the absolute paths to match your environment:
+A helper script `start.sh` (at the project root) rebuilds the compiled bundles (both the stdio server and the bundled local backend), refreshes the native addon, and then launches everything. Point your Codex CLI config at this script. Adjust the absolute paths to match your environment:
 
 ```json
 {
@@ -93,7 +95,7 @@ A helper script `start.sh` (at the project root) ensures the TypeScript is built
 }
 ```
 
-For iterative development you can keep the same config and simply point the script at the TypeScript entrypoint instead:
+For iterative development you can keep the same config and simply point Codex directly at the TypeScript entrypoint instead:
 
 ```json
 {
@@ -125,7 +127,18 @@ env = {
 }
 ```
 
-The bundled `start.sh` builds on demand, rebuilds the Rust addon in release mode on every launch, and then runs `node dist/server.js`. Adjust the paths and environment variables (including the optional `INDEX_MCP_LOG_*` values) to match your machine.
+The bundled `start.sh` builds on demand, compiles the Rust addon in release mode, launches a lightweight SSE backend at `${LOCAL_BACKEND_HOST:-127.0.0.1}:${LOCAL_BACKEND_PORT:-8765}`, waits for `/healthz`, and finally starts `node dist/server.js`. Adjust the paths and environment variables (including the optional `INDEX_MCP_LOG_*` values) to match your machine.
+
+#### Local backend options
+
+The sidecar backend (`src/local-backend/server.ts`) gives Codex an HTTP/SSE endpoint it can use for health checks or future tool bridging. Tune it with environment variables before invoking `start.sh`:
+
+- `LOCAL_BACKEND_HOST` (default `127.0.0.1`)
+- `LOCAL_BACKEND_PORT` (default `8765`)
+- `LOCAL_BACKEND_PATH` (default `/mcp`) – SSE subscription path
+- `LOCAL_BACKEND_MESSAGES_PATH` (default `/messages`) – POST endpoint used by the SSE transport
+
+Set `INDEX_MCP_NATIVE_DISABLE=true` if you want to force the JavaScript ingestion path even when the native addon is present.
 
 ### Remote MCP proxying
 
@@ -272,19 +285,33 @@ The tool accepts no parameters and responds with a structured payload containing
 
 ```
 ├── src/
-│   ├── constants.ts        # Shared defaults for tool configuration
-│   ├── embedding.ts        # Lightweight transformer utilities for embeddings
-│   ├── graph-query.ts      # GraphRAG neighbor lookup helper
-│   ├── graph.ts            # Structural metadata extraction helpers
-│   ├── ingest.ts           # Code ingestion, chunking, graph extraction, SQLite persistence
-│   ├── input-normalizer.ts # Alias/coercion helpers for tool parameters
-│   ├── logger.ts           # Pino logger configured for file + optional console output
-│   ├── package-metadata.ts # Lazy loader for name/version/description from package.json
-│   ├── status.ts           # Inspect existing SQLite indexes for coverage and ingestion history
-│   ├── search.ts           # Semantic retrieval over stored embeddings
-│   ├── server.ts           # MCP server wiring and tool registration
-│   └── watcher.ts          # File-watcher daemon for incremental ingests
-├── dist/               # Build output (generated)
+│   ├── changed-paths.ts     # Resolve diff-based ingest scopes from request metadata
+│   ├── cleanup.ts           # Shared cleanup registry triggered on shutdown
+│   ├── constants.ts         # Shared defaults for tool configuration
+│   ├── context-bundle.ts    # Compose context bundle responses
+│   ├── embedding.ts         # Lightweight transformer utilities for embeddings
+│   ├── graph-query.ts       # GraphRAG neighbor lookup helper
+│   ├── graph.ts             # Structural metadata extraction helpers
+│   ├── ingest.ts            # Code ingestion, chunking, graph extraction, SQLite persistence
+│   ├── input-normalizer.ts  # Alias/coercion helpers for tool parameters
+│   ├── local-backend/
+│   │   └── server.ts        # HTTP/SSE helper launched by start.sh
+│   ├── logger-config.ts     # Resolve log directory, level, and diagnostics
+│   ├── logger.ts            # Pino logger configured for file + optional console output
+│   ├── native/
+│   │   ├── fallback.ts      # JavaScript fallback when native bindings are unavailable
+│   │   └── index.ts         # Native module loader and status helpers
+│   ├── package-metadata.ts  # Lazy loader for name/version/description from package.json
+│   ├── remote-proxy.ts      # Remote MCP registration and retry handling
+│   ├── root-resolver.ts     # Resolve workspace roots from metadata, headers, env
+│   ├── search.ts            # Semantic retrieval over stored embeddings
+│   ├── server.ts            # MCP server wiring, tool registration, prompts
+│   ├── status.ts            # Inspect SQLite index coverage and ingestion history
+│   ├── types/
+│   │   └── native.ts        # Shared types for native bindings
+│   └── watcher.ts           # File-watcher daemon for incremental ingests
+├── crates/index_mcp_native/ # Rust addon sources + build tooling
+├── dist/                    # Build output (generated)
 ├── package.json
 ├── tsconfig.json
 └── eslint.config.js
@@ -302,6 +329,7 @@ The tool accepts no parameters and responds with a structured payload containing
 - Patterns from a root `.gitignore` file are honored automatically so ignored artifacts never enter the index.
 - Runtime logs are emitted via Pino to `~/.index-mcp/logs/server.log` by default. Tune with `INDEX_MCP_LOG_DIR`, `INDEX_MCP_LOG_FILE`, `INDEX_MCP_LOG_LEVEL`, and set `INDEX_MCP_LOG_CONSOLE=true` to mirror logs to stdout/stderr.
 - The MCP server reads its name/version/description from `package.json` at startup, so updating the package version automatically flows through to tool metadata and the `info` response.
+- Automated regression tests have been removed; there is currently no supported `npm test` workflow or CI suite.
 
 ## Accelerating with Rust
 

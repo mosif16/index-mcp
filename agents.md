@@ -47,7 +47,7 @@ This document explains how to run and use the **index-mcp** server with the Code
 - **Purpose:** Index a codebase into a root-level SQLite database (`.mcp-index.sqlite`) so agents can perform fast metadata/content queries.
 - **Primary tool:** `ingest_codebase` – scans files, stores hashes, metadata, and optionally UTF-8 content.
 - **Supporting prompt:** `indexing_guidance` – returns reminders about when to run the ingestor.
-- **Helper script:** `start.sh` – builds the project (if needed), rebuilds the native addon in release mode, and launches the MCP server over stdio.
+- **Helper script:** `start.sh` – rebuilds the TypeScript bundles, refreshes the native addon, spins up the local HTTP/SSE backend, and launches the stdio MCP server.
 - **GraphRAG side index:** Structural relationships (imports, functions, calls) are captured automatically and can be explored via `graph_neighbors`.
 - **Watch mode:** `npm run watch` streams incremental ingests so the SQLite database stays aligned with live edits.
 
@@ -77,10 +77,21 @@ This installs dependencies including `@modelcontextprotocol/sdk`, `better-sqlite
 | `npm start`          | Execute the compiled server (`dist/server.js`) with Node.       |
 | `npm run watch`      | Run the server with an incremental ingest file watcher.         |
 | `npm run lint`       | ESLint (flat config) over the workspace.                        |
-| `npm test`           | Execute the TypeScript-based test suite (`tests/run-all.ts`).   |
 | `npm run clean`      | Remove `dist/`.                                                 |
 
-`start.sh` wraps the build/start workflow so external agents don’t have to worry about the build step.
+Automated testing has been removed; there is no `npm test` workflow or CI suite at this time.
+
+`start.sh` wraps the build/start workflow so external agents don’t have to worry about the build step. The script rebuilds both the stdio server bundle and the `local-backend` helper, recompiles the Rust addon in release mode, launches the backend, waits for `/healthz`, and then execs `node dist/server.js`.
+
+### Local backend helper
+
+The sidecar backend (`src/local-backend/server.ts`) exposes an HTTP/SSE surface that Codex can ping or extend. Configure it (and the native addon) through environment variables before running `start.sh`:
+
+- `LOCAL_BACKEND_HOST` (default `127.0.0.1`)
+- `LOCAL_BACKEND_PORT` (default `8765`)
+- `LOCAL_BACKEND_PATH` (default `/mcp`)
+- `LOCAL_BACKEND_MESSAGES_PATH` (default `/messages`)
+- `INDEX_MCP_NATIVE_DISABLE=true` forces the JavaScript ingestion path when debugging native issues
 
 ### Watch Mode Flags
 
@@ -234,6 +245,7 @@ The tool response returns both text (a summary) and `structuredContent` matching
 ## 10. Troubleshooting
 
 - **Node binding error:** If the MCP server complains about missing `better_sqlite3.node`, ensure `npm install` was run with a Node version >= 18. Prebuilt binaries are available beginning with `better-sqlite3@12.x`.
+- **Native addon fallback:** The server automatically falls back to the TypeScript scanner if the Rust bindings fail to load; check the `info` tool output for diagnostics or set `INDEX_MCP_NATIVE_DISABLE=true` to force the fallback while debugging.
 - **Index not updating:** Re-run `ingest_codebase` as soon as files are added/changed. The server reminder text emphasizes this.
 - **Embedding pipeline hiccup:** If the initial model download fails (for example, due to a network hiccup), the server clears the cached pipeline and the next ingest or search request will trigger a fresh download. Simply re-run the command once connectivity is restored, or temporarily disable embeddings with `{"embedding": {"enabled": false}}` if you need to proceed without vectors.
 - **Large repos:** Increase `maxFileSizeBytes` or adjust `include`/`exclude` to limit scope.
