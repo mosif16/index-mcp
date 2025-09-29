@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import type { Database as DatabaseInstance } from 'better-sqlite3';
 import { promises as fs } from 'node:fs';
 import crypto from 'node:crypto';
+import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -20,6 +21,7 @@ const DEFAULT_MAX_FILE_SIZE_BYTES = 8 * 1024 * 1024; // 8 MiB
 const DEFAULT_CHUNK_SIZE_TOKENS = 256;
 const DEFAULT_CHUNK_OVERLAP_TOKENS = 32;
 const DEFAULT_EMBED_BATCH_SIZE = 32;
+const FALLBACK_INGEST_CONCURRENCY = 4;
 
 function hasNativeMetadataFlow(
   module: NativeModule
@@ -81,6 +83,7 @@ export interface IngestOptions {
   embedding?: EmbeddingOptions;
   graph?: GraphOptions;
   paths?: string[];
+  concurrency?: number;
 }
 
 export interface SkippedFile {
@@ -452,6 +455,7 @@ interface ProcessNativeEntriesParams {
   embeddingConfig: EmbeddingConfig;
   graphConfig: GraphConfig;
   storeFileContent: boolean;
+  concurrency: number;
 }
 
 async function processNativeEntries({
@@ -468,9 +472,10 @@ async function processNativeEntries({
   embeddingConfig,
   graphConfig,
   storeFileContent,
-  nativeModule
+  nativeModule,
+  concurrency
 }: ProcessNativeEntriesParams): Promise<void> {
-  for (const entry of nativeResult.files) {
+  await runConcurrencyLimited(nativeResult.files, concurrency, async (entry) => {
     await processNativeEntry({
       absoluteRoot,
       entry,
@@ -487,7 +492,7 @@ async function processNativeEntries({
       graphConfig,
       storeFileContent
     });
-  }
+  });
 }
 
 interface ProcessNativeEntryParams {
@@ -714,6 +719,93 @@ function normalizeTargetPaths(root: string, paths?: string[]): string[] {
   return [...normalized];
 }
 
+function detectDefaultConcurrency(): number {
+  try {
+    if (typeof os.availableParallelism === 'function') {
+      const available = os.availableParallelism();
+      if (Number.isFinite(available) && available > 0) {
+        return Math.max(1, available);
+      }
+    }
+
+    const cpus = typeof os.cpus === 'function' ? os.cpus() : [];
+    if (Array.isArray(cpus) && cpus.length > 0) {
+      return Math.max(1, cpus.length);
+    }
+  } catch {
+    // Ignore detection errors and fall back to a conservative default.
+  }
+
+  return FALLBACK_INGEST_CONCURRENCY;
+}
+
+function parseConcurrencyInput(value: unknown): number | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  const normalized = typeof value === 'number' ? value : Number(String(value).trim());
+  if (!Number.isFinite(normalized)) {
+    return null;
+  }
+
+  const coerced = Math.floor(normalized);
+  if (coerced <= 0) {
+    return null;
+  }
+
+  return coerced;
+}
+
+function resolveIngestConcurrency(explicit?: number): number {
+  const optionOverride = parseConcurrencyInput(explicit);
+  if (optionOverride) {
+    return optionOverride;
+  }
+
+  const envOverride = parseConcurrencyInput(process.env.INDEX_MCP_INGEST_CONCURRENCY);
+  if (envOverride) {
+    return envOverride;
+  }
+
+  return detectDefaultConcurrency();
+}
+
+async function runConcurrencyLimited<T>(
+  iterable: Iterable<T>,
+  concurrency: number,
+  worker: (item: T) => Promise<void>
+): Promise<void> {
+  const iterator = iterable[Symbol.iterator]();
+  const workerCount = Math.max(1, Math.floor(concurrency));
+  const tasks: Promise<void>[] = [];
+
+  const runWorker = async (): Promise<void> => {
+    for (;;) {
+      const next = iterator.next();
+      if (next.done) {
+        return;
+      }
+      await worker(next.value);
+    }
+  };
+
+  for (let i = 0; i < workerCount; i += 1) {
+    tasks.push(runWorker());
+  }
+
+  await Promise.all(tasks);
+}
+
+function* chunkIterable<T>(items: T[], chunkSize: number): Iterable<T[]> {
+  if (chunkSize <= 0) {
+    chunkSize = items.length > 0 ? items.length : 1;
+  }
+  for (let i = 0; i < items.length; i += chunkSize) {
+    yield items.slice(i, i + chunkSize);
+  }
+}
+
 export async function ingestCodebase(options: IngestOptions): Promise<IngestResult> {
   const databaseName = options.databaseName ?? DEFAULT_DB_FILENAME;
   const includeGlobs = options.include ?? DEFAULT_INCLUDE_GLOBS;
@@ -730,6 +822,7 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
   const storeFileContent = options.storeFileContent ?? true;
   const embeddingConfig = resolveEmbeddingDefaults(options.embedding);
   const graphConfig = resolveGraphDefaults(options.graph);
+  const concurrency = resolveIngestConcurrency(options.concurrency);
 
   const absoluteRoot = path.resolve(options.root);
   const targetPaths = normalizeTargetPaths(absoluteRoot, options.paths);
@@ -850,45 +943,53 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
       }
 
       if (pendingReadPaths.size > 0) {
-        let readResult;
-        try {
-          readResult = await nativeModule.readRepoFiles({
-            root: absoluteRoot,
-            paths: Array.from(pendingReadPaths),
-            maxFileSizeBytes: maxFileSizeBytes,
-            needsContent: needsTextContent
-          });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          throw new Error(`[index-mcp] Native file load failed: ${message}`);
-        }
+        const pending = Array.from(pendingReadPaths);
+        const chunkSize = Math.max(1, Math.ceil(pending.length / concurrency));
+        await runConcurrencyLimited(
+          chunkIterable(pending, chunkSize),
+          concurrency,
+          async (batch) => {
+            let readResult;
+            try {
+              readResult = await nativeModule.readRepoFiles({
+                root: absoluteRoot,
+                paths: batch,
+                maxFileSizeBytes: maxFileSizeBytes,
+                needsContent: needsTextContent
+              });
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              throw new Error(`[index-mcp] Native file load failed: ${message}`);
+            }
 
-        readResult.skipped.forEach((entry) => {
-          skipped.push(convertSkippedFile(entry));
-        });
+            readResult.skipped.forEach((entry) => {
+              skipped.push(convertSkippedFile(entry));
+            });
 
-        for (const entry of readResult.files) {
-          const normalizedEntry: NativeFileEntry = {
-            ...entry,
-            path: toPosixPath(entry.path)
-          };
-          await processNativeEntry({
-            absoluteRoot,
-            entry: normalizedEntry,
-            nativeModule,
-            existingByPath,
-            files,
-            seenPaths,
-            chunkJobs,
-            chunkRefreshPaths,
-            graphNodeJobs,
-            graphEdgeJobs,
-            sanitizeContent,
-            embeddingConfig,
-            graphConfig,
-            storeFileContent
-          });
-        }
+            await runConcurrencyLimited(readResult.files, concurrency, async (entry) => {
+              const normalizedEntry: NativeFileEntry = {
+                ...entry,
+                path: toPosixPath(entry.path)
+              };
+              await processNativeEntry({
+                absoluteRoot,
+                entry: normalizedEntry,
+                nativeModule,
+                existingByPath,
+                files,
+                seenPaths,
+                chunkJobs,
+                chunkRefreshPaths,
+                graphNodeJobs,
+                graphEdgeJobs,
+                sanitizeContent,
+                embeddingConfig,
+                graphConfig,
+                storeFileContent
+              });
+            });
+          }
+        );
       }
     } else {
       let nativeResult: NativeScanResult;
@@ -923,7 +1024,8 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
         sanitizeContent,
         embeddingConfig,
         graphConfig,
-        storeFileContent
+        storeFileContent,
+        concurrency
       });
     }
 
