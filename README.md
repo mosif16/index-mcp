@@ -328,6 +328,7 @@ The tool accepts no parameters and responds with a structured payload containing
 - Structural metadata is stored in `code_graph_nodes` and `code_graph_edges` tables to power GraphRAG queries; disable via `graph.enabled = false` if you only need file/embedding data.
 - Patterns from a root `.gitignore` file are honored automatically so ignored artifacts never enter the index.
 - Runtime logs are emitted via Pino to `~/.index-mcp/logs/server.log` by default. Tune with `INDEX_MCP_LOG_DIR`, `INDEX_MCP_LOG_FILE`, `INDEX_MCP_LOG_LEVEL`, and set `INDEX_MCP_LOG_CONSOLE=true` to mirror logs to stdout/stderr.
+- Embedding models cache to `~/.index-mcp/models` by default (override with `INDEX_MCP_MODEL_CACHE_DIR` or `FASTEMBED_CACHE_DIR`) so multiple workspaces reuse downloads instead of spawning per-directory `model_cache` folders.
 - The MCP server reads its name/version/description from `package.json` at startup, so updating the package version automatically flows through to tool metadata and the `info` response.
 - Automated regression tests have been removed; there is currently no supported `npm test` workflow or CI suite.
 

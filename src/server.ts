@@ -4,6 +4,7 @@ import type { GetPromptResult } from '@modelcontextprotocol/sdk/types.js';
 import { parseArgs } from 'node:util';
 import { z } from 'zod';
 
+import { getEnvironmentDiagnostics, getModelCacheConfiguration } from './environment.js';
 import { ingestCodebase } from './ingest.js';
 import { semanticSearch } from './search.js';
 import { graphNeighbors, type GraphNodeDescriptor } from './graph-query.js';
@@ -88,6 +89,15 @@ function createRootResolutionContext(extra: unknown): RootResolutionContext {
 }
 
 const { name: serverName, version: serverVersion, description: serverDescription } = getPackageMetadata();
+
+for (const diagnostic of getEnvironmentDiagnostics()) {
+  const level: 'warn' | 'error' = diagnostic.level;
+  if (diagnostic.context) {
+    logger[level]({ event: diagnostic.code, ...diagnostic.context }, diagnostic.message);
+  } else {
+    logger[level]({ event: diagnostic.code }, diagnostic.message);
+  }
+}
 
 const ingestToolJsonSchema = {
   type: 'object',
@@ -852,6 +862,13 @@ const nativeStatusSchema = z.object({
   message: z.string().optional()
 });
 
+const environmentDiagnosticSchema = z.object({
+  level: z.enum(['warn', 'error']),
+  code: z.string(),
+  message: z.string(),
+  context: z.record(z.any()).optional()
+});
+
 const infoToolOutputShape = {
   name: z.string(),
   version: z.string(),
@@ -862,7 +879,12 @@ const infoToolOutputShape = {
     nodeVersion: z.string(),
     platform: z.string(),
     cwd: z.string(),
-    pid: z.number()
+    pid: z.number(),
+    modelCache: z.object({
+      directory: z.string().nullable(),
+      source: z.string().nullable(),
+      diagnostics: z.array(environmentDiagnosticSchema)
+    })
   })
 } as const;
 
@@ -875,10 +897,11 @@ const indexingGuidanceOutputShape = {
 const indexingGuidanceOutputSchema = z.object(indexingGuidanceOutputShape);
 
 const SERVER_INSTRUCTIONS = [
-  `Tools available from ${serverName} v${serverVersion}: code_lookup (single entry point that routes to semantic search, context bundles, or graph neighbors), ingest_codebase (index the current codebase into SQLite), semantic_search (embedding-powered retrieval with byte/line metadata and nearby context), graph_neighbors (explore GraphRAG relationships), context_bundle (assemble file-level definitions, snippets, and related symbols), index_status (summarize index coverage and recent ingestions), info (report server diagnostics), indexing_guidance_tool (return the indexing reminders as a tool), and indexing_guidance (prompt describing when to reindex).`,
-  'Start new tasks by confirming the index: run ingest_codebase on a fresh checkout, then prefer code_lookup query="..." for discovery, code_lookup file="..." (with optional symbol) for file context, and code_lookup mode="graph" when you need structural neighbors.',
-  'Use index_status before searching if you are unsure whether the SQLite index is current, and fall back to ingest_codebase whenever files change so downstream lookups stay accurate.',
-  'Keep .gitignore exclusions in place during ingest so ignored content never enters the index, and remember that semantic_search, graph_neighbors, and context_bundle remain available when you need direct access to those specialized responses.'
+  `Tools available from ${serverName} v${serverVersion}: code_lookup (routes to semantic search, context bundles, or graph neighbors), ingest_codebase (build or refresh the SQLite index), index_status (verify index freshness), semantic_search (direct embedding-powered retrieval), context_bundle (assemble focused file context), graph_neighbors (inspect structural relationships), indexing_guidance_tool (return these reminders as a tool), indexing_guidance (prompt form of the guidance), and info (runtime diagnostics).`,
+  'Preferred workflow: (1) on a new checkout or after edits, run ingest_codebase with the workspace root or specific changed paths; (2) call index_status whenever you are unsure the index is current; (3) reach for code_lookup first—use query="..." for discovery, file="..." plus optional symbol for file context, and mode="graph" when you need relationship exploration.',
+  'Call semantic_search when you want raw retrieval snippets, context_bundle for a structured file packet, or graph_neighbors to expand through the GraphRAG index; these direct calls expose additional metadata beyond the routed code_lookup path.',
+  'If ingest_codebase reports "UNIQUE constraint failed: code_graph_nodes...", rerun it with graph.enabled set to false while the duplicate-node bug is addressed.',
+  'Respect ignore files during ingestion so .gitignore exclusions stay enforced, and rerun ingest_codebase (or rely on the watcher) whenever files change to prevent stale search results.'
 ].join(' ');
 
 const INDEXING_GUIDANCE_PROMPT: GetPromptResult = {
@@ -887,7 +910,7 @@ const INDEXING_GUIDANCE_PROMPT: GetPromptResult = {
       role: 'assistant',
       content: {
         type: 'text',
-        text: 'Tools: ingest_codebase (index the repository), semantic_search (find relevant snippets), graph_neighbors (inspect code graph relationships), index_status (check ingestion freshness and coverage), and indexing_guidance (show these reminders). Always run ingest_codebase on a new codebase before requesting analysis, ensure .gitignore-matched files stay excluded whenever you index, and run ingest_codebase again after you or I modify files so the SQLite index reflects the latest code.'
+        text: 'Tools: code_lookup (routes to semantic search, context bundles, or graph neighbors), ingest_codebase (refresh the SQLite index), index_status (check freshness), semantic_search (direct embedding-powered retrieval), context_bundle (structured file packet), graph_neighbors (relationship explorer), indexing_guidance_tool (tool-form reminders), indexing_guidance (prompt version), and info (runtime diagnostics). Workflow: run ingest_codebase on a new checkout or after edits while respecting .gitignore, call index_status when freshness is uncertain, then reach for code_lookup—use query="..." for discovery, file="..." plus optional symbol for file context, and mode="graph" for relationship exploration. If ingest_codebase hits a "UNIQUE constraint failed: code_graph_nodes..." error, rerun it with graph.enabled=false until the duplicate-node fix lands. Invoke the specialist tools directly when you need their richer metadata.'
       }
     }
   ]
@@ -1369,6 +1392,9 @@ async function main() {
         nativeModuleStatus = { status: 'error', message };
       }
 
+      const modelCache = getModelCacheConfiguration();
+      const environmentDiagnostics = getEnvironmentDiagnostics();
+
       const payload = infoToolOutputSchema.parse({
         name: serverName,
         version: serverVersion,
@@ -1379,7 +1405,12 @@ async function main() {
           nodeVersion: process.version,
           platform: `${process.platform}-${process.arch}`,
           cwd: process.cwd(),
-          pid: process.pid
+          pid: process.pid,
+          modelCache: {
+            directory: modelCache.directory,
+            source: modelCache.source,
+            diagnostics: environmentDiagnostics
+          }
         }
       });
 

@@ -36,6 +36,35 @@ echo "[index-mcp] Building native addon in release mode..." >&2
 
 BACKEND_HOST="${LOCAL_BACKEND_HOST:-127.0.0.1}"
 BACKEND_PORT="${LOCAL_BACKEND_PORT:-8765}"
+BACKEND_BASE_URL="http://${BACKEND_HOST}:${BACKEND_PORT}"
+BACKEND_HEALTH_URL="${BACKEND_BASE_URL}/healthz"
+
+HAS_CURL=0
+if command -v curl >/dev/null 2>&1; then
+  HAS_CURL=1
+fi
+
+check_backend_health() {
+  if [[ "$HAS_CURL" -ne 1 ]]; then
+    return 1
+  fi
+  local response
+  if ! response="$(curl --silent --fail "$BACKEND_HEALTH_URL" 2>/dev/null)"; then
+    return 1
+  fi
+  case "$response" in
+    *'"status":"ok"'*) return 0 ;;
+  esac
+  return 1
+}
+
+reuse_existing_backend=0
+if [[ "$HAS_CURL" -eq 1 ]]; then
+  if check_backend_health; then
+    reuse_existing_backend=1
+    echo "[index-mcp] Reusing existing local backend at ${BACKEND_BASE_URL}" >&2
+  fi
+fi
 
 cleanup() {
   local exit_status=$?
@@ -50,22 +79,30 @@ cleanup() {
 
 trap cleanup EXIT
 
-echo "[index-mcp] Launching local backend on ${BACKEND_HOST}:${BACKEND_PORT}" >&2
-"$NODE_BIN" "$BACKEND_ENTRY" &
-BACKEND_PID=$!
+if [[ "$reuse_existing_backend" -eq 0 ]]; then
+  echo "[index-mcp] Launching local backend on ${BACKEND_HOST}:${BACKEND_PORT}" >&2
+  "$NODE_BIN" "$BACKEND_ENTRY" &
+  BACKEND_PID=$!
+else
+  BACKEND_PID=""
+fi
 
 # Wait for backend readiness
-if command -v curl >/dev/null 2>&1; then
+if [[ "$HAS_CURL" -eq 1 ]]; then
   backend_ready=0
   for attempt in $(seq 1 40); do
-    if curl --silent --fail "http://${BACKEND_HOST}:${BACKEND_PORT}/healthz" >/dev/null 2>&1; then
+    if check_backend_health; then
       backend_ready=1
       break
     fi
     sleep 0.25
   done
   if [[ "$backend_ready" -ne 1 ]]; then
-    echo "[index-mcp] Backend failed to become ready at http://${BACKEND_HOST}:${BACKEND_PORT}" >&2
+    if [[ "$reuse_existing_backend" -eq 1 ]]; then
+      echo "[index-mcp] Existing backend at ${BACKEND_BASE_URL} failed health checks; stop it or choose a new LOCAL_BACKEND_PORT." >&2
+    else
+      echo "[index-mcp] Backend failed to become ready at ${BACKEND_BASE_URL}; the port may already be in use. Stop the conflicting process or set LOCAL_BACKEND_PORT." >&2
+    fi
     exit 1
   fi
 else

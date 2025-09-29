@@ -1,3 +1,4 @@
+import { ensureModelCacheDirectory } from './environment.js';
 import { loadNativeModule } from './native/index.js';
 
 const DEFAULT_MODEL = 'Xenova/bge-small-en-v1.5';
@@ -19,6 +20,8 @@ type EmbeddingProvider = (texts: string[], config: EmbedConfig) => Promise<Float
 
 let cachedProvider: EmbeddingProvider | null = null;
 let overrideProvider: EmbeddingProvider | null = null;
+
+ensureModelCacheDirectory();
 
 function normalizeVectors(vectors: unknown, expected: number): Float32Array[] {
   if (!Array.isArray(vectors)) {

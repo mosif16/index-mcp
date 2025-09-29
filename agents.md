@@ -1,8 +1,9 @@
 # Codex MCP Best Practices
 
 Transport
+	•	Codex CLI starts MCP servers from `~/.codex/config.toml`; make sure each entry launches the server in stdio mode (for example `args = ["-y", "snyk@latest", "mcp", "-t", "stdio"]`).
+	•	Codex currently speaks stdio only; keep it as the primary transport and rely on a stdio↔HTTP/SSE proxy when a server exposes HTTP or SSE endpoints.
 	•	Use stdio as the primary method. Codex CLI reliably supports stdio today.
-	•	If a server is HTTP/SSE-only, connect through a stdio↔HTTP/SSE proxy.
 
 Framing
 	•	Stdout must contain newline-delimited JSON-RPC only.
@@ -92,6 +93,7 @@ The sidecar backend (`src/local-backend/server.ts`) exposes an HTTP/SSE surface 
 - `LOCAL_BACKEND_PATH` (default `/mcp`)
 - `LOCAL_BACKEND_MESSAGES_PATH` (default `/messages`)
 - `INDEX_MCP_NATIVE_DISABLE=true` forces the JavaScript ingestion path when debugging native issues
+- `INDEX_MCP_MODEL_CACHE_DIR` overrides the embedding cache location (defaults to `~/.index-mcp/models`; `FASTEMBED_CACHE_DIR` is respected if you need to share a cache across tools)
 
 ### Watch Mode Flags
 
@@ -163,7 +165,7 @@ Environment variables scoped in the `env` table support both the `INDEX_MCP_*` n
 
 When the client connects, it receives this message:
 
-> Tools available: code_lookup (single entry point that routes to semantic_search, context_bundle, or graph_neighbors), ingest_codebase (index the current codebase into SQLite), semantic_search (embedding-powered retrieval), graph_neighbors (GraphRAG neighbor explorer), context_bundle (assemble file-level definitions, snippets, and related symbols), indexing_guidance_tool (fetch the reminders without prompt support), and indexing_guidance (prompt describing when to reindex). Always run ingest_codebase on a new or freshly checked out codebase before asking for help. Any time you or the agent edits files, re-run ingest_codebase so the SQLite index stays current, then prefer code_lookup for follow-up lookups.
+> Tools available: code_lookup (routes to semantic search, context bundles, or graph neighbors), ingest_codebase (build or refresh the SQLite index), index_status (verify index freshness), semantic_search (direct embedding-powered retrieval), context_bundle (assemble focused file context), graph_neighbors (inspect structural relationships), indexing_guidance_tool (serve these reminders as a tool), indexing_guidance (prompt form of the guidance), and info (runtime diagnostics). Preferred workflow: (1) on a new checkout or after edits, run ingest_codebase with the workspace root or the changed paths; (2) call index_status whenever you are unsure the index is current; (3) reach for code_lookup first—use query="..." for discovery, file="..." plus optional symbol for file context, and mode="graph" for relationship exploration. If ingest_codebase throws a "UNIQUE constraint failed: code_graph_nodes..." error, rerun it with graph.enabled=false while the duplicate-node bug is addressed. Call semantic_search for raw retrieval snippets, context_bundle when you need a structured file packet, or graph_neighbors to expand through the GraphRAG index, and keep .gitignore exclusions in place so repeated ingests stay clean.
 
 If your client does not yet support MCP prompts, call `indexing_guidance_tool` to retrieve the guidance text in the response’s `guidance` field; the tool mirrors the prompt content exactly so both entry points stay in sync.
 
