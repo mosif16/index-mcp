@@ -141,37 +141,24 @@ export async function semanticSearch(options: SemanticSearchOptions): Promise<Se
       );
     }
 
-    const modelRows = db
-      .prepare(
-        `SELECT
-           id,
-           path,
-           chunk_index as chunkIndex,
-           content,
-           embedding,
-           embedding_model as embeddingModel,
-           byte_start as byteStart,
-           byte_end as byteEnd,
-           line_start as lineStart,
-           line_end as lineEnd
-         FROM file_chunks
-         WHERE embedding_model = ?`
-      )
-      .all(requestedModel) as ChunkRow[];
-
-    if (!modelRows.length) {
-      return {
-        databasePath: dbPath,
-        embeddingModel: requestedModel,
-        totalChunks,
-        evaluatedChunks: 0,
-        results: []
-      };
-    }
+    const chunkStmt = db.prepare(
+      `SELECT
+         id,
+         path,
+         chunk_index as chunkIndex,
+         content,
+         embedding,
+         embedding_model as embeddingModel,
+         byte_start as byteStart,
+         byte_end as byteEnd,
+         line_start as lineStart,
+         line_end as lineEnd
+       FROM file_chunks
+       WHERE embedding_model = ?`
+    );
 
     const fileContentStmt = db.prepare('SELECT content FROM files WHERE path = ?');
     const fileCache = new Map<string, FileCacheEntry>();
-    const rowByKey = new Map<string, ChunkRow>();
 
     const getFileEntry = (filePath: string): FileCacheEntry => {
       const cached = fileCache.get(filePath);
@@ -245,8 +232,10 @@ export async function semanticSearch(options: SemanticSearchOptions): Promise<Se
     const [queryEmbedding] = await embedTexts([trimmedQuery], { model: requestedModel });
 
     const topMatches: SemanticSearchMatch[] = [];
-    for (const row of modelRows) {
-      rowByKey.set(`${row.path}::${row.chunkIndex}`, row);
+    let evaluatedChunks = 0;
+
+    for (const row of chunkStmt.iterate(requestedModel) as Iterable<ChunkRow>) {
+      evaluatedChunks += 1;
       const chunkEmbedding = bufferToFloat32Array(row.embedding);
       const score = dotProduct(queryEmbedding, chunkEmbedding);
       insertIntoTopMatches(
@@ -271,14 +260,13 @@ export async function semanticSearch(options: SemanticSearchOptions): Promise<Se
     const results = limit > 0 ? [...topMatches].reverse() : [];
 
     for (const match of results) {
-      const sourceRow = rowByKey.get(`${match.path}::${match.chunkIndex}`);
       const entry = getFileEntry(match.path);
 
       const needsMetadataFallback =
         match.byteStart === null || match.byteEnd === null || match.lineStart === null || match.lineEnd === null;
 
-      if (needsMetadataFallback && sourceRow) {
-        const derived = deriveMetadataFromContent(entry, sourceRow.content);
+      if (needsMetadataFallback) {
+        const derived = deriveMetadataFromContent(entry, match.content);
         match.byteStart = match.byteStart ?? derived.byteStart;
         match.byteEnd = match.byteEnd ?? derived.byteEnd;
         match.lineStart = match.lineStart ?? derived.lineStart;
@@ -294,7 +282,7 @@ export async function semanticSearch(options: SemanticSearchOptions): Promise<Se
       databasePath: dbPath,
       embeddingModel: requestedModel,
       totalChunks,
-      evaluatedChunks: modelRows.length,
+      evaluatedChunks,
       results
     };
   } finally {
