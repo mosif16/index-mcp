@@ -180,7 +180,7 @@ If your client does not yet support MCP prompts, call `indexing_guidance_tool` t
 4. *(Optional)* **Run the watcher:** `npm run watch` keeps the database fresh by triggering incremental ingests when files change.
 5. **Use specialist tools** directly when you need their structured responses without routing (e.g. `index_status` or `info`).
 6. **Re-index after edits:** call `ingest_codebase` again (or rely on the watcher) so `.mcp-index.sqlite` reflects the latest changes.
-7. **Shut down cleanly:** call `runCleanup()` (or rely on the CLI’s built-in signal handlers) when stopping the server to terminate watchers, close transports, and release cached embedding/native resources.
+7. **Shut down cleanly:** `await runCleanup()` (or rely on the CLI’s built-in signal handlers) when stopping the server so the asynchronous teardown can finish terminating watchers, closing transports, and draining embedding/native caches before the process exits.
 8. **Optional inspection:** use `sqlite3 .mcp-index.sqlite` to run ad-hoc queries if needed.
 
 ## 8. Database Schema (summary)

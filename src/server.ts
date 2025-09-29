@@ -1,6 +1,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import type { GetPromptResult } from '@modelcontextprotocol/sdk/types.js';
+import type { EventEmitter } from 'node:events';
+import type { ReadStream, WriteStream } from 'node:tty';
 import { parseArgs } from 'node:util';
 import { z } from 'zod';
 
@@ -1490,7 +1492,10 @@ async function main() {
 
   await registerRemoteServers(server);
 
-  const transport = new StdioServerTransport();
+  const stdinStream: ReadStream = process.stdin;
+  const stdoutStream: WriteStream = process.stdout;
+  const transport = new StdioServerTransport(stdinStream, stdoutStream);
+  const stdioDisposalCallbacks: Array<() => void> = [];
 
   const keepAliveInterval = setInterval(() => {}, 1 << 30);
   registerCleanupTask(() => {
@@ -1532,6 +1537,56 @@ async function main() {
   server.server.onclose = () => {
     void triggerCleanup('server-close');
   };
+
+  const addOnceListener = (
+    emitter: EventEmitter | undefined,
+    event: string,
+    listener: (...args: unknown[]) => void
+  ) => {
+    if (!emitter) {
+      return;
+    }
+    emitter.once(event, listener);
+    stdioDisposalCallbacks.push(() => {
+      emitter.off(event, listener);
+    });
+  };
+
+  const addStdioErrorListener = (
+    emitter: EventEmitter | undefined,
+    label: 'stdin' | 'stdout'
+  ) => {
+    if (!emitter) {
+      return;
+    }
+    const listener = (error: unknown) => {
+      logger.warn({ err: error }, `[server] ${label} stream error; triggering cleanup`);
+      void triggerCleanup(`${label}-error`);
+    };
+    emitter.once('error', listener);
+    stdioDisposalCallbacks.push(() => {
+      emitter.off('error', listener);
+    });
+  };
+
+  addOnceListener(stdinStream, 'end', () => {
+    void triggerCleanup('stdin-end');
+  });
+  addOnceListener(stdinStream, 'close', () => {
+    void triggerCleanup('stdin-close');
+  });
+  addOnceListener(stdoutStream, 'close', () => {
+    void triggerCleanup('stdout-close');
+  });
+
+  addStdioErrorListener(stdinStream, 'stdin');
+  addStdioErrorListener(stdoutStream, 'stdout');
+
+  registerCleanupTask(() => {
+    for (const dispose of stdioDisposalCallbacks.splice(0)) {
+      dispose();
+    }
+  });
 
   registerCleanupTask(closeTransport);
 

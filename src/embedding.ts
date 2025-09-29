@@ -1,5 +1,5 @@
 import { ensureModelCacheDirectory } from './environment.js';
-import { loadNativeModule } from './native/index.js';
+import { getNativeModuleStatus, loadNativeModule } from './native/index.js';
 
 const DEFAULT_MODEL = 'Xenova/bge-small-en-v1.5';
 
@@ -125,22 +125,19 @@ export function getDefaultEmbeddingModel(): string {
   return DEFAULT_MODEL;
 }
 
-export function clearEmbeddingPipelineCache(): void {
+export async function clearEmbeddingPipelineCache(): Promise<void> {
   cachedProvider = null;
   overrideProvider = null;
 
-  void loadNativeModule()
-    .then((nativeModule) => {
-      const clear = nativeModule.clearEmbeddingCache as NativeClearFn | undefined;
-      if (typeof clear === 'function') {
-        try {
-          clear();
-        } catch {
-          // Ignore errors during best-effort native cache clear
-        }
-      }
-    })
-    .catch(() => undefined);
+  if (getNativeModuleStatus().state === 'uninitialized') {
+    return;
+  }
+
+  const nativeModule = await loadNativeModule();
+  const clear = nativeModule.clearEmbeddingCache as NativeClearFn | undefined;
+  if (typeof clear === 'function') {
+    clear();
+  }
 }
 
 export const __testing = {

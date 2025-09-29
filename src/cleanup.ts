@@ -29,7 +29,7 @@ export function ensureCleanupHooks(): void {
 
   hooksInstalled = true;
 
-  type CleanupSignal = 'SIGINT' | 'SIGTERM' | 'SIGQUIT';
+  type CleanupSignal = 'SIGINT' | 'SIGTERM' | 'SIGQUIT' | 'SIGHUP';
 
   const handleSignal = (signal: CleanupSignal) => {
     log.info({ signal }, 'Received termination signal; running cleanup');
@@ -42,7 +42,7 @@ export function ensureCleanupHooks(): void {
       });
   };
 
-  const cleanupSignals: CleanupSignal[] = ['SIGINT', 'SIGTERM', 'SIGQUIT'];
+  const cleanupSignals: CleanupSignal[] = ['SIGINT', 'SIGTERM', 'SIGQUIT', 'SIGHUP'];
 
   for (const signal of cleanupSignals) {
     process.once(signal, handleSignal);
@@ -70,15 +70,15 @@ export function runCleanup(): Promise<void> {
       }
 
       try {
-        resetNativeModuleCache();
+        await clearEmbeddingPipelineCache();
       } catch (error) {
-        log.warn({ err: error }, 'Failed to reset native module cache during cleanup');
+        log.warn({ err: error }, 'Failed to clear embedding pipeline cache during cleanup');
       }
 
       try {
-        clearEmbeddingPipelineCache();
+        resetNativeModuleCache();
       } catch (error) {
-        log.warn({ err: error }, 'Failed to clear embedding pipeline cache during cleanup');
+        log.warn({ err: error }, 'Failed to reset native module cache during cleanup');
       }
 
       try {
