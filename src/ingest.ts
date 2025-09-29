@@ -6,7 +6,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { embedTexts, float32ArrayToBuffer, getDefaultEmbeddingModel } from './embedding.js';
-import { extractGraphMetadata, type GraphExtractionResult } from './graph.js';
+import { extractGraphMetadata } from './graph.js';
 import { DEFAULT_DB_FILENAME, DEFAULT_INCLUDE_GLOBS, DEFAULT_EXCLUDE_GLOBS } from './constants.js';
 import { loadNativeModule } from './native/index.js';
 import type {
@@ -124,6 +124,27 @@ interface PendingChunk {
   lineStart: number | null;
   lineEnd: number | null;
   embedding?: Buffer;
+}
+
+interface PendingGraphNode {
+  id: string;
+  path: string | null;
+  kind: string;
+  name: string;
+  signature: string | null;
+  rangeStart: number | null;
+  rangeEnd: number | null;
+  metadata: string | null;
+}
+
+interface PendingGraphEdge {
+  id: string;
+  sourceId: string;
+  targetId: string;
+  type: string;
+  sourcePath: string | null;
+  targetPath: string | null;
+  metadata: string | null;
 }
 
 interface ChunkFragment {
@@ -425,7 +446,8 @@ interface ProcessNativeEntriesParams {
   seenPaths: Set<string>;
   chunkJobs: PendingChunk[];
   chunkRefreshPaths: Set<string>;
-  graphUpdates: Map<string, GraphExtractionResult | null>;
+  graphNodeJobs: PendingGraphNode[];
+  graphEdgeJobs: PendingGraphEdge[];
   sanitizeContent: ContentSanitizer;
   embeddingConfig: EmbeddingConfig;
   graphConfig: GraphConfig;
@@ -440,7 +462,8 @@ async function processNativeEntries({
   seenPaths,
   chunkJobs,
   chunkRefreshPaths,
-  graphUpdates,
+  graphNodeJobs,
+  graphEdgeJobs,
   sanitizeContent,
   embeddingConfig,
   graphConfig,
@@ -457,7 +480,8 @@ async function processNativeEntries({
       seenPaths,
       chunkJobs,
       chunkRefreshPaths,
-      graphUpdates,
+      graphNodeJobs,
+      graphEdgeJobs,
       sanitizeContent,
       embeddingConfig,
       graphConfig,
@@ -475,7 +499,8 @@ interface ProcessNativeEntryParams {
   seenPaths: Set<string>;
   chunkJobs: PendingChunk[];
   chunkRefreshPaths: Set<string>;
-  graphUpdates: Map<string, GraphExtractionResult | null>;
+  graphNodeJobs: PendingGraphNode[];
+  graphEdgeJobs: PendingGraphEdge[];
   sanitizeContent: ContentSanitizer;
   embeddingConfig: EmbeddingConfig;
   graphConfig: GraphConfig;
@@ -491,7 +516,8 @@ async function processNativeEntry({
   seenPaths,
   chunkJobs,
   chunkRefreshPaths,
-  graphUpdates,
+  graphNodeJobs,
+  graphEdgeJobs,
   sanitizeContent,
   embeddingConfig,
   graphConfig,
@@ -622,10 +648,36 @@ async function processNativeEntry({
     content: storeFileContent ? content : null
   });
 
-  if (graphConfig.enabled) {
-    const graphResult = content ? extractGraphMetadata(normalizedPath, content) : null;
-    graphUpdates.set(normalizedPath, graphResult);
+  if (graphConfig.enabled && content) {
+    const graphResult = extractGraphMetadata(normalizedPath, content);
+    if (graphResult) {
+      for (const node of graphResult.entities) {
+        graphNodeJobs.push({
+          id: node.id,
+          path: node.path,
+          kind: node.kind,
+          name: node.name,
+          signature: node.signature ?? null,
+          rangeStart: node.rangeStart ?? null,
+          rangeEnd: node.rangeEnd ?? null,
+          metadata: node.metadata ? JSON.stringify(node.metadata) : null
+        });
+      }
+      for (const edge of graphResult.edges) {
+        graphEdgeJobs.push({
+          id: edge.id,
+          sourceId: edge.sourceId,
+          targetId: edge.targetId,
+          type: edge.type,
+          sourcePath: edge.sourcePath ?? null,
+          targetPath: edge.targetPath ?? null,
+          metadata: edge.metadata ? JSON.stringify(edge.metadata) : null
+        });
+      }
+    }
   }
+
+  content = null;
 }
 
 function normalizeTargetPaths(root: string, paths?: string[]): string[] {
@@ -697,10 +749,37 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
 
     const sanitizeContent = await loadSanitizer(absoluteRoot, options.contentSanitizer);
 
-    const existingRows = db
-      .prepare('SELECT path, size, modified, hash, last_indexed_at as lastIndexedAt, content FROM files')
-      .all() as FileRow[];
-    const existingByPath = new Map<string, FileRow>(existingRows.map((row) => [row.path, row]));
+    const baseSelectColumns = `path, size, modified, hash, last_indexed_at as lastIndexedAt${
+      storeFileContent ? ', content' : ''
+    }`;
+    let selectSql = `SELECT ${baseSelectColumns} FROM files`;
+    const selectArgs: string[] = [];
+    if (usingTargetPaths) {
+      const placeholders = targetPaths.map(() => '?').join(', ');
+      selectSql += ` WHERE path IN (${placeholders})`;
+      selectArgs.push(...targetPaths);
+    }
+
+    const selectStmt = db.prepare(selectSql);
+    const existingByPath = new Map<string, FileRow>();
+    for (const row of selectStmt.iterate(...selectArgs)) {
+      const record = row as {
+        path: string;
+        size: number;
+        modified: number;
+        hash: string;
+        lastIndexedAt: number;
+        content?: string | null;
+      };
+      existingByPath.set(record.path, {
+        path: record.path,
+        size: record.size,
+        modified: record.modified,
+        hash: record.hash,
+        lastIndexedAt: record.lastIndexedAt,
+        content: storeFileContent ? record.content ?? null : null
+      });
+    }
 
     const needsTextContent = storeFileContent || embeddingConfig.enabled || graphConfig.enabled;
     const nativeModule = await loadNativeModule();
@@ -710,7 +789,8 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
     const seenPaths = new Set<string>();
     const chunkJobs: PendingChunk[] = [];
     const chunkRefreshPaths = new Set<string>();
-    const graphUpdates = new Map<string, GraphExtractionResult | null>();
+    const graphNodeJobs: PendingGraphNode[] = [];
+    const graphEdgeJobs: PendingGraphEdge[] = [];
 
     const existingPathsSet = usingTargetPaths
       ? new Set<string>(targetPaths.filter((p) => existingByPath.has(p)))
@@ -757,7 +837,8 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
             seenPaths,
             chunkJobs,
             chunkRefreshPaths,
-            graphUpdates,
+            graphNodeJobs,
+            graphEdgeJobs,
             sanitizeContent,
             embeddingConfig,
             graphConfig,
@@ -800,7 +881,8 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
             seenPaths,
             chunkJobs,
             chunkRefreshPaths,
-            graphUpdates,
+            graphNodeJobs,
+            graphEdgeJobs,
             sanitizeContent,
             embeddingConfig,
             graphConfig,
@@ -836,7 +918,8 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
         seenPaths,
         chunkJobs,
         chunkRefreshPaths,
-        graphUpdates,
+        graphNodeJobs,
+        graphEdgeJobs,
         sanitizeContent,
         embeddingConfig,
         graphConfig,
@@ -859,19 +942,28 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
         jobsByModel.set(job.model, list);
       }
 
+      const batchTexts: string[] = [];
       for (const [model, jobs] of jobsByModel) {
         for (let i = 0; i < jobs.length; i += embeddingConfig.batchSize) {
-          const batch = jobs.slice(i, i + embeddingConfig.batchSize);
-          const embeddings = await embedTexts(
-            batch.map((job) => job.content),
-            { model }
-          );
-          batch.forEach((job, idx) => {
-            job.embedding = float32ArrayToBuffer(embeddings[idx]);
-          });
-          embeddedChunkCount += batch.length;
+          const end = Math.min(i + embeddingConfig.batchSize, jobs.length);
+          batchTexts.length = 0;
+          for (let cursor = i; cursor < end; cursor += 1) {
+            batchTexts.push(jobs[cursor].content);
+          }
+          if (batchTexts.length === 0) {
+            continue;
+          }
+          const embeddings = await embedTexts(batchTexts, { model });
+          let embeddingIndex = 0;
+          for (let cursor = i; cursor < end; cursor += 1) {
+            jobs[cursor].embedding = float32ArrayToBuffer(embeddings[embeddingIndex]);
+            embeddingIndex += 1;
+          }
+          embeddedChunkCount += batchTexts.length;
         }
       }
+      batchTexts.length = 0;
+      jobsByModel.clear();
     }
 
     const upsertStmt = db.prepare(
@@ -953,35 +1045,13 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
         });
       }
       if (graphConfig.enabled) {
-        for (const graphData of graphUpdates.values()) {
-          if (!graphData) {
-            continue;
-          }
-          for (const node of graphData.entities) {
-            insertGraphNodeStmt.run({
-              id: node.id,
-              path: node.path,
-              kind: node.kind,
-              name: node.name,
-              signature: node.signature ?? null,
-              rangeStart: node.rangeStart ?? null,
-              rangeEnd: node.rangeEnd ?? null,
-              metadata: node.metadata ? JSON.stringify(node.metadata) : null
-            });
-            graphNodeCount += 1;
-          }
-          for (const edge of graphData.edges) {
-            insertGraphEdgeStmt.run({
-              id: edge.id,
-              sourceId: edge.sourceId,
-              targetId: edge.targetId,
-              type: edge.type,
-              sourcePath: edge.sourcePath ?? null,
-              targetPath: edge.targetPath ?? null,
-              metadata: edge.metadata ? JSON.stringify(edge.metadata) : null
-            });
-            graphEdgeCount += 1;
-          }
+        for (const node of graphNodeJobs) {
+          insertGraphNodeStmt.run(node);
+          graphNodeCount += 1;
+        }
+        for (const edge of graphEdgeJobs) {
+          insertGraphEdgeStmt.run(edge);
+          graphEdgeCount += 1;
         }
       }
       for (const deleted of deletedPaths) {
