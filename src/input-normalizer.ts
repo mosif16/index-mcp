@@ -344,6 +344,10 @@ export function normalizeTimelineArgs(raw: unknown): UnknownRecord {
   coerceBoolean(record, 'includeFileStats');
   coerceBoolean(record, 'includeDiffs');
 
+  if (record.includeDiffs === undefined) {
+    record.includeDiffs = true;
+  }
+
   ensureArray(record, 'paths');
 
   if (typeof record.branch === 'string') {
