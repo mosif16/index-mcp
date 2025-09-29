@@ -486,7 +486,7 @@ async function loadGitignoreMatcher(root: string, exclude: string[]): Promise<Ig
 }
 
 function convertGitignorePattern(pattern: string, baseDir: string): string {
-  const normalizedPattern = pattern.replace(/\\/g, '/');
+  const normalizedPattern = pattern.replace(/\\/g, '/').replace(/^\.\/+/, '');
   const prefix = baseDir ? `${baseDir}/` : '';
 
   if (normalizedPattern.startsWith('/')) {
@@ -495,5 +495,12 @@ function convertGitignorePattern(pattern: string, baseDir: string): string {
     return anchored.replace(/\/+/g, '/');
   }
 
-  return `${prefix}**/${normalizedPattern}`.replace(/\/+/g, '/');
+  const hasSlash = normalizedPattern.includes('/');
+  const hasRecursivePrefix = normalizedPattern.startsWith('**');
+
+  if (!hasSlash && !hasRecursivePrefix) {
+    return `${prefix}**/${normalizedPattern}`.replace(/\/+/g, '/');
+  }
+
+  return `${prefix}${normalizedPattern}`.replace(/\/+/g, '/');
 }
