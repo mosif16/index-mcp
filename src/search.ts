@@ -49,6 +49,7 @@ export interface SemanticSearchResult {
 }
 
 const DEFAULT_RESULT_LIMIT = 8;
+const MAX_RESULT_LIMIT = 50;
 const CONTEXT_LINE_PADDING = 2;
 
 interface FileCacheEntry {
@@ -91,6 +92,24 @@ function insertIntoTopMatches(
   }
 }
 
+function normalizeResultLimit(limit: number | undefined): number {
+  if (limit === undefined || Number.isNaN(limit)) {
+    return DEFAULT_RESULT_LIMIT;
+  }
+
+  if (!Number.isFinite(limit)) {
+    throw new Error('Result limit must be a finite number');
+  }
+
+  if (limit <= 0) {
+    return 0;
+  }
+
+  const coerced = Math.floor(limit);
+  const positive = Math.max(coerced, 1);
+  return Math.min(positive, MAX_RESULT_LIMIT);
+}
+
 export async function semanticSearch(options: SemanticSearchOptions): Promise<SemanticSearchResult> {
   const trimmedQuery = options.query.trim();
   if (!trimmedQuery) {
@@ -104,7 +123,7 @@ export async function semanticSearch(options: SemanticSearchOptions): Promise<Se
   }
 
   const dbPath = path.join(absoluteRoot, options.databaseName ?? DEFAULT_DB_FILENAME);
-  const limit = options.limit ?? DEFAULT_RESULT_LIMIT;
+  const limit = normalizeResultLimit(options.limit);
 
   const db = new Database(dbPath, { readonly: true });
   try {

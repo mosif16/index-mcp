@@ -1,7 +1,10 @@
 import { ensureModelCacheDirectory } from './environment.js';
+import { createLogger } from './logger.js';
 import { getNativeModuleStatus, loadNativeModule } from './native/index.js';
 
 const DEFAULT_MODEL = 'Xenova/bge-small-en-v1.5';
+const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+const MIN_IDLE_TIMEOUT_MS = 30 * 1000;
 
 type NativeEmbeddingFn = (request: {
   texts: string[];
@@ -20,8 +23,68 @@ type EmbeddingProvider = (texts: string[], config: EmbedConfig) => Promise<Float
 
 let cachedProvider: EmbeddingProvider | null = null;
 let overrideProvider: EmbeddingProvider | null = null;
+let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+const log = createLogger('embedding');
 
 ensureModelCacheDirectory();
+
+const embeddingIdleTimeoutMs = resolveEmbeddingIdleTimeout();
+
+function resolveEmbeddingIdleTimeout(): number | null {
+  const raw = process.env.INDEX_MCP_EMBEDDING_IDLE_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === '') {
+    return DEFAULT_IDLE_TIMEOUT_MS;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    log.warn(
+      { value: raw },
+      'Invalid INDEX_MCP_EMBEDDING_IDLE_TIMEOUT_MS; falling back to default idle timeout'
+    );
+    return DEFAULT_IDLE_TIMEOUT_MS;
+  }
+
+  if (parsed <= 0) {
+    return null;
+  }
+
+  const coerced = Math.max(MIN_IDLE_TIMEOUT_MS, Math.floor(parsed));
+  return coerced;
+}
+
+function cancelEmbeddingIdleCleanup(): void {
+  if (idleTimer) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
+}
+
+function scheduleEmbeddingIdleCleanup(): void {
+  if (embeddingIdleTimeoutMs === null) {
+    return;
+  }
+
+  cancelEmbeddingIdleCleanup();
+
+  idleTimer = setTimeout(() => {
+    idleTimer = null;
+    void runIdleEmbeddingCleanup();
+  }, embeddingIdleTimeoutMs);
+
+  // Avoid keeping the event loop alive solely for the idle timeout.
+  idleTimer.unref?.();
+}
+
+async function runIdleEmbeddingCleanup(): Promise<void> {
+  try {
+    await clearEmbeddingPipelineCache();
+    log.debug({ timeoutMs: embeddingIdleTimeoutMs }, 'Cleared embedding pipeline cache after idle window');
+  } catch (error) {
+    log.warn({ err: error }, 'Failed to clear embedding pipeline cache after idle window');
+  }
+}
 
 function normalizeVectors(vectors: unknown, expected: number): Float32Array[] {
   if (!Array.isArray(vectors)) {
@@ -105,7 +168,11 @@ export async function embedTexts(texts: string[], config: EmbedConfig = {}): Pro
     model: config.model ?? DEFAULT_MODEL
   };
 
-  return provider(texts, normalizedConfig);
+  try {
+    return await provider(texts, normalizedConfig);
+  } finally {
+    scheduleEmbeddingIdleCleanup();
+  }
 }
 
 export function float32ArrayToBuffer(array: Float32Array): Buffer {
@@ -126,6 +193,7 @@ export function getDefaultEmbeddingModel(): string {
 }
 
 export async function clearEmbeddingPipelineCache(): Promise<void> {
+  cancelEmbeddingIdleCleanup();
   cachedProvider = null;
   overrideProvider = null;
 
@@ -147,6 +215,7 @@ export const __testing = {
   reset(): void {
     cachedProvider = null;
     overrideProvider = null;
+    cancelEmbeddingIdleCleanup();
   },
   getCachedProvider(): EmbeddingProvider | null {
     return cachedProvider;

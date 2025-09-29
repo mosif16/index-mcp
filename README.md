@@ -321,6 +321,7 @@ The tool accepts no parameters and responds with a structured payload containing
 
 - Files larger than `maxFileSizeBytes` are skipped to avoid ballooning the index. Adjust per codebase needs.
 - Binary files are detected heuristically (null-byte scan) and stored without content even when `storeFileContent` is true.
+- The embedding pipeline releases cached model weights after five minutes of inactivity to reclaim memory. Override the window with `INDEX_MCP_EMBEDDING_IDLE_TIMEOUT_MS` (milliseconds) or set it to `0` to disable automatic cleanup.
 - The ingestion table keeps track of added, updated, and deleted entries so repeated runs stay fast, and unchanged files are skipped using mtime/size checks.
 - When the native addon is available, ingestion now performs a metadata-only scan first and only re-reads files whose size or mtime changed. Large repos with minimal edits avoid rehashing unchanged files, dramatically reducing IO and memory pressure.
 - Provide a sanitizer module to strip secrets or redact sensitive payloads before they reach the index.
