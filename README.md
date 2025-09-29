@@ -246,6 +246,26 @@ Returns a single payload that combines file metadata, discovered definitions, re
 
 Snippets come from embedded chunks when available; otherwise the tool falls back to stored file content so clients always receive at least one preview. Warnings surface when graph metadata or snippets are missing, helping agents decide whether a fresh ingest is needed.
 
+### `repository_timeline`
+
+Generates a digest of recent git commits so agents can factor change history, merge activity, and file churn into their reasoning before diving into code.
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `root` | `string` | Absolute or relative path to the repository root. |
+| `branch` | `string` | Git reference to inspect (defaults to `HEAD`). |
+| `limit` | `number` | Maximum commits to return (default 20, capped at 200). |
+| `since` | `string` | ISO timestamp or shorthand (e.g. `7d`, `4w`) used to filter commits. |
+| `includeMerges` | `boolean` | Include merge commits in the digest (default `true`). |
+| `includeFileStats` | `boolean` | Include per-file insert/delete counts (default `true`). |
+| `includeDiffs` | `boolean` | Include unified diffs for each commit (default `false`). |
+| `paths` | `string[]` | Optional list of path filters; when present Git only returns commits touching those paths and patches contain matching files. |
+| `diffPattern` | `string` | Optional regular expression (`git log -G`) used to limit commits to diffs matching the pattern. |
+
+The structured payload reports aggregate totals (commit count, merge count, insertions/deletions) and an entry per commit with authorship metadata, optional PR numbers extracted from the subject, and file-level churn details when stats are enabled.
+
+When `includeDiffs` is `true`, each entry also exposes a `diff` field containing the filtered patch text (respecting `paths` and `diffPattern`).
+
 ### `indexing_guidance_tool`
 
 Returns the same reminders surfaced by the `indexing_guidance` prompt, but wrapped as a tool response for clients that do not expose prompt invocation yet. The tool accepts no parameters.

@@ -22,12 +22,14 @@ import {
   normalizeIngestArgs,
   normalizeLookupArgs,
   normalizeSearchArgs,
-  normalizeStatusArgs
+  normalizeStatusArgs,
+  normalizeTimelineArgs
 } from './input-normalizer.js';
 import { getNativeModuleStatus, loadNativeModule } from './native/index.js';
 import { getIndexStatus } from './status.js';
 import { getContextBundle } from './context-bundle.js';
 import { registerRemoteServers } from './remote-proxy.js';
+import { getRepositoryTimeline } from './git-timeline.js';
 
 function rethrowWithContext(toolName: string, error: unknown): never {
   if (error instanceof Error) {
@@ -771,6 +773,161 @@ const codeLookupOutputShape = {
 
 const codeLookupOutputSchema = z.object(codeLookupOutputShape);
 
+const repositoryTimelineJsonSchema = {
+  type: 'object',
+  title: 'Repository Timeline Parameters',
+  description: 'Summarize recent git commits, merges, and file churn for a repository.',
+  properties: {
+    root: {
+      type: 'string',
+      description: 'Absolute or relative path to the repository whose history should be inspected.'
+    },
+    branch: {
+      type: 'string',
+      description: 'Git reference to examine (defaults to HEAD).'
+    },
+    limit: {
+      type: 'integer',
+      description: 'Maximum number of commits to include (aliases: max_commits, max_results, top_k). Defaults to 20.',
+      minimum: 1,
+      maximum: 200,
+      default: 20
+    },
+    since: {
+      type: 'string',
+      description: 'Limit commits to those after the given ISO timestamp or shorthand (e.g. 2024-01-01, 14d, 4w).'
+    },
+    includeMerges: {
+      type: 'boolean',
+      description: 'Whether merge commits should be included (aliases: include_merges). Defaults to true.'
+    },
+    includeFileStats: {
+      type: 'boolean',
+      description: 'Whether to return per-file insert/delete counts (aliases: include_stats). Defaults to true.'
+    },
+    includeDiffs: {
+      type: 'boolean',
+      description: 'Whether to include unified diffs for each commit (aliases: include_patches). Defaults to false.'
+    },
+    paths: {
+      type: 'array',
+      description: 'Optional list of file paths to filter commits and diffs (aliases: path_filters, file_paths).',
+      items: {
+        type: 'string'
+      }
+    },
+    diffPattern: {
+      type: 'string',
+      description: 'Optional regular expression to limit results to diffs matching the pattern (aliases: diff_regex, content_match).'
+    }
+  },
+  required: [],
+  additionalProperties: false
+} as const;
+
+const repositoryTimelineInputSchema = z
+  .object({
+    root: z
+      .string()
+      .min(1, 'root directory is required')
+      .describe('Absolute or relative path to the repository whose history should be inspected.')
+      .optional(),
+    branch: z
+      .string()
+      .min(1)
+      .describe('Git reference to examine (defaults to HEAD).')
+      .optional(),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(200)
+      .describe('Maximum number of commits to include.')
+      .optional(),
+    since: z
+      .string()
+      .min(1)
+      .describe('Limit commits to those after the given ISO timestamp or shorthand (e.g. 2024-01-01, 14d, 4w).')
+      .optional(),
+    includeMerges: z
+      .boolean()
+      .describe('Whether merge commits should be included (defaults to true).')
+      .optional(),
+    includeFileStats: z
+      .boolean()
+      .describe('Whether to return per-file insert/delete counts (defaults to true).')
+      .optional(),
+    includeDiffs: z
+      .boolean()
+      .describe('Whether to include unified diffs for each commit (defaults to false).')
+      .optional(),
+    paths: z
+      .array(z.string())
+      .min(1)
+      .describe('Optional list of file paths to filter commits and diffs.')
+      .optional(),
+    diffPattern: z
+      .string()
+      .min(1)
+      .describe('Optional regular expression to limit results to diffs matching the pattern.')
+      .optional()
+  })
+  .strict();
+
+const repositoryTimelineFileChangeShape = {
+  path: z.string(),
+  insertions: z.number().nullable(),
+  deletions: z.number().nullable(),
+  net: z.number().nullable()
+} as const;
+
+const repositoryTimelineFileChangeSchema = z.object(repositoryTimelineFileChangeShape);
+
+const repositoryTimelineEntryShape = {
+  sha: z.string(),
+  subject: z.string(),
+  summary: z.string(),
+  author: z.object({
+    name: z.string(),
+    email: z.string()
+  }),
+  authorDate: z.string(),
+  committer: z.object({
+    name: z.string(),
+    email: z.string()
+  }),
+  committerDate: z.string(),
+  parents: z.array(z.string()),
+  isMerge: z.boolean(),
+  pullRequestNumber: z.number().nullable(),
+  filesChanged: z.number(),
+  insertions: z.number(),
+  deletions: z.number(),
+  fileChanges: z.array(repositoryTimelineFileChangeSchema),
+  diff: z.string().nullable().optional()
+} as const;
+
+const repositoryTimelineEntrySchema = z.object(repositoryTimelineEntryShape);
+
+const repositoryTimelineOutputShape = {
+  repositoryRoot: z.string(),
+  branch: z.string(),
+  limit: z.number(),
+  since: z.string().optional(),
+  includeMerges: z.boolean(),
+  includeFileStats: z.boolean(),
+  includeDiffs: z.boolean(),
+  paths: z.array(z.string()).optional(),
+  diffPattern: z.string().optional(),
+  totalCommits: z.number(),
+  mergeCommits: z.number(),
+  totalInsertions: z.number(),
+  totalDeletions: z.number(),
+  entries: z.array(repositoryTimelineEntrySchema)
+} as const;
+
+const repositoryTimelineOutputSchema = z.object(repositoryTimelineOutputShape);
+
 const indexStatusJsonSchema = {
   type: 'object',
   title: 'Index Status Parameters',
@@ -899,9 +1056,10 @@ const indexingGuidanceOutputShape = {
 const indexingGuidanceOutputSchema = z.object(indexingGuidanceOutputShape);
 
 const SERVER_INSTRUCTIONS = [
-  `Tools available from ${serverName} v${serverVersion}: code_lookup (routes to semantic search, context bundles, or graph neighbors), ingest_codebase (build or refresh the SQLite index), index_status (verify index freshness), semantic_search (direct embedding-powered retrieval), context_bundle (assemble focused file context), graph_neighbors (inspect structural relationships), indexing_guidance_tool (return these reminders as a tool), indexing_guidance (prompt form of the guidance), and info (runtime diagnostics).`,
+  `Tools available from ${serverName} v${serverVersion}: code_lookup (routes to semantic search, context bundles, or graph neighbors), ingest_codebase (build or refresh the SQLite index), index_status (verify index freshness), semantic_search (direct embedding-powered retrieval), context_bundle (assemble focused file context), graph_neighbors (inspect structural relationships), repository_timeline (summarize recent git commits and file churn), indexing_guidance_tool (return these reminders as a tool), indexing_guidance (prompt form of the guidance), and info (runtime diagnostics).`,
   'Preferred workflow: (1) on a new checkout or after edits, run ingest_codebase with the workspace root or specific changed paths; (2) call index_status whenever you are unsure the index is current; (3) reach for code_lookup first—use query="..." for discovery, file="..." plus optional symbol for file context, and mode="graph" when you need relationship exploration.',
   'Call semantic_search when you want raw retrieval snippets, context_bundle for a structured file packet, or graph_neighbors to expand through the GraphRAG index; these direct calls expose additional metadata beyond the routed code_lookup path.',
+  'Use repository_timeline to review recent commits, merges, and churn so plan-of-action agents can factor fresh changes into their reasoning.',
   'If ingest_codebase reports "UNIQUE constraint failed: code_graph_nodes...", rerun it with graph.enabled set to false while the duplicate-node bug is addressed.',
   'Respect ignore files during ingestion so .gitignore exclusions stay enforced, and rerun ingest_codebase (or rely on the watcher) whenever files change to prevent stale search results.'
 ].join(' ');
@@ -1316,6 +1474,58 @@ async function main() {
         };
       } catch (error) {
         return rethrowWithContext('context_bundle', error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'repository_timeline',
+    {
+      description: 'Summarize recent git commits, merges, and file churn.',
+      inputSchema: repositoryTimelineInputSchema.shape,
+      outputSchema: repositoryTimelineOutputShape,
+      annotations: {
+        jsonSchema: repositoryTimelineJsonSchema
+      }
+    },
+    async (args, extra) => {
+      try {
+        const normalizedInput = normalizeTimelineArgs(args);
+        const parsedInput = repositoryTimelineInputSchema.parse(normalizedInput);
+        const context = createRootResolutionContext(extra);
+        const resolvedRoot = resolveRootPath(parsedInput.root, context);
+        const timelineInput = {
+          ...parsedInput,
+          root: resolvedRoot
+        };
+        const result = repositoryTimelineOutputSchema.parse(
+          await getRepositoryTimeline(timelineInput)
+        );
+
+        let summary: string;
+        if (result.totalCommits === 0) {
+          const sinceText = result.since ? ` since ${result.since}` : '';
+          summary = `No commits matched the requested filters on ${result.branch}${sinceText}.`;
+        } else {
+          const commitWord = result.totalCommits === 1 ? 'commit' : 'commits';
+          const sinceText = result.since ? ` since ${result.since}` : '';
+          const mergeSegment = result.mergeCommits
+            ? ` Includes ${result.mergeCommits} merge${result.mergeCommits === 1 ? '' : 's'}.`
+            : '';
+          summary = `Latest ${result.totalCommits} ${commitWord}${sinceText} on ${result.branch}; ${result.totalInsertions} insertions / ${result.totalDeletions} deletions.${mergeSegment}`;
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: summary
+            }
+          ],
+          structuredContent: result
+        };
+      } catch (error) {
+        return rethrowWithContext('repository_timeline', error);
       }
     }
   );

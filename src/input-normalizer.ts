@@ -319,6 +319,75 @@ export function normalizeStatusArgs(raw: unknown): UnknownRecord {
   return record;
 }
 
+export function normalizeTimelineArgs(raw: unknown): UnknownRecord {
+  if (!raw || typeof raw !== 'object') {
+    return {};
+  }
+
+  const record = cloneRecord(raw as UnknownRecord);
+
+  applyAliases(record, {
+    root: ['path', 'project_path', 'workspace_root', 'working_directory'],
+    branch: ['ref', 'revision', 'target', 'branch_name'],
+    limit: ['max_commits', 'max_results', 'top_k'],
+    since: ['after', 'since_date', 'since_time'],
+    includeMerges: ['merges', 'include_merges', 'with_merges'],
+    includeFileStats: ['file_stats', 'include_stats', 'with_stats'],
+    includeDiffs: ['diffs', 'with_diffs', 'include_patches'],
+    paths: ['path_filters', 'files', 'file_paths'],
+    diffPattern: ['pattern', 'diff_regex', 'search', 'content_match']
+  });
+
+  normalizeRootField(record);
+  coerceNumber(record, 'limit');
+  coerceBoolean(record, 'includeMerges');
+  coerceBoolean(record, 'includeFileStats');
+  coerceBoolean(record, 'includeDiffs');
+
+  ensureArray(record, 'paths');
+
+  if (typeof record.branch === 'string') {
+    const trimmedBranch = record.branch.trim();
+    if (trimmedBranch) {
+      record.branch = trimmedBranch;
+    } else {
+      delete record.branch;
+    }
+  }
+
+  if (typeof record.since === 'string') {
+    const trimmedSince = record.since.trim();
+    if (trimmedSince) {
+      record.since = trimmedSince;
+    } else {
+      delete record.since;
+    }
+  }
+
+  if (typeof record.diffPattern === 'string') {
+    const trimmedPattern = record.diffPattern.trim();
+    if (trimmedPattern) {
+      record.diffPattern = trimmedPattern;
+    } else {
+      delete record.diffPattern;
+    }
+  }
+
+  if (Array.isArray(record.paths)) {
+    const normalizedPaths = record.paths
+      .map((value) => (typeof value === 'string' ? value.trim() : undefined))
+      .filter((value): value is string => typeof value === 'string' && value.length > 0);
+
+    if (normalizedPaths.length > 0) {
+      record.paths = normalizedPaths;
+    } else {
+      delete record.paths;
+    }
+  }
+
+  return record;
+}
+
 export function normalizeContextBundleArgs(raw: unknown): UnknownRecord {
   if (!raw || typeof raw !== 'object') {
     return {};
