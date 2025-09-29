@@ -4,12 +4,55 @@ dist/
 .DS_Store
 *.log
 
+# IDEs / Editor settings
+.vscode/
+.idea/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
 # Local SQLite indexes
 .mcp-index.sqlite
 .mcp-index.sqlite-*
 *.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite-journal
 
 # Native addon build outputs
 crates/index_mcp_native/target/
 crates/index_mcp_native/index.node
 crates/index_mcp_native/index.*.node
+
+# Rust top-level target (for any root-level cargo builds)
+target/
+
+# TypeScript build info
+*.tsbuildinfo
+
+# Linters / tooling caches
+.eslintcache
+
+# Test coverage and reports
+coverage/
+.nyc_output/
+.coverage*
+
+# Logs
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.swp
+*.swo
+*.orig
+.fastembed_cache

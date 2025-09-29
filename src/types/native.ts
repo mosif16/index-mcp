@@ -78,9 +78,17 @@ export interface NativeAnalysisResult {
   chunks: NativeChunkFragment[];
 }
 
+export interface NativeEmbeddingRequest {
+  texts: string[];
+  model?: string;
+  batchSize?: number;
+}
+
 export interface NativeModule {
   scanRepo(options: NativeScanOptions): Promise<NativeScanResult>;
   scanRepoMetadata?(options: NativeMetadataOptions): Promise<NativeMetadataResult>;
   readRepoFiles?(options: NativeReadOptions): Promise<NativeReadResult>;
   analyzeFileContent?(options: NativeAnalyzeOptions): Promise<NativeAnalysisResult>;
+  generateEmbeddings(options: NativeEmbeddingRequest): Promise<number[][]>;
+  clearEmbeddingCache?(): void;
 }

@@ -1,115 +1,91 @@
-import {
-  pipeline,
-  env,
-  type FeatureExtractionPipeline,
-  type PipelineType
-} from '@xenova/transformers';
-
-env.allowRemoteModels = true;
+import { loadNativeModule } from './native/index.js';
 
 const DEFAULT_MODEL = 'Xenova/bge-small-en-v1.5';
 
-type EmbeddingPipeline = FeatureExtractionPipeline;
+type NativeEmbeddingFn = (request: {
+  texts: string[];
+  model?: string;
+  batchSize?: number;
+}) => Promise<number[][]>;
 
-type TensorData = Float32Array | ArrayLike<number>;
-
-type TensorLike = {
-  data: TensorData;
-  dims?: number[];
-};
-
-type PipelineFactory = (task: PipelineType, model: string) => Promise<EmbeddingPipeline>;
-
-const pipelineCache = new Map<string, Promise<EmbeddingPipeline>>();
-
-const defaultPipelineFactory: PipelineFactory = (task, model) =>
-  pipeline(task, model) as Promise<EmbeddingPipeline>;
-
-let currentPipelineFactory: PipelineFactory = defaultPipelineFactory;
-
-async function getEmbeddingPipeline(model = DEFAULT_MODEL): Promise<EmbeddingPipeline> {
-  if (!pipelineCache.has(model)) {
-    const pipelinePromise = currentPipelineFactory('feature-extraction', model).catch((error) => {
-      pipelineCache.delete(model);
-      throw error;
-    });
-    pipelineCache.set(model, pipelinePromise);
-  }
-  return pipelineCache.get(model)!;
-}
-
-function toFloat32Array(data: TensorData): Float32Array {
-  if (data instanceof Float32Array) {
-    return data;
-  }
-  return new Float32Array(data);
-}
-
-function normalizeToFloat32Arrays(output: unknown): Float32Array[] {
-  if (output instanceof Float32Array) {
-    return [output];
-  }
-
-  if (ArrayBuffer.isView(output)) {
-    const view = output as ArrayBufferView;
-    const floatView = new Float32Array(
-      view.buffer,
-      view.byteOffset,
-      view.byteLength / Float32Array.BYTES_PER_ELEMENT
-    );
-    return [floatView.slice()];
-  }
-
-  if (Array.isArray(output)) {
-    if (output.length === 0) {
-      return [];
-    }
-
-    if (typeof output[0] === 'number') {
-      return [new Float32Array(output as number[])];
-    }
-
-    return output.flatMap((item) => normalizeToFloat32Arrays(item));
-  }
-
-  if (output && typeof output === 'object' && (output as TensorLike).data) {
-    const tensor = output as TensorLike;
-    const baseArray = toFloat32Array(tensor.data);
-    const dims = Array.isArray(tensor.dims) ? tensor.dims : [];
-
-    if (dims.length > 1 && dims[0] && dims[0] > 1) {
-      const vectorLength = Math.floor(baseArray.length / dims[0]);
-      const vectors: Float32Array[] = [];
-      for (let i = 0; i < dims[0]; i += 1) {
-        const start = i * vectorLength;
-        const end = start + vectorLength;
-        vectors.push(baseArray.slice(start, end));
-      }
-      return vectors;
-    }
-
-    return [baseArray];
-  }
-
-  throw new Error('Unexpected tensor output from embedding pipeline');
-}
+type NativeClearFn = () => unknown;
 
 export interface EmbedConfig {
   model?: string;
+  batchSize?: number;
+}
+
+type EmbeddingProvider = (texts: string[], config: EmbedConfig) => Promise<Float32Array[]>;
+
+let cachedProvider: EmbeddingProvider | null = null;
+let overrideProvider: EmbeddingProvider | null = null;
+
+function normalizeVectors(vectors: number[][], expected: number): Float32Array[] {
+  if (!Array.isArray(vectors)) {
+    throw new Error('[index-mcp] Native embedding response is not an array of vectors');
+  }
+
+  if (vectors.length !== expected) {
+    throw new Error(
+      `[index-mcp] Native embedding count mismatch: expected ${expected}, received ${vectors.length}`
+    );
+  }
+
+  return vectors.map((vector, index) => {
+    if (!Array.isArray(vector)) {
+      throw new Error(`[index-mcp] Native embedding vector at index ${index} is not an array`);
+    }
+    return Float32Array.from(vector);
+  });
+}
+
+async function createNativeProvider(): Promise<EmbeddingProvider> {
+  const nativeModule = await loadNativeModule();
+  const generateEmbeddings = nativeModule.generateEmbeddings as NativeEmbeddingFn | undefined;
+
+  if (typeof generateEmbeddings !== 'function') {
+    throw new Error(
+      "[index-mcp] Native bindings did not expose generateEmbeddings(); rebuild the Rust addon."
+    );
+  }
+
+  return async (texts, config) => {
+    const request = {
+      texts,
+      model: config.model,
+      batchSize: config.batchSize
+    };
+
+    const result = await generateEmbeddings(request);
+    return normalizeVectors(result, texts.length);
+  };
+}
+
+async function getEmbeddingProvider(): Promise<EmbeddingProvider> {
+  if (overrideProvider) {
+    return overrideProvider;
+  }
+  if (cachedProvider) {
+    return cachedProvider;
+  }
+
+  const provider = await createNativeProvider();
+  cachedProvider = provider;
+  return provider;
 }
 
 export async function embedTexts(texts: string[], config: EmbedConfig = {}): Promise<Float32Array[]> {
   if (!texts.length) {
     return [];
   }
-  const model = config.model ?? DEFAULT_MODEL;
-  const embeddingPipeline = await getEmbeddingPipeline(model);
-  const output = await embeddingPipeline(texts.length === 1 ? texts[0] : texts, {
-    pooling: 'mean',
-    normalize: true
-  });
 
-  return normalizeToFloat32Arrays(output);
+  const provider = await getEmbeddingProvider();
+  const normalizedConfig: EmbedConfig = {
+    ...config,
+    model: config.model ?? DEFAULT_MODEL
+  };
+
+  return provider(texts, normalizedConfig);
 }
 
 export function float32ArrayToBuffer(array: Float32Array): Buffer {
@@ -129,27 +105,37 @@ export function getDefaultEmbeddingModel(): string {
   return DEFAULT_MODEL;
 }
 
-function clearPipelineCache(): void {
-  pipelineCache.clear();
-}
-
-function resetPipelineFactory(): void {
-  currentPipelineFactory = defaultPipelineFactory;
-  clearPipelineCache();
-}
-
 export function clearEmbeddingPipelineCache(): void {
-  clearPipelineCache();
-}
+  cachedProvider = null;
+  overrideProvider = null;
 
-function setPipelineFactory(factory: PipelineFactory): void {
-  currentPipelineFactory = factory;
-  clearPipelineCache();
+  void loadNativeModule()
+    .then((nativeModule) => {
+      const clear = nativeModule.clearEmbeddingCache as NativeClearFn | undefined;
+      if (typeof clear === 'function') {
+        try {
+          clear();
+        } catch {
+          // Ignore errors during best-effort native cache clear
+        }
+      }
+    })
+    .catch(() => undefined);
 }
 
 export const __testing = {
-  clearPipelineCache,
-  resetPipelineFactory,
-  setPipelineFactory,
-  getEmbeddingPipeline
+  setEmbeddingProvider(provider: EmbeddingProvider | null): void {
+    overrideProvider = provider;
+  },
+  reset(): void {
+    cachedProvider = null;
+    overrideProvider = null;
+  },
+  getCachedProvider(): EmbeddingProvider | null {
+    return cachedProvider;
+  },
+  getOverrideProvider(): EmbeddingProvider | null {
+    return overrideProvider;
+  },
+  createNativeProvider
 };

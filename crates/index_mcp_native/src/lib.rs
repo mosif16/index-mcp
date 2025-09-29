@@ -12,6 +12,9 @@ use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
 mod chunk;
+mod embedding;
+
+pub use embedding::{clear_embedding_cache, generate_embeddings};
 
 #[napi(object)]
 pub struct ScanOptions {

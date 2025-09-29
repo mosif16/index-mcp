@@ -16,7 +16,9 @@ function validateNativeModule(candidate: unknown): NativeModule {
 
     if (
       'scanRepo' in asRecord &&
-      typeof asRecord.scanRepo === 'function'
+      typeof asRecord.scanRepo === 'function' &&
+      'generateEmbeddings' in asRecord &&
+      typeof asRecord.generateEmbeddings === 'function'
     ) {
       return candidate as NativeModule;
     }
@@ -27,7 +29,9 @@ function validateNativeModule(candidate: unknown): NativeModule {
         defaultExport &&
         typeof defaultExport === 'object' &&
         'scanRepo' in (defaultExport as Record<string, unknown>) &&
-        typeof (defaultExport as Record<string, unknown>).scanRepo === 'function'
+        typeof (defaultExport as Record<string, unknown>).scanRepo === 'function' &&
+        'generateEmbeddings' in (defaultExport as Record<string, unknown>) &&
+        typeof (defaultExport as Record<string, unknown>).generateEmbeddings === 'function'
       ) {
         return defaultExport as NativeModule;
       }

@@ -66,7 +66,7 @@ From the project root (`/Users/mohammedsayf/Desktop/index-mcp`):
 npm install
 ```
 
-This installs dependencies including `@modelcontextprotocol/sdk`, `better-sqlite3@^12.4.1`, `fast-glob`, `chokidar`, `ignore`, `zod`, `@xenova/transformers`, and TypeScript tooling.
+This installs dependencies including `@modelcontextprotocol/sdk`, `better-sqlite3@^12.4.1`, `fast-glob`, `chokidar`, `ignore`, `zod`, and TypeScript tooling. The Rust addon pulled in by `crates/index_mcp_native` brings `fastembed` for embedding generation.
 
 ## 4. Build and Development Scripts
 
@@ -227,7 +227,7 @@ When clients omit `paths`, the server inspects MCP metadata, headers, and enviro
 
 Relative `root` values are resolved against the caller-supplied working directory metadata (such as `_meta.cwd`), common headers (`x-mcp-cwd`, `x-mcp-root`, `x-workspace-*`), and environment overrides like `MCP_CALLER_CWD` or `MCP_WORKSPACE_ROOT` when available, so CLI clients can safely pass `"."` to target their active workspace. If no caller context is provided the path falls back to the server process directory.
 
-Embeddings default to the `Xenova/bge-small-en-v1.5` model provided by `@xenova/transformers` with a batch size of 32. The server downloads and caches the model on first use; set `embedding.model` in tool inputs if you need an alternative.
+Embeddings default to the `Xenova/bge-small-en-v1.5` model served through the Rust `fastembed` pipeline with a batch size of 32. The server downloads and caches the model on first use; set `embedding.model` in tool inputs if you need an alternative.
 
 The tool response returns both text (a summary) and `structuredContent` matching the `ingestToolOutputShape` schema.
 

@@ -7,6 +7,7 @@ import ignore, { type Ignore } from 'ignore';
 import type {
   NativeAnalyzeOptions,
   NativeAnalysisResult,
+  NativeEmbeddingRequest,
   NativeFileEntry,
   NativeMetadataEntry,
   NativeMetadataOptions,
@@ -217,6 +218,15 @@ export const fallbackNativeModule: NativeModule = {
   },
   async analyzeFileContent(options: NativeAnalyzeOptions): Promise<NativeAnalysisResult> {
     return fallbackAnalyzeFileContent(options);
+  },
+  async generateEmbeddings(options: NativeEmbeddingRequest): Promise<number[][]> {
+    void options;
+    throw new Error(
+      '[index-mcp] Native embeddings are unavailable in the fallback implementation. Build the Rust addon to enable embeddings.'
+    );
+  },
+  clearEmbeddingCache(): void {
+    // no-op for the fallback implementation
   }
 };
 
