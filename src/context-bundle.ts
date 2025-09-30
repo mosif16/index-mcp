@@ -16,6 +16,7 @@ export interface ContextBundleOptions {
   symbol?: ContextBundleSymbolSelector;
   maxSnippets?: number;
   maxNeighbors?: number;
+  budgetTokens?: number;
 }
 
 export interface BundleFileMetadata {
@@ -154,6 +155,54 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
+function estimateTokens(text: string): number {
+  // Simple token estimation: ~4 characters per token on average
+  return Math.ceil(text.length / 4);
+}
+
+function trimSnippetsToFitBudget(
+  snippets: BundleSnippet[],
+  definitions: BundleDefinition[],
+  budgetTokens: number
+): BundleSnippet[] {
+  let totalTokens = 0;
+  
+  // Count tokens from definitions first (they have priority)
+  for (const def of definitions) {
+    totalTokens += estimateTokens(def.name);
+    if (def.signature) {
+      totalTokens += estimateTokens(def.signature);
+    }
+    if (def.docstring) {
+      totalTokens += estimateTokens(def.docstring);
+    }
+  }
+  
+  // Now fit as many snippets as possible
+  const result: BundleSnippet[] = [];
+  for (const snippet of snippets) {
+    const snippetTokens = estimateTokens(snippet.content);
+    if (totalTokens + snippetTokens <= budgetTokens) {
+      result.push(snippet);
+      totalTokens += snippetTokens;
+    } else {
+      // Try to fit a partial snippet
+      const remainingTokens = budgetTokens - totalTokens;
+      if (remainingTokens > 100) {
+        const charsToKeep = remainingTokens * 4;
+        const trimmedContent = snippet.content.slice(0, charsToKeep);
+        result.push({
+          ...snippet,
+          content: trimmedContent + '\n... (truncated due to budget)'
+        });
+      }
+      break;
+    }
+  }
+  
+  return result;
+}
+
 function extractDocstring(content: string, rangeStart: number | null): string | null {
   if (rangeStart === null || rangeStart <= 0) {
     return null;
@@ -289,7 +338,7 @@ export async function getContextBundle(options: ContextBundleOptions): Promise<C
   }
 
   const databasePath = path.join(absoluteRoot, options.databaseName ?? DEFAULT_DB_FILENAME);
-  const db = new Database(databasePath, { readonly: true, fileMustExist: true });
+  const db = new Database(databasePath, { fileMustExist: true });
 
   try {
     const fileRow = db
@@ -488,7 +537,38 @@ export async function getContextBundle(options: ContextBundleOptions): Promise<C
       warnings.push('No graph metadata recorded for the requested file.');
     }
 
+    // Apply token budget if specified
+    let finalSnippets = snippets;
+    if (options.budgetTokens && options.budgetTokens > 0) {
+      finalSnippets = trimSnippetsToFitBudget(snippets, definitions, options.budgetTokens);
+      if (finalSnippets.length < snippets.length) {
+        warnings.push(`Content trimmed to fit ${options.budgetTokens} token budget. Showing ${finalSnippets.length} of ${snippets.length} snippets.`);
+      }
+    }
+
     const quickLinks = createQuickLinks(file, definitions, related, focusDefinition);
+
+    const updateChunkHitsStmt = db.prepare(
+      'UPDATE file_chunks SET hits = COALESCE(hits, 0) + 1 WHERE path = ? AND chunk_index = ?'
+    );
+    
+    const updateNodeHitsStmt = db.prepare(
+      'UPDATE code_graph_nodes SET hits = COALESCE(hits, 0) + 1 WHERE id = ?'
+    );
+    
+    for (const snippet of finalSnippets) {
+      if (snippet.source === 'chunk' && snippet.chunkIndex !== null) {
+        updateChunkHitsStmt.run(file.path, snippet.chunkIndex);
+      }
+    }
+    
+    for (const def of definitions) {
+      updateNodeHitsStmt.run(def.id);
+    }
+    
+    if (focusDefinition) {
+      updateNodeHitsStmt.run(focusDefinition.id);
+    }
 
     return {
       databasePath,
@@ -496,7 +576,7 @@ export async function getContextBundle(options: ContextBundleOptions): Promise<C
       definitions,
       focusDefinition,
       related,
-      snippets,
+      snippets: finalSnippets,
       latestIngestion,
       warnings,
       quickLinks

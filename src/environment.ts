@@ -213,3 +213,14 @@ export function getModelCacheConfiguration(): { directory: string | null; source
 export function getEnvironmentDiagnostics(): EnvironmentDiagnostic[] {
   return diagnostics.map((diagnostic) => ({ ...diagnostic }));
 }
+
+export function getBudgetTokens(): number {
+  const budgetEnv = process.env.INDEX_MCP_BUDGET_TOKENS?.trim();
+  if (budgetEnv) {
+    const parsed = parseInt(budgetEnv, 10);
+    if (!isNaN(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return 3000; // Default budget
+}

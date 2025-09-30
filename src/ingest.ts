@@ -5,6 +5,8 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 
 import { embedTexts, float32ArrayToBuffer, getDefaultEmbeddingModel } from './embedding.js';
 import { extractGraphMetadata } from './graph.js';
@@ -17,6 +19,8 @@ import type {
   NativeScanResult,
   NativeSkippedFile
 } from './types/native.js';
+
+const execFileAsync = promisify(execFile);
 const DEFAULT_MAX_FILE_SIZE_BYTES = 8 * 1024 * 1024; // 8 MiB
 
 const DEFAULT_CHUNK_SIZE_TOKENS = 256;
@@ -329,6 +333,11 @@ function ensureSchema(db: DatabaseInstance) {
       skipped_count INTEGER NOT NULL,
       deleted_count INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS files_hash_idx ON files(hash);
     CREATE INDEX IF NOT EXISTS file_chunks_path_idx ON file_chunks(path);
     CREATE TABLE IF NOT EXISTS code_graph_nodes (
@@ -359,6 +368,7 @@ function ensureSchema(db: DatabaseInstance) {
   `);
 
   ensureFileChunkMetadataColumns(db);
+  ensureHitsColumns(db);
 }
 
 function ensureFileChunkMetadataColumns(db: DatabaseInstance): void {
@@ -376,6 +386,34 @@ function ensureFileChunkMetadataColumns(db: DatabaseInstance): void {
     if (!columnNames.has(migration.name)) {
       db.prepare(migration.statement).run();
     }
+  }
+}
+
+function ensureHitsColumns(db: DatabaseInstance): void {
+  const chunkColumns = db.prepare("PRAGMA table_info('file_chunks')").all() as { name: string }[];
+  const chunkColumnNames = new Set(chunkColumns.map((column) => column.name));
+  
+  if (!chunkColumnNames.has('hits')) {
+    db.prepare('ALTER TABLE file_chunks ADD COLUMN hits INTEGER DEFAULT 0').run();
+  }
+
+  const nodeColumns = db.prepare("PRAGMA table_info('code_graph_nodes')").all() as { name: string }[];
+  const nodeColumnNames = new Set(nodeColumns.map((column) => column.name));
+  
+  if (!nodeColumnNames.has('hits')) {
+    db.prepare('ALTER TABLE code_graph_nodes ADD COLUMN hits INTEGER DEFAULT 0').run();
+  }
+}
+
+async function getCurrentGitCommitSha(root: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], { 
+      cwd: root,
+      maxBuffer: 1024 * 1024
+    });
+    return stdout.trim() || null;
+  } catch (error) {
+    return null;
   }
 }
 
@@ -1016,8 +1054,18 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
        VALUES (:id, :root, :started, :finished, :fileCount, :skippedCount, :deletedCount)`
     );
 
+    const upsertMetaStmt = db.prepare(
+      `INSERT INTO meta (key, value, updated_at)
+       VALUES (@key, @value, @updatedAt)
+       ON CONFLICT(key) DO UPDATE SET
+         value = excluded.value,
+         updated_at = excluded.updated_at`
+    );
+
     const ingestionId = crypto.randomUUID();
     const endTime = Date.now();
+    
+    const currentCommitSha = await getCurrentGitCommitSha(absoluteRoot);
 
     let graphNodeCount = 0;
     let graphEdgeCount = 0;
@@ -1068,6 +1116,20 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
         fileCount: files.length,
         skippedCount: skipped.length,
         deletedCount: deletedPaths.length
+      });
+      
+      if (currentCommitSha) {
+        upsertMetaStmt.run({
+          key: 'commit_sha',
+          value: currentCommitSha,
+          updatedAt: endTime
+        });
+      }
+      
+      upsertMetaStmt.run({
+        key: 'indexed_at',
+        value: endTime.toString(),
+        updatedAt: endTime
       });
     });
 

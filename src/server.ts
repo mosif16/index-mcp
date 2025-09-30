@@ -6,7 +6,7 @@ import type { ReadStream, WriteStream } from 'node:tty';
 import { parseArgs } from 'node:util';
 import { z } from 'zod';
 
-import { getEnvironmentDiagnostics, getModelCacheConfiguration } from './environment.js';
+import { getEnvironmentDiagnostics, getModelCacheConfiguration, getBudgetTokens } from './environment.js';
 import { ingestCodebase } from './ingest.js';
 import { semanticSearch } from './search.js';
 import { graphNeighbors, type GraphNodeDescriptor } from './graph-query.js';
@@ -489,6 +489,11 @@ const contextBundleJsonSchema = {
       description: 'Maximum related edges to include per direction (aliases: neighbor_limit, edge_limit). Defaults to 12, max 50.',
       minimum: 0,
       maximum: 50
+    },
+    budgetTokens: {
+      type: 'integer',
+      description: 'Token budget for content trimming (alias: budget, token_budget). Defaults to INDEX_MCP_BUDGET_TOKENS environment variable or 3000.',
+      minimum: 1
     }
   },
   required: ['file'],
@@ -529,7 +534,13 @@ const contextBundleInputSchema = z
       .min(0)
       .max(50)
       .optional()
-      .describe('Maximum related edges per direction (defaults to 12, caps at 50).')
+      .describe('Maximum related edges per direction (defaults to 12, caps at 50).'),
+    budgetTokens: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe('Token budget for content trimming (defaults to INDEX_MCP_BUDGET_TOKENS or 3000).')
   })
   .strict();
 
@@ -1037,7 +1048,11 @@ const indexStatusOutputShape = {
   totalGraphNodes: z.number(),
   totalGraphEdges: z.number(),
   latestIngestion: indexStatusIngestionSchema.nullable(),
-  recentIngestions: z.array(indexStatusIngestionSchema)
+  recentIngestions: z.array(indexStatusIngestionSchema),
+  commitSha: z.string().nullable(),
+  indexedAt: z.number().nullable(),
+  currentCommitSha: z.string().nullable(),
+  isStale: z.boolean()
 } as const;
 
 const indexStatusOutputSchema = z.object(indexStatusOutputShape);
@@ -1484,7 +1499,11 @@ async function main() {
         const parsedInput = contextBundleInputSchema.parse(normalizedInput);
         const context = createRootResolutionContext(extra);
         const resolvedRoot = resolveRootPath(parsedInput.root, context);
-        const bundleInput = { ...parsedInput, root: resolvedRoot };
+        
+        // Apply budget tokens from environment if not specified
+        const budgetTokens = parsedInput.budgetTokens ?? getBudgetTokens();
+        
+        const bundleInput = { ...parsedInput, root: resolvedRoot, budgetTokens };
         const result = contextBundleOutputSchema.parse(await getContextBundle(bundleInput));
 
         const summaryPieces: string[] = [
