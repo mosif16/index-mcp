@@ -167,6 +167,15 @@ const ingestToolJsonSchema = {
       type: 'array',
       description: 'Restrict ingest to specific relative paths (aliases: target_paths, changed_paths).',
       items: { type: 'string' }
+    },
+    autoEvict: {
+      type: 'boolean',
+      description: 'Automatically evict least-used data if database exceeds maxDatabaseSizeBytes. Defaults to false.'
+    },
+    maxDatabaseSizeBytes: {
+      type: 'integer',
+      description: 'Maximum database size before eviction (aliases: max_db_size). Defaults to 150 MB.',
+      minimum: 1
     }
   },
   required: [],
@@ -247,6 +256,16 @@ const ingestToolSchema = z
     paths: z
       .array(z.string())
       .describe('Restrict ingest to specific relative paths (aliases: target_paths, changed_paths).')
+      .optional(),
+    autoEvict: z
+      .boolean()
+      .describe('Automatically evict least-used data if database exceeds maxDatabaseSizeBytes. Defaults to false.')
+      .optional(),
+    maxDatabaseSizeBytes: z
+      .number()
+      .int()
+      .positive()
+      .describe('Maximum database size before eviction (aliases: max_db_size). Defaults to 150 MB.')
       .optional()
   })
   .strict();
@@ -268,7 +287,13 @@ const ingestToolOutputShape = {
   embeddedChunkCount: z.number().int().min(0),
   embeddingModel: z.string().nullable(),
   graphNodeCount: z.number().int().min(0),
-  graphEdgeCount: z.number().int().min(0)
+  graphEdgeCount: z.number().int().min(0),
+  evicted: z
+    .object({
+      chunks: z.number().int().min(0),
+      nodes: z.number().int().min(0)
+    })
+    .optional()
 } as const;
 const ingestToolOutputSchema = z.object(ingestToolOutputShape);
 

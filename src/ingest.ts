@@ -87,6 +87,8 @@ export interface IngestOptions {
   embedding?: EmbeddingOptions;
   graph?: GraphOptions;
   paths?: string[];
+  autoEvict?: boolean;
+  maxDatabaseSizeBytes?: number;
 }
 
 export interface SkippedFile {
@@ -108,6 +110,10 @@ export interface IngestResult {
   embeddingModel: string | null;
   graphNodeCount: number;
   graphEdgeCount: number;
+  evicted?: {
+    chunks: number;
+    nodes: number;
+  };
 }
 
 interface FileRow {
@@ -1135,7 +1141,31 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
 
     transaction();
 
-    const dbStats = await fs.stat(dbPath);
+    db.close();
+
+    let dbStats = await fs.stat(dbPath);
+    let evictionResult: { chunks: number; nodes: number } | undefined;
+
+    // Check if eviction is needed
+    const autoEvict = options.autoEvict ?? false;
+    const maxDatabaseSizeBytes = options.maxDatabaseSizeBytes ?? 150 * 1024 * 1024; // 150 MB default
+
+    if (autoEvict && dbStats.size > maxDatabaseSizeBytes) {
+      const { evictLeastUsed } = await import('./eviction.js');
+      const evicted = await evictLeastUsed({
+        root: absoluteRoot,
+        databaseName: databaseName,
+        maxSizeBytes: maxDatabaseSizeBytes
+      });
+      
+      if (evicted.wasEvictionNeeded) {
+        evictionResult = {
+          chunks: evicted.evictedChunks,
+          nodes: evicted.evictedNodes
+        };
+        dbStats = await fs.stat(dbPath);
+      }
+    }
 
     return {
       root: absoluteRoot,
@@ -1148,9 +1178,11 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
       embeddedChunkCount,
       embeddingModel: embeddingConfig.enabled ? embeddingConfig.model : null,
       graphNodeCount,
-      graphEdgeCount
+      graphEdgeCount,
+      evicted: evictionResult
     };
-  } finally {
+  } catch (error) {
     db.close();
+    throw error;
   }
 }
