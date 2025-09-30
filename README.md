@@ -2,12 +2,17 @@
 
 An MCP (Model Context Protocol) server that scans a source-code workspace and builds a searchable SQLite index (`.mcp-index.sqlite` by default) in the project root. The index stores file metadata, hashes, and optionally file contents so MCP-compatible clients can perform fast lookups, semantic search, and graph exploration.
 
+**New in this version:** Context budget control and hotness tracking to prevent overwhelming LLMs with excessive context. Only small, focused bundles are sent based on actual usage patterns.
+
 ## Key capabilities
 
 - **Fast ingestion** – Uses a native Rust addon (when available) to parallelize filesystem walking, hashing, and chunking.
 - **Flexible querying** – Downstream MCP clients can retrieve semantic chunks, structural graph edges, or full file context.
 - **Incremental updates** – Watch mode keeps the SQLite database aligned with live edits.
 - **Optional remotes** – Proxy additional MCP servers and expose them under configurable namespaces.
+- **Token budget control** – Context bundles respect token limits to avoid sending excessive data to LLMs.
+- **Hotness tracking** – Tracks which symbols and snippets are actually used, with optional eviction of stale data.
+- **Freshness checks** – Compares current git commit with indexed commit to detect when re-indexing is needed.
 
 ## Requirements
 
@@ -76,6 +81,51 @@ You can also pass flags through `npm run dev` (e.g. `npm run dev -- --watch`). U
 
 When embedding the server in another process, call `await runCleanup()` from `src/cleanup.ts` before exit so watchers, transports, and embedding pipelines shut down cleanly.
 
+## Context Budget and Hotness Tracking
+
+This implementation ensures that **raw index data is not sent to the LLM**. Instead, everything is stored in SQLite, and only small, focused bundles are sent when requested.
+
+### Token Budget Control
+
+Context bundles automatically respect token limits to prevent overwhelming LLMs:
+
+- Default budget: **3000 tokens** (configurable via `INDEX_MCP_BUDGET_TOKENS` env var)
+- Prioritizes key definitions first, then nearby lines
+- Trims content to fit within budget
+- Warns when content is truncated
+
+```bash
+export INDEX_MCP_BUDGET_TOKENS=5000  # Increase to 5000 tokens
+```
+
+### Hotness Tracking
+
+The system tracks which symbols and snippets are actually accessed:
+
+- Every served symbol/snippet increments a `hits` counter
+- Optional automatic eviction of least-used data when database exceeds size limit (default: 150 MB)
+- Keeps high-value, frequently accessed data in the index
+
+To enable automatic eviction during ingest:
+
+```typescript
+await ingestCodebase({
+  root: '/path/to/repo',
+  autoEvict: true,
+  maxDatabaseSizeBytes: 100 * 1024 * 1024  // 100 MB limit
+});
+```
+
+### Freshness Checks
+
+The `index_status` tool now compares the current git commit with the indexed commit:
+
+- Returns `isStale: true` if commits don't match
+- Includes both current and indexed commit SHAs
+- Tracks when indexing occurred
+
+This allows agents to automatically detect when re-indexing is needed after git operations.
+
 ## Codex CLI setup
 
 The project root includes a `start.sh` helper that rebuilds both the stdio server bundle and the bundled local backend, refreshes the native addon, waits for the backend health check, and finally launches `node dist/server.js`. Point your Codex configuration at this script and customize paths for your machine:
@@ -121,7 +171,8 @@ command = "/absolute/path/to/index-mcp/start.sh"
 env = {
   INDEX_MCP_LOG_LEVEL = "info",
   INDEX_MCP_LOG_DIR = "/absolute/path/to/.index-mcp/logs",
-  INDEX_MCP_LOG_CONSOLE = "false"
+  INDEX_MCP_LOG_CONSOLE = "false",
+  INDEX_MCP_BUDGET_TOKENS = "3000"
 }
 ```
 
