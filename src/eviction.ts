@@ -1,5 +1,4 @@
 import Database from 'better-sqlite3';
-import type { Database as DatabaseInstance } from 'better-sqlite3';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 

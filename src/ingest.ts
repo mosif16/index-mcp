@@ -418,7 +418,7 @@ async function getCurrentGitCommitSha(root: string): Promise<string | null> {
       maxBuffer: 1024 * 1024
     });
     return stdout.trim() || null;
-  } catch (error) {
+  } catch {
     return null;
   }
 }
