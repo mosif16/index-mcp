@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import type { Database as DatabaseInstance } from 'better-sqlite3';
 import { promises as fs } from 'node:fs';
 import crypto from 'node:crypto';
+import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -10,6 +11,7 @@ import { extractGraphMetadata } from './graph.js';
 import { DEFAULT_DB_FILENAME, DEFAULT_INCLUDE_GLOBS, DEFAULT_EXCLUDE_GLOBS } from './constants.js';
 import { loadNativeModule } from './native/index.js';
 import type {
+  NativeBatchAnalysisResult,
   NativeFileEntry,
   NativeModule,
   NativeScanResult,
@@ -30,12 +32,12 @@ function hasNativeMetadataFlow(
   return typeof module.scanRepoMetadata === 'function' && typeof module.readRepoFiles === 'function';
 }
 
-function hasNativeAnalysisFlow(
+function hasNativeBatchAnalysisFlow(
   module: NativeModule
 ): module is NativeModule & {
-  analyzeFileContent: NonNullable<NativeModule['analyzeFileContent']>;
+  analyzeFileContentBatch: NonNullable<NativeModule['analyzeFileContentBatch']>;
 } {
-  return typeof module.analyzeFileContent === 'function';
+  return typeof module.analyzeFileContentBatch === 'function';
 }
 
 export interface ContentSanitizerSpec {
@@ -126,6 +128,11 @@ interface PendingChunk {
   embedding?: Buffer;
 }
 
+interface PendingAnalysis {
+  path: string;
+  content: string;
+}
+
 interface PendingGraphNode {
   id: string;
   path: string | null;
@@ -147,14 +154,132 @@ interface PendingGraphEdge {
   metadata: string | null;
 }
 
-interface ChunkFragment {
+interface NormalizedFragment {
   content: string;
-  start: number;
-  end: number;
-  byteStart: number;
-  byteEnd: number;
-  lineStart: number;
-  lineEnd: number;
+  byteStart: number | null;
+  byteEnd: number | null;
+  lineStart: number | null;
+  lineEnd: number | null;
+}
+
+function availableParallelism(): number {
+  try {
+    if (typeof os.availableParallelism === 'function') {
+      return Math.max(1, os.availableParallelism());
+    }
+  } catch {
+    // Ignore errors and fall back to os.cpus().length
+  }
+  const cores = os.cpus();
+  return Array.isArray(cores) && cores.length > 0 ? cores.length : 1;
+}
+
+function resolvePipelineConcurrency(): number {
+  const raw = process.env.INDEX_MCP_INGEST_CONCURRENCY;
+  if (typeof raw === 'string' && raw.trim().length > 0) {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isInteger(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+
+  const parallelism = availableParallelism();
+  return Math.min(Math.max(2, parallelism), 16);
+}
+
+async function runWithConcurrency<T>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T) => Promise<void>
+): Promise<void> {
+  if (!items.length) {
+    return;
+  }
+
+  const normalizedLimit = Math.max(1, Math.floor(limit));
+  let index = 0;
+
+  async function runNext(): Promise<void> {
+    for (;;) {
+      const current = index;
+      index += 1;
+      if (current >= items.length) {
+        return;
+      }
+      await worker(items[current]);
+    }
+  }
+
+  const workers: Promise<void>[] = [];
+  const workerCount = Math.min(normalizedLimit, items.length);
+  for (let i = 0; i < workerCount; i += 1) {
+    workers.push(runNext());
+  }
+
+  await Promise.all(workers);
+}
+
+function appendFragmentsToChunkJobs(
+  path: string,
+  fragments: NormalizedFragment[],
+  _fallbackContent: string,
+  chunkJobs: PendingChunk[],
+  model: string
+): void {
+  const usableFragments = fragments.filter((fragment) => fragment.content);
+  if (!usableFragments.length) {
+    throw new Error(`[index-mcp] Native chunking produced no fragments for ${path}`);
+  }
+
+  usableFragments.forEach((fragment, index) => {
+    chunkJobs.push({
+      id: crypto.randomUUID(),
+      path,
+      chunkIndex: index,
+      content: fragment.content,
+      model,
+      byteStart: fragment.byteStart,
+      byteEnd: fragment.byteEnd,
+      lineStart: fragment.lineStart,
+      lineEnd: fragment.lineEnd
+    });
+  });
+}
+
+function normalizeNativeFragments(
+  fragments: Array<{
+    content?: string | null;
+    byteStart?: number | null;
+    byteEnd?: number | null;
+    lineStart?: number | null;
+    lineEnd?: number | null;
+  }> | undefined
+): NormalizedFragment[] {
+  if (!fragments?.length) {
+    return [];
+  }
+
+  return fragments
+    .filter((fragment) => fragment && typeof fragment.content === 'string' && fragment.content.trim().length > 0)
+    .map((fragment) => ({
+      content: fragment.content as string,
+      byteStart:
+        fragment.byteStart !== undefined && fragment.byteStart !== null
+          ? fragment.byteStart
+          : null,
+      byteEnd:
+        fragment.byteEnd !== undefined && fragment.byteEnd !== null
+          ? fragment.byteEnd
+          : null,
+      lineStart:
+        fragment.lineStart !== undefined && fragment.lineStart !== null
+          ? fragment.lineStart
+          : null,
+      lineEnd:
+        fragment.lineEnd !== undefined && fragment.lineEnd !== null
+          ? fragment.lineEnd
+          : null
+    }));
 }
 
 function toPosixPath(relativePath: string): string {
@@ -303,120 +428,6 @@ async function loadSanitizer(root: string, spec?: ContentSanitizerSpec): Promise
   };
 }
 
-function computeLineStarts(text: string): number[] {
-  if (!text) {
-    return [0];
-  }
-
-  const lineStarts = [0];
-  for (let i = 0; i < text.length; i += 1) {
-    if (text.charCodeAt(i) === 10 /* \n */) {
-      lineStarts.push(i + 1);
-    }
-  }
-  return lineStarts;
-}
-
-function findLineNumber(lineStarts: number[], index: number): number {
-  if (lineStarts.length === 0) {
-    return 1;
-  }
-
-  let low = 0;
-  let high = lineStarts.length - 1;
-
-  while (low <= high) {
-    const mid = Math.floor((low + high) / 2);
-    const value = lineStarts[mid];
-    if (value <= index) {
-      low = mid + 1;
-    } else {
-      high = mid - 1;
-    }
-  }
-
-  return Math.max(1, high + 1);
-}
-
-function createByteOffsetCalculator(text: string): (index: number) => number {
-  const cache = new Map<number, number>();
-  cache.set(0, 0);
-
-  return (index: number) => {
-    if (index <= 0) {
-      return 0;
-    }
-    const cached = cache.get(index);
-    if (cached !== undefined) {
-      return cached;
-    }
-    const value = Buffer.byteLength(text.slice(0, index), 'utf8');
-    cache.set(index, value);
-    return value;
-  };
-}
-
-function chunkText(content: string, chunkSizeTokens: number, overlapTokens: number): ChunkFragment[] {
-  const sanitized = content.trim();
-  if (!sanitized) {
-    return [];
-  }
-
-  const maxChars = Math.max(256, chunkSizeTokens * 4);
-  const overlapChars = Math.max(0, overlapTokens * 4);
-  const fragments: ChunkFragment[] = [];
-
-  const lineStarts = computeLineStarts(sanitized);
-  const byteOffsetFor = createByteOffsetCalculator(sanitized);
-
-  let start = 0;
-  while (start < sanitized.length) {
-    let end = Math.min(sanitized.length, start + maxChars);
-
-    if (end < sanitized.length) {
-      const newlineBreak = sanitized.lastIndexOf('\n', end - 1);
-      if (newlineBreak > start + 200) {
-        end = newlineBreak + 1;
-      }
-    }
-
-    const rawSlice = sanitized.slice(start, end);
-    const snippet = rawSlice.trimEnd();
-    if (!snippet) {
-      if (end <= start) {
-        break;
-      }
-      start = end;
-      continue;
-    }
-
-    const effectiveEnd = start + snippet.length;
-    const byteStart = byteOffsetFor(start);
-    const byteEnd = byteOffsetFor(effectiveEnd);
-    const lineStart = findLineNumber(lineStarts, start);
-    const lineEnd = findLineNumber(lineStarts, Math.max(effectiveEnd - 1, start));
-
-    fragments.push({
-      content: snippet,
-      start,
-      end: effectiveEnd,
-      byteStart,
-      byteEnd,
-      lineStart,
-      lineEnd
-    });
-
-    if (effectiveEnd >= sanitized.length) {
-      break;
-    }
-
-    const overlapStart = Math.max(effectiveEnd - overlapChars, 0);
-    start = overlapStart > start ? overlapStart : effectiveEnd;
-  }
-
-  return fragments;
-}
-
 function resolveEmbeddingDefaults(options?: EmbeddingOptions) {
   const model = options?.model ?? getDefaultEmbeddingModel();
   return {
@@ -440,11 +451,9 @@ type GraphConfig = ReturnType<typeof resolveGraphDefaults>;
 interface ProcessNativeEntriesParams {
   absoluteRoot: string;
   nativeResult: NativeScanResult;
-  nativeModule: NativeModule;
   existingByPath: Map<string, FileRow>;
   files: FileRow[];
   seenPaths: Set<string>;
-  chunkJobs: PendingChunk[];
   chunkRefreshPaths: Set<string>;
   graphNodeJobs: PendingGraphNode[];
   graphEdgeJobs: PendingGraphEdge[];
@@ -452,6 +461,8 @@ interface ProcessNativeEntriesParams {
   embeddingConfig: EmbeddingConfig;
   graphConfig: GraphConfig;
   storeFileContent: boolean;
+  pendingAnalysis: PendingAnalysis[];
+  pipelineConcurrency: number;
 }
 
 async function processNativeEntries({
@@ -460,7 +471,6 @@ async function processNativeEntries({
   existingByPath,
   files,
   seenPaths,
-  chunkJobs,
   chunkRefreshPaths,
   graphNodeJobs,
   graphEdgeJobs,
@@ -468,36 +478,34 @@ async function processNativeEntries({
   embeddingConfig,
   graphConfig,
   storeFileContent,
-  nativeModule
+  pendingAnalysis,
+  pipelineConcurrency
 }: ProcessNativeEntriesParams): Promise<void> {
-  for (const entry of nativeResult.files) {
+  await runWithConcurrency(nativeResult.files, pipelineConcurrency, async (entry) => {
     await processNativeEntry({
       absoluteRoot,
       entry,
-      nativeModule,
       existingByPath,
       files,
       seenPaths,
-      chunkJobs,
       chunkRefreshPaths,
       graphNodeJobs,
       graphEdgeJobs,
       sanitizeContent,
       embeddingConfig,
       graphConfig,
-      storeFileContent
+      storeFileContent,
+      pendingAnalysis
     });
-  }
+  });
 }
 
 interface ProcessNativeEntryParams {
   absoluteRoot: string;
   entry: NativeFileEntry;
-  nativeModule: NativeModule;
   existingByPath: Map<string, FileRow>;
   files: FileRow[];
   seenPaths: Set<string>;
-  chunkJobs: PendingChunk[];
   chunkRefreshPaths: Set<string>;
   graphNodeJobs: PendingGraphNode[];
   graphEdgeJobs: PendingGraphEdge[];
@@ -505,23 +513,23 @@ interface ProcessNativeEntryParams {
   embeddingConfig: EmbeddingConfig;
   graphConfig: GraphConfig;
   storeFileContent: boolean;
+  pendingAnalysis: PendingAnalysis[];
 }
 
 async function processNativeEntry({
   absoluteRoot,
   entry,
-  nativeModule,
   existingByPath,
   files,
   seenPaths,
-  chunkJobs,
   chunkRefreshPaths,
   graphNodeJobs,
   graphEdgeJobs,
   sanitizeContent,
   embeddingConfig,
   graphConfig,
-  storeFileContent
+  storeFileContent,
+  pendingAnalysis
 }: ProcessNativeEntryParams): Promise<void> {
   const normalizedPath = toPosixPath(entry.path);
   const absolutePath = path.join(absoluteRoot, normalizedPath);
@@ -558,83 +566,9 @@ async function processNativeEntry({
   if (embeddingConfig.enabled && content) {
     const trimmedContent = content.trim();
     if (trimmedContent) {
-      let chunkFragments: Array<{
-        content: string;
-        byteStart: number | null;
-        byteEnd: number | null;
-        lineStart: number | null;
-        lineEnd: number | null;
-      }> = [];
-
-      if (hasNativeAnalysisFlow(nativeModule)) {
-        try {
-          const analysis = await nativeModule.analyzeFileContent({
-            path: normalizedPath,
-            content,
-            chunkSizeTokens: embeddingConfig.chunkSizeTokens,
-            chunkOverlapTokens: embeddingConfig.chunkOverlapTokens
-          });
-          chunkFragments = analysis.chunks.map((fragment) => ({
-            content: fragment.content,
-            byteStart: fragment.byteStart ?? null,
-            byteEnd: fragment.byteEnd ?? null,
-            lineStart: fragment.lineStart ?? null,
-            lineEnd: fragment.lineEnd ?? null
-          }));
-        } catch {
-          const fallbackFragments = chunkText(
-            trimmedContent,
-            embeddingConfig.chunkSizeTokens,
-            embeddingConfig.chunkOverlapTokens
-          );
-          chunkFragments = fallbackFragments.map((fragment) => ({
-            content: fragment.content,
-            byteStart: fragment.byteStart,
-            byteEnd: fragment.byteEnd,
-            lineStart: fragment.lineStart,
-            lineEnd: fragment.lineEnd
-          }));
-        }
-      } else {
-        const fallbackFragments = chunkText(
-          trimmedContent,
-          embeddingConfig.chunkSizeTokens,
-          embeddingConfig.chunkOverlapTokens
-        );
-        chunkFragments = fallbackFragments.map((fragment) => ({
-          content: fragment.content,
-          byteStart: fragment.byteStart,
-          byteEnd: fragment.byteEnd,
-          lineStart: fragment.lineStart,
-          lineEnd: fragment.lineEnd
-        }));
-      }
-
-      const targetFragments = chunkFragments.length > 0
-        ? chunkFragments
-        : [{
-            content: trimmedContent.trimEnd(),
-            byteStart: 0,
-            byteEnd: Buffer.byteLength(trimmedContent, 'utf8'),
-            lineStart: 1,
-            lineEnd: trimmedContent ? trimmedContent.split('\n').length : 1
-          }];
-
-      targetFragments.forEach((fragment, index) => {
-        if (!fragment.content) {
-          return;
-        }
-        chunkJobs.push({
-          id: crypto.randomUUID(),
-          path: normalizedPath,
-          chunkIndex: index,
-          content: fragment.content,
-          model: embeddingConfig.model,
-          byteStart: fragment.byteStart ?? null,
-          byteEnd: fragment.byteEnd ?? null,
-          lineStart: fragment.lineStart ?? null,
-          lineEnd: fragment.lineEnd ?? null
-        });
+      pendingAnalysis.push({
+        path: normalizedPath,
+        content: trimmedContent
       });
     }
   }
@@ -678,6 +612,64 @@ async function processNativeEntry({
   }
 
   content = null;
+}
+
+interface PopulateChunkJobsParams {
+  nativeModule: NativeModule;
+  pendingAnalysis: PendingAnalysis[];
+  chunkJobs: PendingChunk[];
+  embeddingConfig: EmbeddingConfig;
+}
+
+async function populateChunkJobs({
+  nativeModule,
+  pendingAnalysis,
+  chunkJobs,
+  embeddingConfig
+}: PopulateChunkJobsParams): Promise<void> {
+  if (!embeddingConfig.enabled || pendingAnalysis.length === 0) {
+    return;
+  }
+
+  if (!hasNativeBatchAnalysisFlow(nativeModule)) {
+    throw new Error('[index-mcp] Native module is missing batch analysis support.');
+  }
+
+  const batchResult: NativeBatchAnalysisResult = await nativeModule.analyzeFileContentBatch({
+    files: pendingAnalysis.map((job) => ({
+      path: job.path,
+      content: job.content
+    })),
+    chunkSizeTokens: embeddingConfig.chunkSizeTokens,
+    chunkOverlapTokens: embeddingConfig.chunkOverlapTokens
+  });
+
+  if (!batchResult.files?.length) {
+    throw new Error('[index-mcp] Native batch analysis returned no results.');
+  }
+
+  const fragmentsByPath = new Map<string, NormalizedFragment[]>();
+  for (const file of batchResult.files) {
+    const normalized = normalizeNativeFragments(file.chunks);
+    if (!normalized.length) {
+      throw new Error(
+        `[index-mcp] Native batch analysis produced empty fragments for ${file.path}`
+      );
+    }
+    fragmentsByPath.set(file.path, normalized);
+  }
+
+  for (const job of pendingAnalysis) {
+    const fragments = fragmentsByPath.get(job.path);
+    if (!fragments) {
+      throw new Error(
+        `[index-mcp] Native batch analysis did not return fragments for ${job.path}`
+      );
+    }
+    appendFragmentsToChunkJobs(job.path, fragments, job.content, chunkJobs, embeddingConfig.model);
+  }
+
+  pendingAnalysis.length = 0;
 }
 
 function normalizeTargetPaths(root: string, paths?: string[]): string[] {
@@ -784,6 +776,10 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
     const needsTextContent = storeFileContent || embeddingConfig.enabled || graphConfig.enabled;
     const nativeModule = await loadNativeModule();
 
+    if (!hasNativeBatchAnalysisFlow(nativeModule)) {
+      throw new Error('[index-mcp] Native module must expose analyzeFileContentBatch.');
+    }
+
     const files: FileRow[] = [];
     const skipped: SkippedFile[] = [];
     const seenPaths = new Set<string>();
@@ -791,6 +787,8 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
     const chunkRefreshPaths = new Set<string>();
     const graphNodeJobs: PendingGraphNode[] = [];
     const graphEdgeJobs: PendingGraphEdge[] = [];
+    const pendingAnalysis: PendingAnalysis[] = [];
+    const pipelineConcurrency = resolvePipelineConcurrency();
 
     const existingPathsSet = usingTargetPaths
       ? new Set<string>(targetPaths.filter((p) => existingByPath.has(p)))
@@ -831,18 +829,17 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
               content: existing.content,
               isBinary: existing.content === null
             },
-            nativeModule,
             existingByPath,
             files,
             seenPaths,
-            chunkJobs,
             chunkRefreshPaths,
             graphNodeJobs,
             graphEdgeJobs,
             sanitizeContent,
             embeddingConfig,
             graphConfig,
-            storeFileContent
+            storeFileContent,
+            pendingAnalysis
           });
         } else {
           pendingReadPaths.add(normalizedPath);
@@ -867,7 +864,7 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
           skipped.push(convertSkippedFile(entry));
         });
 
-        for (const entry of readResult.files) {
+        await runWithConcurrency(readResult.files, pipelineConcurrency, async (entry) => {
           const normalizedEntry: NativeFileEntry = {
             ...entry,
             path: toPosixPath(entry.path)
@@ -875,20 +872,19 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
           await processNativeEntry({
             absoluteRoot,
             entry: normalizedEntry,
-            nativeModule,
             existingByPath,
             files,
             seenPaths,
-            chunkJobs,
             chunkRefreshPaths,
             graphNodeJobs,
             graphEdgeJobs,
             sanitizeContent,
             embeddingConfig,
             graphConfig,
-            storeFileContent
+            storeFileContent,
+            pendingAnalysis
           });
-        }
+        });
       }
     } else {
       let nativeResult: NativeScanResult;
@@ -912,20 +908,27 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
       await processNativeEntries({
         absoluteRoot,
         nativeResult,
-        nativeModule,
         existingByPath,
         files,
         seenPaths,
-        chunkJobs,
         chunkRefreshPaths,
         graphNodeJobs,
         graphEdgeJobs,
         sanitizeContent,
         embeddingConfig,
         graphConfig,
-        storeFileContent
+        storeFileContent,
+        pendingAnalysis,
+        pipelineConcurrency
       });
     }
+
+    await populateChunkJobs({
+      nativeModule,
+      pendingAnalysis,
+      chunkJobs,
+      embeddingConfig
+    });
 
     const deletedPaths = usingTargetPaths
       ? targetPaths.filter((p) => !seenPaths.has(p) && existingByPath.has(p))

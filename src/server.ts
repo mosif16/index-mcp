@@ -1591,10 +1591,8 @@ async function main() {
         const nativeStatus = getNativeModuleStatus();
         if (nativeStatus.state === 'native') {
           nativeModuleStatus = { status: 'ready' };
-        } else if (nativeStatus.state === 'fallback') {
-          const message = nativeStatus.message
-            ? `${nativeStatus.message} (using JS fallback scanner)`
-            : 'Using JS fallback scanner because native bindings were unavailable.';
+        } else if (nativeStatus.state === 'error') {
+          const message = nativeStatus.message ?? 'Native bindings failed to load.';
           nativeModuleStatus = { status: 'error', message };
         } else {
           nativeModuleStatus = { status: 'unavailable' };

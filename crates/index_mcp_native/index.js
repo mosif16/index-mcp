@@ -310,7 +310,7 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { generateEmbeddings, clearEmbeddingCache, scanRepo, scanRepoMetadata, readRepoFiles, analyzeFileContent } = nativeBinding
+const { generateEmbeddings, clearEmbeddingCache, scanRepo, scanRepoMetadata, readRepoFiles, analyzeFileContent, analyzeFileContentBatch } = nativeBinding
 
 module.exports.generateEmbeddings = generateEmbeddings
 module.exports.clearEmbeddingCache = clearEmbeddingCache
@@ -318,3 +318,4 @@ module.exports.scanRepo = scanRepo
 module.exports.scanRepoMetadata = scanRepoMetadata
 module.exports.readRepoFiles = readRepoFiles
 module.exports.analyzeFileContent = analyzeFileContent
+module.exports.analyzeFileContentBatch = analyzeFileContentBatch

@@ -1,10 +1,9 @@
 import type { NativeModule } from '../types/native.js';
-import { fallbackNativeModule } from './fallback.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('native');
 
-type NativeModuleState = 'uninitialized' | 'native' | 'fallback';
+type NativeModuleState = 'uninitialized' | 'native' | 'error';
 
 let nativeModulePromise: Promise<NativeModule> | null = null;
 let nativeModuleState: NativeModuleState = 'uninitialized';
@@ -55,56 +54,32 @@ async function importNativeModule(): Promise<NativeModule> {
   }
 }
 
-function shouldForceFallback(): boolean {
-  const value = process.env.INDEX_MCP_NATIVE_DISABLE;
-  if (!value) {
-    return false;
-  }
-
-  const normalized = value.toLowerCase();
-  return normalized === '1' || normalized === 'true' || normalized === 'yes';
-}
-
 function normalizeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function logWarning(message: string, error?: unknown): void {
-  if (error) {
-    log.warn({ err: error, message }, 'Native module warning');
-  } else {
-    log.warn({ message }, 'Native module warning');
-  }
-}
-
 export async function loadNativeModule(): Promise<NativeModule> {
   if (!nativeModulePromise) {
-    if (shouldForceFallback()) {
-      nativeModuleState = 'fallback';
-      nativeModuleError = new Error('Native bindings disabled via INDEX_MCP_NATIVE_DISABLE');
-      logWarning('Native bindings disabled via INDEX_MCP_NATIVE_DISABLE; using JS fallback scanner.');
-      nativeModulePromise = Promise.resolve(fallbackNativeModule);
-    } else {
-      nativeModulePromise = importNativeModule()
-        .then((module) => {
-          nativeModuleState = 'native';
-          nativeModuleError = undefined;
-          return module;
-        })
-        .catch((error) => {
-          nativeModuleState = 'fallback';
-          nativeModuleError = error;
-          logWarning('Failed to load native bindings; using JS fallback scanner.', error);
-          return fallbackNativeModule;
-        });
-    }
+    nativeModulePromise = importNativeModule()
+      .then((module) => {
+        nativeModuleState = 'native';
+        nativeModuleError = undefined;
+        return module;
+      })
+      .catch((error) => {
+        nativeModuleState = 'error';
+        nativeModuleError = error;
+        nativeModulePromise = null;
+        log.warn({ err: error }, 'Failed to load native bindings');
+        throw error;
+      });
   }
 
   return nativeModulePromise;
 }
 
 export function getNativeModuleStatus(): { state: NativeModuleState; message?: string } {
-  if (nativeModuleState === 'fallback' && nativeModuleError) {
+  if (nativeModuleState === 'error' && nativeModuleError) {
     return { state: nativeModuleState, message: normalizeError(nativeModuleError) };
   }
   return { state: nativeModuleState };

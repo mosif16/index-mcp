@@ -78,6 +78,26 @@ export interface NativeAnalysisResult {
   chunks: NativeChunkFragment[];
 }
 
+export interface NativeBatchAnalyzeFile {
+  path: string;
+  content: string;
+}
+
+export interface NativeBatchAnalyzeOptions {
+  files: NativeBatchAnalyzeFile[];
+  chunkSizeTokens?: number;
+  chunkOverlapTokens?: number;
+}
+
+export interface NativeBatchAnalysisFile {
+  path: string;
+  chunks: NativeChunkFragment[];
+}
+
+export interface NativeBatchAnalysisResult {
+  files: NativeBatchAnalysisFile[];
+}
+
 export interface NativeEmbeddingRequest {
   texts: string[];
   model?: string;
@@ -89,6 +109,7 @@ export interface NativeModule {
   scanRepoMetadata?(options: NativeMetadataOptions): Promise<NativeMetadataResult>;
   readRepoFiles?(options: NativeReadOptions): Promise<NativeReadResult>;
   analyzeFileContent?(options: NativeAnalyzeOptions): Promise<NativeAnalysisResult>;
+  analyzeFileContentBatch?(options: NativeBatchAnalyzeOptions): Promise<NativeBatchAnalysisResult>;
   generateEmbeddings(options: NativeEmbeddingRequest): Promise<number[][]>;
   clearEmbeddingCache?(): void;
 }

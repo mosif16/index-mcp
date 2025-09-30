@@ -76,7 +76,24 @@ export interface AnalyzeOptions {
 export interface NativeAnalysisResult {
   chunks: Array<NativeChunkFragment>
 }
+export interface BatchAnalyzeFileRequest {
+  path: string
+  content: string
+}
+export interface BatchAnalyzeOptions {
+  files: Array<BatchAnalyzeFileRequest>
+  chunkSizeTokens?: number
+  chunkOverlapTokens?: number
+}
+export interface NativeBatchAnalysisFile {
+  path: string
+  chunks: Array<NativeChunkFragment>
+}
+export interface NativeBatchAnalysisResult {
+  files: Array<NativeBatchAnalysisFile>
+}
 export declare function scanRepo(options: ScanOptions): NativeScanResult
 export declare function scanRepoMetadata(options: MetadataOptions): NativeMetadataResult
 export declare function readRepoFiles(options: ReadRepoOptions): NativeReadResult
 export declare function analyzeFileContent(options: AnalyzeOptions): NativeAnalysisResult
+export declare function analyzeFileContentBatch(options: BatchAnalyzeOptions): NativeBatchAnalysisResult

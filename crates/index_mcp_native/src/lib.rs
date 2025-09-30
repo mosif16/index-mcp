@@ -106,6 +106,30 @@ pub struct NativeAnalysisResult {
     pub chunks: Vec<NativeChunkFragment>,
 }
 
+#[napi(object)]
+pub struct BatchAnalyzeFileRequest {
+    pub path: String,
+    pub content: String,
+}
+
+#[napi(object)]
+pub struct BatchAnalyzeOptions {
+    pub files: Vec<BatchAnalyzeFileRequest>,
+    pub chunk_size_tokens: Option<f64>,
+    pub chunk_overlap_tokens: Option<f64>,
+}
+
+#[napi(object)]
+pub struct NativeBatchAnalysisFile {
+    pub path: String,
+    pub chunks: Vec<NativeChunkFragment>,
+}
+
+#[napi(object)]
+pub struct NativeBatchAnalysisResult {
+    pub files: Vec<NativeBatchAnalysisFile>,
+}
+
 struct ScanJob {
     relative_path: String,
 }
@@ -263,6 +287,45 @@ pub fn analyze_file_content(options: AnalyzeOptions) -> Result<NativeAnalysisRes
         .collect();
 
     Ok(NativeAnalysisResult { chunks })
+}
+
+#[napi]
+pub fn analyze_file_content_batch(options: BatchAnalyzeOptions) -> Result<NativeBatchAnalysisResult> {
+    let chunk_size = options
+        .chunk_size_tokens
+        .unwrap_or(256.0)
+        .max(0.0)
+        .floor() as usize;
+    let chunk_overlap = options
+        .chunk_overlap_tokens
+        .unwrap_or(32.0)
+        .max(0.0)
+        .floor() as usize;
+
+    let files = options
+        .files
+        .into_par_iter()
+        .map(|file| {
+            let fragments = chunk::chunk_content(&file.content, chunk_size, chunk_overlap);
+            let chunks = fragments
+                .into_iter()
+                .map(|fragment| NativeChunkFragment {
+                    content: fragment.content,
+                    byte_start: fragment.byte_start as f64,
+                    byte_end: fragment.byte_end as f64,
+                    line_start: fragment.line_start as f64,
+                    line_end: fragment.line_end as f64,
+                })
+                .collect();
+
+            NativeBatchAnalysisFile {
+                path: file.path,
+                chunks,
+            }
+        })
+        .collect();
+
+    Ok(NativeBatchAnalysisResult { files })
 }
 
 fn collect_scan_jobs(
