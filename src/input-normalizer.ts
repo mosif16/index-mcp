@@ -160,8 +160,7 @@ export function normalizeSearchArgs(raw: unknown): UnknownRecord {
     root: ['path', 'project_path', 'workspace_root', 'working_directory'],
     query: ['text', 'search', 'search_query'],
     databaseName: ['database', 'database_path', 'db'],
-    limit: ['max_results', 'top_k'],
-    model: ['embedding_model']
+    limit: ['max_results', 'top_k']
   });
 
   normalizeRootField(record);
@@ -186,10 +185,8 @@ export function normalizeLookupArgs(raw: unknown): UnknownRecord {
     node: ['graph_node', 'graph_target', 'target', 'entity'],
     databaseName: ['database', 'database_path', 'db'],
     limit: ['max_results', 'top_k', 'max_neighbors'],
-    maxSnippets: ['snippet_limit', 'max_chunks'],
-    maxNeighbors: ['neighbor_limit', 'edge_limit'],
     direction: ['edge_direction'],
-    model: ['embedding_model']
+    budgetTokens: ['token_budget']
   });
 
   normalizeRootField(record);
@@ -197,6 +194,8 @@ export function normalizeLookupArgs(raw: unknown): UnknownRecord {
   if (typeof record.mode === 'string') {
     record.mode = record.mode.trim().toLowerCase();
   }
+
+  coerceNumber(record, 'budgetTokens');
 
   if (typeof record.query === 'string') {
     const queryText = record.query.trim();
@@ -251,9 +250,6 @@ export function normalizeLookupArgs(raw: unknown): UnknownRecord {
   }
 
   coerceNumber(record, 'limit');
-  coerceNumber(record, 'maxSnippets');
-  coerceNumber(record, 'maxNeighbors');
-
   if (typeof record.direction === 'string') {
     record.direction = record.direction.trim().toLowerCase();
   }
@@ -404,13 +400,11 @@ export function normalizeContextBundleArgs(raw: unknown): UnknownRecord {
     databaseName: ['database', 'database_path', 'db'],
     file: ['file_path', 'relative_path', 'target_path'],
     symbol: ['symbol_selector', 'target_symbol'],
-    maxSnippets: ['snippet_limit', 'max_chunks'],
-    maxNeighbors: ['neighbor_limit', 'edge_limit', 'max_edges']
+    budgetTokens: ['token_budget']
   });
 
   normalizeRootField(record);
-  coerceNumber(record, 'maxSnippets');
-  coerceNumber(record, 'maxNeighbors');
+  coerceNumber(record, 'budgetTokens');
 
   const symbolValue = record.symbol;
   if (typeof symbolValue === 'string') {

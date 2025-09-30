@@ -1,10 +1,12 @@
 import Database from 'better-sqlite3';
 import type { Database as DatabaseInstance } from 'better-sqlite3';
+import { execFile } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
 
 import { embedTexts, float32ArrayToBuffer, getDefaultEmbeddingModel } from './embedding.js';
 import { extractGraphMetadata } from './graph.js';
@@ -16,6 +18,8 @@ import type {
   NativeScanResult,
   NativeSkippedFile
 } from './types/native.js';
+
+const execFileAsync = promisify(execFile);
 const DEFAULT_MAX_FILE_SIZE_BYTES = 8 * 1024 * 1024; // 8 MiB
 
 const DEFAULT_CHUNK_SIZE_TOKENS = 256;
@@ -105,6 +109,10 @@ export interface IngestResult {
   embeddingModel: string | null;
   graphNodeCount: number;
   graphEdgeCount: number;
+  snippetCount: number;
+  symbolCount: number;
+  commitSha: string | null;
+  indexedAt: number;
 }
 
 interface FileRow {
@@ -148,6 +156,20 @@ interface PendingGraphEdge {
   sourcePath: string | null;
   targetPath: string | null;
   metadata: string | null;
+}
+
+interface PendingSnippet {
+  file: string;
+  text: string;
+  startLine: number;
+  endLine: number;
+}
+
+interface PendingSymbol {
+  name: string;
+  file: string;
+  startLine: number;
+  endLine: number;
 }
 
 interface ChunkFragment {
@@ -234,6 +256,52 @@ function ensureSchema(db: DatabaseInstance) {
     CREATE INDEX IF NOT EXISTS code_graph_nodes_path_idx ON code_graph_nodes(path);
     CREATE INDEX IF NOT EXISTS code_graph_edges_source_idx ON code_graph_edges(source_id);
     CREATE INDEX IF NOT EXISTS code_graph_edges_target_idx ON code_graph_edges(target_id);
+    CREATE TABLE IF NOT EXISTS symbols (
+      name TEXT NOT NULL,
+      file TEXT NOT NULL,
+      start_line INTEGER NOT NULL,
+      end_line INTEGER NOT NULL,
+      hits INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (name, file, start_line)
+    );
+    CREATE INDEX IF NOT EXISTS symbols_file_idx ON symbols(file);
+    CREATE INDEX IF NOT EXISTS symbols_hits_idx ON symbols(hits);
+    CREATE TABLE IF NOT EXISTS snippets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      file TEXT NOT NULL,
+      text TEXT NOT NULL,
+      start_line INTEGER NOT NULL,
+      end_line INTEGER NOT NULL,
+      hits INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS snippets_file_idx ON snippets(file);
+    CREATE VIRTUAL TABLE IF NOT EXISTS snippets_fts USING fts5(
+      text,
+      file UNINDEXED,
+      start_line UNINDEXED,
+      end_line UNINDEXED,
+      content='snippets',
+      content_rowid='id'
+    );
+    CREATE TRIGGER IF NOT EXISTS snippets_ai AFTER INSERT ON snippets BEGIN
+      INSERT INTO snippets_fts(rowid, text, file, start_line, end_line)
+      VALUES (new.id, new.text, new.file, new.start_line, new.end_line);
+    END;
+    CREATE TRIGGER IF NOT EXISTS snippets_ad AFTER DELETE ON snippets BEGIN
+      INSERT INTO snippets_fts(snippets_fts, rowid, text)
+      VALUES('delete', old.id, old.text);
+    END;
+    CREATE TRIGGER IF NOT EXISTS snippets_au AFTER UPDATE ON snippets BEGIN
+      INSERT INTO snippets_fts(snippets_fts, rowid, text)
+      VALUES('delete', old.id, old.text);
+      INSERT INTO snippets_fts(rowid, text, file, start_line, end_line)
+      VALUES (new.id, new.text, new.file, new.start_line, new.end_line);
+    END;
+    CREATE TABLE IF NOT EXISTS meta (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      commit_sha TEXT,
+      indexed_at INTEGER
+    );
   `);
 
   ensureFileChunkMetadataColumns(db);
@@ -420,6 +488,21 @@ function chunkText(content: string, chunkSizeTokens: number, overlapTokens: numb
   return fragments;
 }
 
+function coerceLineNumber(value: unknown): number | null {
+  if (typeof value !== 'number' || Number.isNaN(value) || !Number.isFinite(value)) {
+    return null;
+  }
+  const coerced = Math.floor(value);
+  if (coerced <= 0) {
+    return null;
+  }
+  return coerced;
+}
+
+function readLineMetadata(metadata: Record<string, unknown>, key: string): number | null {
+  return coerceLineNumber(metadata[key]);
+}
+
 function resolveEmbeddingDefaults(options?: EmbeddingOptions) {
   const model = options?.model ?? getDefaultEmbeddingModel();
   return {
@@ -449,6 +532,8 @@ interface ProcessNativeEntriesParams {
   seenPaths: Set<string>;
   chunkJobs: PendingChunk[];
   chunkRefreshPaths: Set<string>;
+  snippetJobs: PendingSnippet[];
+  symbolJobs: PendingSymbol[];
   graphNodeJobs: PendingGraphNode[];
   graphEdgeJobs: PendingGraphEdge[];
   sanitizeContent: ContentSanitizer;
@@ -466,6 +551,8 @@ async function processNativeEntries({
   seenPaths,
   chunkJobs,
   chunkRefreshPaths,
+  snippetJobs,
+  symbolJobs,
   graphNodeJobs,
   graphEdgeJobs,
   sanitizeContent,
@@ -485,6 +572,8 @@ async function processNativeEntries({
       seenPaths,
       chunkJobs,
       chunkRefreshPaths,
+      snippetJobs,
+      symbolJobs,
       graphNodeJobs,
       graphEdgeJobs,
       sanitizeContent,
@@ -504,6 +593,8 @@ interface ProcessNativeEntryParams {
   seenPaths: Set<string>;
   chunkJobs: PendingChunk[];
   chunkRefreshPaths: Set<string>;
+  snippetJobs: PendingSnippet[];
+  symbolJobs: PendingSymbol[];
   graphNodeJobs: PendingGraphNode[];
   graphEdgeJobs: PendingGraphEdge[];
   sanitizeContent: ContentSanitizer;
@@ -521,6 +612,8 @@ async function processNativeEntry({
   seenPaths,
   chunkJobs,
   chunkRefreshPaths,
+  snippetJobs,
+  symbolJobs,
   graphNodeJobs,
   graphEdgeJobs,
   sanitizeContent,
@@ -560,7 +653,7 @@ async function processNativeEntry({
   seenPaths.add(normalizedPath);
   chunkRefreshPaths.add(normalizedPath);
 
-  if (embeddingConfig.enabled && content) {
+  if (content) {
     const trimmedContent = content.trim();
     if (trimmedContent) {
       let chunkFragments: Array<{
@@ -571,22 +664,39 @@ async function processNativeEntry({
         lineEnd: number | null;
       }> = [];
 
-      if (hasNativeAnalysisFlow(nativeModule)) {
-        try {
-          const analysis = await nativeModule.analyzeFileContent({
-            path: normalizedPath,
-            content,
-            chunkSizeTokens: embeddingConfig.chunkSizeTokens,
-            chunkOverlapTokens: embeddingConfig.chunkOverlapTokens
-          });
-          chunkFragments = analysis.chunks.map((fragment) => ({
-            content: fragment.content,
-            byteStart: fragment.byteStart ?? null,
-            byteEnd: fragment.byteEnd ?? null,
-            lineStart: fragment.lineStart ?? null,
-            lineEnd: fragment.lineEnd ?? null
-          }));
-        } catch {
+      if (embeddingConfig.enabled) {
+        if (hasNativeAnalysisFlow(nativeModule)) {
+          try {
+            const analysis = await nativeModule.analyzeFileContent({
+              path: normalizedPath,
+              content,
+              chunkSizeTokens: embeddingConfig.chunkSizeTokens,
+              chunkOverlapTokens: embeddingConfig.chunkOverlapTokens
+            });
+            chunkFragments = analysis.chunks.map((fragment) => ({
+              content: fragment.content,
+              byteStart: fragment.byteStart ?? null,
+              byteEnd: fragment.byteEnd ?? null,
+              lineStart: fragment.lineStart ?? null,
+              lineEnd: fragment.lineEnd ?? null
+            }));
+          } catch {
+            const fallbackFragments = chunkText(
+              trimmedContent,
+              embeddingConfig.chunkSizeTokens,
+              embeddingConfig.chunkOverlapTokens
+            );
+            chunkFragments = fallbackFragments.map((fragment) => ({
+              content: fragment.content,
+              byteStart: fragment.byteStart,
+              byteEnd: fragment.byteEnd,
+              lineStart: fragment.lineStart,
+              lineEnd: fragment.lineEnd
+            }));
+          }
+        }
+
+        if (chunkFragments.length === 0) {
           const fallbackFragments = chunkText(
             trimmedContent,
             embeddingConfig.chunkSizeTokens,
@@ -603,8 +713,8 @@ async function processNativeEntry({
       } else {
         const fallbackFragments = chunkText(
           trimmedContent,
-          embeddingConfig.chunkSizeTokens,
-          embeddingConfig.chunkOverlapTokens
+          DEFAULT_CHUNK_SIZE_TOKENS,
+          DEFAULT_CHUNK_OVERLAP_TOKENS
         );
         chunkFragments = fallbackFragments.map((fragment) => ({
           content: fragment.content,
@@ -629,16 +739,26 @@ async function processNativeEntry({
         if (!fragment.content) {
           return;
         }
-        chunkJobs.push({
-          id: crypto.randomUUID(),
-          path: normalizedPath,
-          chunkIndex: index,
-          content: fragment.content,
-          model: embeddingConfig.model,
-          byteStart: fragment.byteStart ?? null,
-          byteEnd: fragment.byteEnd ?? null,
-          lineStart: fragment.lineStart ?? null,
-          lineEnd: fragment.lineEnd ?? null
+        if (embeddingConfig.enabled) {
+          chunkJobs.push({
+            id: crypto.randomUUID(),
+            path: normalizedPath,
+            chunkIndex: index,
+            content: fragment.content,
+            model: embeddingConfig.model,
+            byteStart: fragment.byteStart ?? null,
+            byteEnd: fragment.byteEnd ?? null,
+            lineStart: fragment.lineStart ?? null,
+            lineEnd: fragment.lineEnd ?? null
+          });
+        }
+        const startLine = fragment.lineStart ?? 1;
+        const rawLineEstimate = fragment.lineEnd ?? startLine + fragment.content.split(/\r?\n/).length - 1;
+        snippetJobs.push({
+          file: normalizedPath,
+          text: fragment.content,
+          startLine,
+          endLine: Math.max(startLine, rawLineEstimate)
         });
       });
     }
@@ -651,6 +771,14 @@ async function processNativeEntry({
     hash: entry.hash,
     lastIndexedAt: Date.now(),
     content: storeFileContent ? content : null
+  });
+
+  const totalLines = content ? content.split(/\r?\n/).length : 1;
+  symbolJobs.push({
+    name: path.posix.basename(normalizedPath),
+    file: normalizedPath,
+    startLine: 1,
+    endLine: Math.max(1, totalLines)
   });
 
   if (graphConfig.enabled && content) {
@@ -667,6 +795,19 @@ async function processNativeEntry({
           rangeEnd: node.rangeEnd ?? null,
           metadata: node.metadata ? JSON.stringify(node.metadata) : null
         });
+        if (node.path) {
+          const metadata = (node.metadata ?? {}) as Record<string, unknown>;
+          const startLine = readLineMetadata(metadata, 'startLine') ?? 1;
+          const endLine = readLineMetadata(metadata, 'endLine') ?? startLine;
+          if (node.kind !== 'module' || node.name) {
+            symbolJobs.push({
+              name: node.name,
+              file: node.path,
+              startLine,
+              endLine: Math.max(startLine, endLine)
+            });
+          }
+        }
       }
       for (const edge of graphResult.edges) {
         graphEdgeJobs.push({
@@ -769,6 +910,16 @@ function resolveIngestConcurrency(explicit?: number): number {
   }
 
   return detectDefaultConcurrency();
+}
+
+async function resolveGitCommitSha(root: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: root });
+    const sha = stdout.trim();
+    return sha ? sha : null;
+  } catch {
+    return null;
+  }
 }
 
 async function runConcurrencyLimited<T>(
@@ -882,6 +1033,8 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
     const seenPaths = new Set<string>();
     const chunkJobs: PendingChunk[] = [];
     const chunkRefreshPaths = new Set<string>();
+    const snippetJobs: PendingSnippet[] = [];
+    const symbolJobs: PendingSymbol[] = [];
     const graphNodeJobs: PendingGraphNode[] = [];
     const graphEdgeJobs: PendingGraphEdge[] = [];
 
@@ -930,6 +1083,8 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
             seenPaths,
             chunkJobs,
             chunkRefreshPaths,
+            snippetJobs,
+            symbolJobs,
             graphNodeJobs,
             graphEdgeJobs,
             sanitizeContent,
@@ -975,16 +1130,18 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
                 absoluteRoot,
                 entry: normalizedEntry,
                 nativeModule,
-                existingByPath,
-                files,
-                seenPaths,
-                chunkJobs,
-                chunkRefreshPaths,
-                graphNodeJobs,
-                graphEdgeJobs,
-                sanitizeContent,
-                embeddingConfig,
-                graphConfig,
+            existingByPath,
+            files,
+            seenPaths,
+            chunkJobs,
+            chunkRefreshPaths,
+            snippetJobs,
+            symbolJobs,
+            graphNodeJobs,
+            graphEdgeJobs,
+            sanitizeContent,
+            embeddingConfig,
+            graphConfig,
                 storeFileContent
               });
             });
@@ -1019,6 +1176,8 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
         seenPaths,
         chunkJobs,
         chunkRefreshPaths,
+        snippetJobs,
+        symbolJobs,
         graphNodeJobs,
         graphEdgeJobs,
         sanitizeContent,
@@ -1068,6 +1227,38 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
       jobsByModel.clear();
     }
 
+    const snippetKey = (snippet: PendingSnippet) => `${snippet.file}::${snippet.startLine}::${snippet.endLine}`;
+    const symbolKey = (symbol: PendingSymbol) => `${symbol.file}::${symbol.name}::${symbol.startLine}`;
+
+    const snippetMap = new Map<string, PendingSnippet>();
+    for (const snippet of snippetJobs) {
+      const key = snippetKey(snippet);
+      if (!snippetMap.has(key)) {
+        const normalizedText = snippet.text.length > 4000
+          ? `${snippet.text.slice(0, 4000)}\n…`
+          : snippet.text;
+        snippetMap.set(key, {
+          file: snippet.file,
+          startLine: snippet.startLine,
+          endLine: snippet.endLine,
+          text: normalizedText
+        });
+      }
+    }
+    const uniqueSnippets = Array.from(snippetMap.values());
+
+    const symbolMap = new Map<string, PendingSymbol>();
+    for (const symbol of symbolJobs) {
+      const key = symbolKey(symbol);
+      const existing = symbolMap.get(key);
+      if (!existing || symbol.endLine > existing.endLine) {
+        symbolMap.set(key, symbol);
+      }
+    }
+    const uniqueSymbols = Array.from(symbolMap.values());
+
+    const commitSha = await resolveGitCommitSha(absoluteRoot);
+
     const upsertStmt = db.prepare(
       `INSERT INTO files (path, size, modified, hash, last_indexed_at, content)
        VALUES (@path, @size, @modified, @hash, @lastIndexedAt, @content)
@@ -1110,10 +1301,40 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
          metadata = excluded.metadata`
     );
 
+    const selectSymbolHitsStmt = db.prepare(
+      'SELECT name, start_line as startLine, hits FROM symbols WHERE file = ?'
+    );
+    const selectSnippetHitsStmt = db.prepare(
+      'SELECT start_line as startLine, end_line as endLine, hits FROM snippets WHERE file = ?'
+    );
+    const deleteSnippetsStmt = db.prepare('DELETE FROM snippets WHERE file = ?');
+    const deleteSymbolsStmt = db.prepare('DELETE FROM symbols WHERE file = ?');
+    const insertSnippetStmt = db.prepare(
+      `INSERT INTO snippets (file, text, start_line, end_line, hits)
+       VALUES (@file, @text, @startLine, @endLine, @hits)`
+    );
+    const insertSymbolStmt = db.prepare(
+      `INSERT INTO symbols (name, file, start_line, end_line, hits)
+       VALUES (@name, @file, @startLine, @endLine, @hits)
+       ON CONFLICT(name, file, start_line) DO UPDATE SET
+         end_line = excluded.end_line,
+         hits = MAX(symbols.hits, excluded.hits)`
+    );
     const insertIngestionStmt = db.prepare(
       `INSERT INTO ingestions (id, root, started_at, finished_at, file_count, skipped_count, deleted_count)
        VALUES (:id, :root, :started, :finished, :fileCount, :skippedCount, :deletedCount)`
     );
+
+    const upsertMetaStmt = db.prepare(
+      `INSERT INTO meta (id, commit_sha, indexed_at)
+       VALUES (1, @commitSha, @indexedAt)
+       ON CONFLICT(id) DO UPDATE SET
+         commit_sha = excluded.commit_sha,
+         indexed_at = excluded.indexed_at`
+    );
+
+    const snippetCount = uniqueSnippets.length;
+    const symbolCount = uniqueSymbols.length;
 
     const ingestionId = crypto.randomUUID();
     const endTime = Date.now();
@@ -1121,8 +1342,31 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
     let graphNodeCount = 0;
     let graphEdgeCount = 0;
 
+    const symbolHitCache = new Map<string, number>();
+    const snippetHitCache = new Map<string, number>();
+
     const transaction = db.transaction(() => {
       for (const pathToReset of chunkRefreshPaths) {
+        const preservedSymbols = selectSymbolHitsStmt.all(pathToReset) as {
+          name: string;
+          startLine: number;
+          hits: number;
+        }[];
+        for (const row of preservedSymbols) {
+          symbolHitCache.set(`${pathToReset}::${row.name}::${row.startLine}`, row.hits ?? 0);
+        }
+
+        const preservedSnippets = selectSnippetHitsStmt.all(pathToReset) as {
+          startLine: number;
+          endLine: number;
+          hits: number;
+        }[];
+        for (const row of preservedSnippets) {
+          snippetHitCache.set(`${pathToReset}::${row.startLine}::${row.endLine}`, row.hits ?? 0);
+        }
+
+        deleteSnippetsStmt.run(pathToReset);
+        deleteSymbolsStmt.run(pathToReset);
         deleteChunksStmt.run(pathToReset);
         deleteGraphNodesStmt.run(pathToReset);
       }
@@ -1156,7 +1400,31 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
           graphEdgeCount += 1;
         }
       }
+      for (const snippet of uniqueSnippets) {
+        const key = snippetKey(snippet);
+        const preservedHits = snippetHitCache.get(key) ?? 0;
+        insertSnippetStmt.run({
+          file: snippet.file,
+          text: snippet.text,
+          startLine: snippet.startLine,
+          endLine: snippet.endLine,
+          hits: preservedHits
+        });
+      }
+      for (const symbol of uniqueSymbols) {
+        const key = symbolKey(symbol);
+        const preservedHits = symbolHitCache.get(key) ?? 0;
+        insertSymbolStmt.run({
+          name: symbol.name,
+          file: symbol.file,
+          startLine: symbol.startLine,
+          endLine: symbol.endLine,
+          hits: preservedHits
+        });
+      }
       for (const deleted of deletedPaths) {
+        deleteSnippetsStmt.run(deleted);
+        deleteSymbolsStmt.run(deleted);
         deleteStmt.run(deleted);
       }
       insertIngestionStmt.run({
@@ -1167,6 +1435,10 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
         fileCount: files.length,
         skippedCount: skipped.length,
         deletedCount: deletedPaths.length
+      });
+      upsertMetaStmt.run({
+        commitSha: commitSha ?? null,
+        indexedAt: endTime
       });
     });
 
@@ -1185,7 +1457,11 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
       embeddedChunkCount,
       embeddingModel: embeddingConfig.enabled ? embeddingConfig.model : null,
       graphNodeCount,
-      graphEdgeCount
+      graphEdgeCount,
+      snippetCount,
+      symbolCount,
+      commitSha: commitSha ?? null,
+      indexedAt: endTime
     };
   } finally {
     db.close();

@@ -28,6 +28,7 @@ import {
 import { getNativeModuleStatus, loadNativeModule } from './native/index.js';
 import { getIndexStatus } from './status.js';
 import { getContextBundle } from './context-bundle.js';
+import { autoLookup } from './lookup.js';
 import { registerRemoteServers } from './remote-proxy.js';
 import { getRepositoryTimeline } from './git-timeline.js';
 
@@ -268,14 +269,18 @@ const ingestToolOutputShape = {
   embeddedChunkCount: z.number().int().min(0),
   embeddingModel: z.string().nullable(),
   graphNodeCount: z.number().int().min(0),
-  graphEdgeCount: z.number().int().min(0)
+  graphEdgeCount: z.number().int().min(0),
+  snippetCount: z.number().int().min(0),
+  symbolCount: z.number().int().min(0),
+  commitSha: z.string().min(1).nullable(),
+  indexedAt: z.number().int().min(0)
 } as const;
 const ingestToolOutputSchema = z.object(ingestToolOutputShape);
 
 const semanticSearchJsonSchema = {
   type: 'object',
-  title: 'Semantic Search Parameters',
-  description: 'Search indexed chunks with embeddings. Accepts alias parameters like text/search_query.',
+  title: 'Search Parameters',
+  description: 'Search indexed snippets using SQLite FTS (aliases: text/search_query).',
   properties: {
     root: {
       type: 'string',
@@ -283,7 +288,7 @@ const semanticSearchJsonSchema = {
     },
     query: {
       type: 'string',
-      description: 'Full-text query used to rank chunks (aliases: text, search, search_query).'
+      description: 'Full-text query used to rank snippets (aliases: text, search, search_query).'
     },
     databaseName: {
       type: 'string',
@@ -292,10 +297,6 @@ const semanticSearchJsonSchema = {
     limit: {
       type: 'integer',
       description: 'Maximum number of matches to return (aliases: max_results, top_k). Defaults to 8 and caps at 50.'
-    },
-    model: {
-      type: 'string',
-      description: 'Embedding model filter (alias: embedding_model). Required when multiple models are present.'
     }
   },
   required: ['query'],
@@ -320,30 +321,25 @@ const semanticSearchSchema = z
       .positive()
       .max(50)
       .optional()
-      .describe('Maximum number of matches to return (defaults to 8, caps at 50).'),
-    model: z.string().min(1).optional().describe('Embedding model filter.')
+      .describe('Maximum number of matches to return (defaults to 8, caps at 50).')
   })
   .strict();
 
 const semanticSearchMatchSchema = z.object({
-  path: z.string(),
-  chunkIndex: z.number().int(),
+  file: z.string(),
+  snippetId: z.number().int(),
   score: z.number(),
-  content: z.string(),
-  embeddingModel: z.string(),
-  byteStart: z.number().int().nullable(),
-  byteEnd: z.number().int().nullable(),
-  lineStart: z.number().int().nullable(),
-  lineEnd: z.number().int().nullable(),
-  contextBefore: z.string().nullable(),
-  contextAfter: z.string().nullable()
+  confidence: z.number(),
+  text: z.string(),
+  startLine: z.number().int(),
+  endLine: z.number().int()
 });
 const semanticSearchOutputShape = {
   databasePath: z.string(),
-  embeddingModel: z.string().nullable(),
-  totalChunks: z.number().int().min(0),
-  evaluatedChunks: z.number().int().min(0),
-  results: z.array(semanticSearchMatchSchema)
+  totalSnippets: z.number().int().min(0),
+  evaluatedSnippets: z.number().int().min(0),
+  results: z.array(semanticSearchMatchSchema),
+  query: z.string()
 } as const;
 const semanticSearchOutputSchema = z.object(semanticSearchOutputShape);
 
@@ -475,24 +471,17 @@ const contextBundleJsonSchema = {
       required: ['name'],
       additionalProperties: false
     },
-    maxSnippets: {
+    budgetTokens: {
       type: 'integer',
-      description: 'Maximum snippets to include (aliases: snippet_limit, max_chunks). Defaults to 3, max 10.',
-      minimum: 0,
-      maximum: 10
-    },
-    maxNeighbors: {
-      type: 'integer',
-      description: 'Maximum related edges to include per direction (aliases: neighbor_limit, edge_limit). Defaults to 12, max 50.',
-      minimum: 0,
-      maximum: 50
+      description: 'Optional token budget for the bundle (aliases: token_budget). Defaults to 3000.',
+      minimum: 100
     }
   },
   required: ['file'],
   additionalProperties: false
 } as const;
 
-const contextBundleSymbolSchema = z
+const contextBundleSymbolInputSchema = z
   .object({
     name: z.string({ required_error: 'symbol name is required' }).min(1, 'symbol name is required'),
     kind: z.string().min(1).optional(),
@@ -512,86 +501,39 @@ const contextBundleInputSchema = z
       .string({ required_error: 'file path is required' })
       .min(1, 'file path is required')
       .describe('Relative file path to summarize.'),
-    symbol: contextBundleSymbolSchema.optional().describe('Optional symbol selector to focus the bundle.'),
-    maxSnippets: z
+    symbol: contextBundleSymbolInputSchema.optional().describe('Optional symbol selector to focus the bundle.'),
+    budgetTokens: z
       .number()
       .int()
-      .min(0)
-      .max(10)
+      .min(100)
       .optional()
-      .describe('Maximum snippets to include (defaults to 3, caps at 10).'),
-    maxNeighbors: z
-      .number()
-      .int()
-      .min(0)
-      .max(50)
-      .optional()
-      .describe('Maximum related edges per direction (defaults to 12, caps at 50).')
+      .describe('Optional token budget for the bundle (defaults to 3000).')
   })
   .strict();
 
-const contextBundleDefinitionSchema = z.object({
-  id: z.string(),
+const contextBundleSymbolResultSchema = z.object({
   name: z.string(),
-  kind: z.string(),
-  signature: z.string().nullable(),
-  rangeStart: z.number().int().nullable(),
-  rangeEnd: z.number().int().nullable(),
-  metadata: z.record(z.any()).nullable()
-});
-
-const contextBundleFileSchema = z.object({
-  path: z.string(),
-  size: z.number(),
-  modified: z.number(),
-  hash: z.string(),
-  lastIndexedAt: z.number()
-});
-
-const contextBundleNeighborNodeSchema = z.object({
-  id: z.string(),
-  path: z.string().nullable(),
-  kind: z.string(),
-  name: z.string(),
-  signature: z.string().nullable(),
-  metadata: z.record(z.any()).nullable()
-});
-
-const contextBundleNeighborSchema = z.object({
-  id: z.string(),
-  type: z.string(),
-  direction: z.enum(['incoming', 'outgoing']),
-  metadata: z.record(z.any()).nullable(),
-  fromNodeId: z.string(),
-  toNodeId: z.string(),
-  neighbor: contextBundleNeighborNodeSchema
+  startLine: z.number().int(),
+  endLine: z.number().int(),
+  hits: z.number().int()
 });
 
 const contextBundleSnippetSchema = z.object({
-  source: z.enum(['chunk', 'content']),
-  chunkIndex: z.number().int().nullable(),
-  content: z.string(),
-  byteStart: z.number().int().nullable(),
-  byteEnd: z.number().int().nullable(),
-  lineStart: z.number().int().nullable(),
-  lineEnd: z.number().int().nullable()
-});
-
-const contextBundleIngestionSchema = z.object({
-  id: z.string(),
-  finishedAt: z.number(),
-  durationMs: z.number(),
-  fileCount: z.number()
+  snippetId: z.number().int(),
+  text: z.string(),
+  startLine: z.number().int(),
+  endLine: z.number().int()
 });
 
 const contextBundleOutputShape = {
   databasePath: z.string(),
-  file: contextBundleFileSchema,
-  definitions: z.array(contextBundleDefinitionSchema),
-  focusDefinition: contextBundleDefinitionSchema.nullable(),
-  related: z.array(contextBundleNeighborSchema),
+  file: z.string(),
+  tokenBudget: z.number().int(),
+  estimatedTokens: z.number().int(),
+  focusSymbol: contextBundleSymbolResultSchema.nullable(),
+  definitions: z.array(contextBundleSymbolResultSchema),
   snippets: z.array(contextBundleSnippetSchema),
-  latestIngestion: contextBundleIngestionSchema.nullable(),
+  citations: z.record(z.array(z.tuple([z.number().int(), z.number().int()]))),
   warnings: z.array(z.string())
 } as const;
 
@@ -609,8 +551,8 @@ const codeLookupJsonSchema = {
     },
     mode: {
       type: 'string',
-      enum: ['search', 'bundle', 'graph'],
-      description: 'Optional explicit mode override. Defaults to search when query is present, bundle when file is provided, otherwise graph.'
+      enum: ['auto', 'search', 'bundle', 'graph'],
+      description: 'Optional mode override. Defaults to auto which prioritizes symbol/file matches before search.'
     },
     query: {
       type: 'string',
@@ -634,6 +576,10 @@ const codeLookupJsonSchema = {
       required: ['name'],
       additionalProperties: false
     },
+    budgetTokens: {
+      type: 'integer',
+      description: 'Optional context bundle token budget override (aliases: token_budget).'
+    },
     node: {
       type: ['object', 'string'],
       description: 'Graph node descriptor (aliases: graph_node, graph_target, entity). String values are treated as the node name.',
@@ -652,30 +598,19 @@ const codeLookupJsonSchema = {
     },
     limit: {
       type: 'integer',
-      description: 'Result limit for search or graph queries (aliases: max_results, top_k, max_neighbors). Defaults to tool defaults, capped at 100.'
-    },
-    maxSnippets: {
-      type: 'integer',
-      description: 'Maximum snippets in context bundle responses (aliases: snippet_limit, max_chunks). Defaults to 3, max 10.'
-    },
-    maxNeighbors: {
-      type: 'integer',
-      description: 'Maximum related edges in context bundle responses (aliases: neighbor_limit, edge_limit). Defaults to 12, max 50.'
+      description:
+        'Result limit for search or graph queries (aliases: max_results, top_k, max_neighbors). Defaults to tool defaults, capped at 100.'
     },
     databaseName: {
       type: 'string',
       description: 'Optional SQLite filename (aliases: database, database_path, db). Defaults to .mcp-index.sqlite.'
-    },
-    model: {
-      type: 'string',
-      description: 'Embedding model filter for semantic search (alias: embedding_model). Required when multiple models exist.'
     }
   },
   required: [],
   additionalProperties: false
 } as const;
 
-const codeLookupModeSchema = z.enum(['search', 'bundle', 'graph']);
+const codeLookupModeSchema = z.enum(['auto', 'search', 'bundle', 'graph']);
 
 const graphNodeInputSchema = z
   .object({
@@ -696,7 +631,7 @@ const codeLookupInputBaseSchema = z
     mode: codeLookupModeSchema.optional().describe('Optional explicit mode override.'),
     query: z.string().optional().describe('Semantic search query text.'),
     file: z.string().optional().describe('Relative file path to summarize.'),
-    symbol: contextBundleSymbolSchema.optional().describe('Optional symbol selector.'),
+    symbol: contextBundleSymbolInputSchema.optional().describe('Optional symbol selector.'),
     node: graphNodeInputSchema.optional().describe('Optional graph node descriptor.'),
     direction: z.enum(['incoming', 'outgoing', 'both']).optional().describe('Graph neighbor direction.'),
     limit: z
@@ -706,22 +641,13 @@ const codeLookupInputBaseSchema = z
       .max(100)
       .optional()
       .describe('Result limit for search or graph queries.'),
-    maxSnippets: z
-      .number()
-      .int()
-      .min(0)
-      .max(10)
-      .optional()
-      .describe('Maximum snippets to include (defaults to 3, caps at 10).'),
-    maxNeighbors: z
-      .number()
-      .int()
-      .min(0)
-      .max(50)
-      .optional()
-      .describe('Maximum related edges per direction (defaults to 12, caps at 50).'),
     databaseName: z.string().min(1).optional().describe('Optional SQLite filename.'),
-    model: z.string().min(1).optional().describe('Embedding model filter for semantic search.')
+    budgetTokens: z
+      .number()
+      .int()
+      .min(100)
+      .optional()
+      .describe('Optional context bundle token budget override.')
   })
   .strict();
 
@@ -931,7 +857,7 @@ const repositoryTimelineOutputSchema = z.object(repositoryTimelineOutputShape);
 const indexStatusJsonSchema = {
   type: 'object',
   title: 'Index Status Parameters',
-  description: 'Summarize the SQLite index, including ingestion history and coverage metrics.',
+  description: 'Summarize the SQLite index, including freshness and symbol/snippet counts.',
   properties: {
     root: {
       type: 'string',
@@ -940,12 +866,6 @@ const indexStatusJsonSchema = {
     databaseName: {
       type: 'string',
       description: 'Optional SQLite filename (aliases: database, database_path, db). Defaults to .mcp-index.sqlite.'
-    },
-    historyLimit: {
-      type: 'integer',
-      description: 'Number of recent ingestions to include (aliases: history_limit, ingestion_limit, recent_runs). Defaults to 5.',
-      minimum: 0,
-      maximum: 25
     }
   },
   required: [],
@@ -963,39 +883,20 @@ const indexStatusSchema = z
       .string()
       .min(1)
       .describe('Optional SQLite filename (aliases: database, database_path, db).')
-      .optional(),
-    historyLimit: z
-      .number()
-      .int()
-      .min(0)
-      .max(25)
-      .describe('Number of recent ingestions to include (defaults to 5, capped at 25).')
       .optional()
   })
   .strict();
-
-const indexStatusIngestionSchema = z.object({
-  id: z.string(),
-  root: z.string(),
-  startedAt: z.number(),
-  finishedAt: z.number(),
-  durationMs: z.number(),
-  fileCount: z.number(),
-  skippedCount: z.number(),
-  deletedCount: z.number()
-});
 
 const indexStatusOutputShape = {
   databasePath: z.string(),
   databaseExists: z.boolean(),
   databaseSizeBytes: z.number().nullable(),
-  totalFiles: z.number(),
-  totalChunks: z.number(),
-  embeddingModels: z.array(z.string()),
-  totalGraphNodes: z.number(),
-  totalGraphEdges: z.number(),
-  latestIngestion: indexStatusIngestionSchema.nullable(),
-  recentIngestions: z.array(indexStatusIngestionSchema)
+  totalSymbols: z.number().int().min(0),
+  totalSnippets: z.number().int().min(0),
+  lastIndexedAt: z.number().int().nullable(),
+  indexedCommitSha: z.string().min(1).nullable(),
+  currentCommitSha: z.string().min(1).nullable(),
+  isStale: z.boolean()
 } as const;
 
 const indexStatusOutputSchema = z.object(indexStatusOutputShape);
@@ -1191,8 +1092,36 @@ async function main() {
         const context = createRootResolutionContext(extra);
         const resolvedRoot = resolveRootPath(parsedInput.root, context);
 
-        const resolvedMode =
-          parsedInput.mode ?? (parsedInput.query ? 'search' : parsedInput.file ? 'bundle' : 'graph');
+        const resolvedMode = parsedInput.mode ?? 'auto';
+
+        if (resolvedMode === 'auto') {
+          const lookupResult = await autoLookup({
+            root: resolvedRoot,
+            databaseName: parsedInput.databaseName,
+            query: parsedInput.query,
+            file: parsedInput.file,
+            symbolName: parsedInput.symbol?.name,
+            budgetTokens: parsedInput.budgetTokens,
+            limit: parsedInput.limit
+          });
+
+          const payload = codeLookupOutputSchema.parse({
+            mode: 'auto',
+            summary: lookupResult.summary,
+            bundleResult: lookupResult.bundle,
+            searchResult: lookupResult.search
+          });
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: lookupResult.summary
+              }
+            ],
+            structuredContent: payload
+          };
+        }
 
         if (resolvedMode === 'search') {
           if (!parsedInput.query) {
@@ -1202,14 +1131,12 @@ async function main() {
             root: resolvedRoot,
             query: parsedInput.query,
             databaseName: parsedInput.databaseName,
-            limit: parsedInput.limit,
-            model: parsedInput.model
+            limit: parsedInput.limit
           };
           const searchResult = semanticSearchOutputSchema.parse(await semanticSearch(searchInput));
-          const modelDescriptor = searchResult.embeddingModel ? `model ${searchResult.embeddingModel}` : 'stored embeddings';
           const summary = searchResult.results.length
-            ? `Semantic search scanned ${searchResult.evaluatedChunks} chunks and returned ${searchResult.results.length} match(es) (${modelDescriptor}).`
-            : 'Semantic search evaluated the index but did not return any matches.';
+            ? `Search evaluated ${searchResult.evaluatedSnippets} snippet(s) and returned ${searchResult.results.length} match(es).`
+            : 'Search evaluated the index but did not return any matches.';
 
           const payload = codeLookupOutputSchema.parse({
             mode: 'search',
@@ -1238,22 +1165,21 @@ async function main() {
             databaseName: parsedInput.databaseName,
             file: parsedInput.file,
             symbol: parsedInput.symbol,
-            maxSnippets: parsedInput.maxSnippets,
-            maxNeighbors: parsedInput.maxNeighbors
+            budgetTokens: parsedInput.budgetTokens
           };
           const bundleResult = contextBundleOutputSchema.parse(await getContextBundle(bundleInput));
           const summaryPieces: string[] = [
-            `Context bundle for ${bundleResult.file.path} includes ${bundleResult.definitions.length} definition(s)`
+            `Context bundle for ${bundleResult.file} includes ${bundleResult.definitions.length} definition(s)`
           ];
-          if (bundleResult.focusDefinition) {
-            summaryPieces.push(`focused on ${bundleResult.focusDefinition.kind} '${bundleResult.focusDefinition.name}'`);
-          }
-          if (bundleResult.related.length) {
-            summaryPieces.push(`${bundleResult.related.length} related edge(s)`);
+          if (bundleResult.focusSymbol) {
+            summaryPieces.push(`focused on '${bundleResult.focusSymbol.name}'`);
           }
           if (bundleResult.snippets.length) {
             summaryPieces.push(`${bundleResult.snippets.length} snippet(s)`);
           }
+          summaryPieces.push(
+            `budget ${bundleResult.estimatedTokens}/${bundleResult.tokenBudget} tokens`
+          );
           if (bundleResult.warnings.length) {
             summaryPieces.push('warnings present');
           }
@@ -1354,7 +1280,7 @@ async function main() {
   server.registerTool(
     'semantic_search',
     {
-      description: 'Return the most relevant indexed snippets using semantic embeddings.',
+      description: 'Return the most relevant indexed snippets using SQLite full-text search.',
       inputSchema: semanticSearchSchema.shape,
       outputSchema: semanticSearchOutputShape,
       annotations: {
@@ -1369,10 +1295,9 @@ async function main() {
         const resolvedRoot = resolveRootPath(parsedInput.root, context);
         const searchInput = { ...parsedInput, root: resolvedRoot };
         const result = semanticSearchOutputSchema.parse(await semanticSearch(searchInput));
-        const modelDescriptor = result.embeddingModel ? `model ${result.embeddingModel}` : 'stored embeddings';
         const summary = result.results.length
-          ? `Semantic search scanned ${result.evaluatedChunks} chunks and returned ${result.results.length} matches (${modelDescriptor}).`
-          : 'Semantic search evaluated the index but did not return any matches.';
+          ? `Search evaluated ${result.evaluatedSnippets} snippet(s) and returned ${result.results.length} match(es).`
+          : 'Search evaluated the index but did not return any matches.';
         return {
           content: [
             {
@@ -1446,17 +1371,17 @@ async function main() {
         const result = contextBundleOutputSchema.parse(await getContextBundle(bundleInput));
 
         const summaryPieces: string[] = [
-          `Context bundle for ${result.file.path} includes ${result.definitions.length} definition(s)`
+          `Context bundle for ${result.file} includes ${result.definitions.length} definition(s)`
         ];
-        if (result.focusDefinition) {
-          summaryPieces.push(`focused on ${result.focusDefinition.kind} '${result.focusDefinition.name}'`);
-        }
-        if (result.related.length) {
-          summaryPieces.push(`${result.related.length} related edge(s)`);
+        if (result.focusSymbol) {
+          summaryPieces.push(`focused on '${result.focusSymbol.name}'`);
         }
         if (result.snippets.length) {
           summaryPieces.push(`${result.snippets.length} snippet(s)`);
         }
+        summaryPieces.push(
+          `budget ${result.estimatedTokens}/${result.tokenBudget} tokens`
+        );
         if (result.warnings.length) {
           summaryPieces.push('warnings present');
         }
@@ -1533,7 +1458,7 @@ async function main() {
   server.registerTool(
     'index_status',
     {
-      description: 'Summarize the SQLite index to reveal ingestion freshness, coverage, and graph/embedding availability.',
+      description: 'Summarize the SQLite index to report ingestion freshness, symbol/snippet coverage, and commit alignment.',
       inputSchema: indexStatusSchema.shape,
       outputSchema: indexStatusOutputShape,
       annotations: {
@@ -1552,11 +1477,29 @@ async function main() {
         let summary: string;
         if (!result.databaseExists) {
           summary = `No SQLite index found at ${result.databasePath}. Run ingest_codebase to create a fresh index.`;
-        } else if (!result.latestIngestion) {
-          summary = `Index file ${result.databasePath} exists but no ingestion history is recorded yet. Run ingest_codebase to populate it.`;
         } else {
-          const finishedIso = new Date(result.latestIngestion.finishedAt).toISOString();
-          summary = `Index at ${result.databasePath} covers ${result.totalFiles} files and ${result.totalChunks} chunks. Last ingest finished ${finishedIso} after processing ${result.latestIngestion.fileCount} files.`;
+          const indexedIso = result.lastIndexedAt ? new Date(result.lastIndexedAt).toISOString() : 'unknown time';
+          const commitSummary = (() => {
+            if (result.indexedCommitSha && result.currentCommitSha) {
+              if (result.indexedCommitSha === result.currentCommitSha) {
+                return `Indexed commit ${result.indexedCommitSha} matches the working tree.`;
+              }
+              return `Indexed commit ${result.indexedCommitSha} differs from working tree ${result.currentCommitSha}; re-run ingest.`;
+            }
+            if (result.indexedCommitSha) {
+              return `Indexed commit ${result.indexedCommitSha}; unable to determine working tree commit.`;
+            }
+            if (result.currentCommitSha) {
+              return `Working tree commit ${result.currentCommitSha}; indexed commit unknown.`;
+            }
+            return 'Commit information unavailable.';
+          })();
+
+          const sizeSegment = typeof result.databaseSizeBytes === 'number'
+            ? ` (~${Math.round(result.databaseSizeBytes / 1024)} KiB)`
+            : '';
+
+          summary = `Index at ${result.databasePath}${sizeSegment} tracks ${result.totalSymbols} symbol(s) and ${result.totalSnippets} snippet(s). Last ingest: ${indexedIso}. ${commitSummary}`;
         }
 
         return {
