@@ -329,6 +329,9 @@ const semanticSearchMatchSchema = z.object({
   path: z.string(),
   chunkIndex: z.number().int(),
   score: z.number(),
+  normalizedScore: z.number(),
+  language: z.string().nullable(),
+  classification: z.enum(['function', 'comment', 'code']),
   content: z.string(),
   embeddingModel: z.string(),
   byteStart: z.number().int().nullable(),
@@ -537,7 +540,10 @@ const contextBundleDefinitionSchema = z.object({
   signature: z.string().nullable(),
   rangeStart: z.number().int().nullable(),
   rangeEnd: z.number().int().nullable(),
-  metadata: z.record(z.any()).nullable()
+  metadata: z.record(z.any()).nullable(),
+  visibility: z.string().nullable().optional(),
+  docstring: z.string().nullable().optional(),
+  todoCount: z.number().optional()
 });
 
 const contextBundleFileSchema = z.object({
@@ -592,7 +598,17 @@ const contextBundleOutputShape = {
   related: z.array(contextBundleNeighborSchema),
   snippets: z.array(contextBundleSnippetSchema),
   latestIngestion: contextBundleIngestionSchema.nullable(),
-  warnings: z.array(z.string())
+  warnings: z.array(z.string()),
+  quickLinks: z.array(
+    z.object({
+      type: z.enum(['file', 'relatedSymbol']),
+      label: z.string(),
+      path: z.string().nullable(),
+      direction: z.enum(['incoming', 'outgoing']).optional(),
+      symbolId: z.string().optional(),
+      symbolKind: z.string().optional()
+    })
+  )
 } as const;
 
 const contextBundleOutputSchema = z.object(contextBundleOutputShape);
@@ -904,7 +920,32 @@ const repositoryTimelineEntryShape = {
   insertions: z.number(),
   deletions: z.number(),
   fileChanges: z.array(repositoryTimelineFileChangeSchema),
-  diff: z.string().nullable().optional()
+  diff: z.string().nullable().optional(),
+  topFiles: z.array(
+    z.object({
+      path: z.string(),
+      insertions: z.number(),
+      deletions: z.number(),
+      net: z.number()
+    })
+  ),
+  directoryChurn: z.array(
+    z.object({
+      path: z.string(),
+      insertions: z.number(),
+      deletions: z.number(),
+      net: z.number(),
+      filesChanged: z.number()
+    })
+  ),
+  diffSummary: z.object({
+    filesChanged: z.number(),
+    insertions: z.number(),
+    deletions: z.number(),
+    net: z.number()
+  }),
+  highlights: z.array(z.string()),
+  pullRequestUrl: z.string().nullable()
 } as const;
 
 const repositoryTimelineEntrySchema = z.object(repositoryTimelineEntryShape);
@@ -923,7 +964,8 @@ const repositoryTimelineOutputShape = {
   mergeCommits: z.number(),
   totalInsertions: z.number(),
   totalDeletions: z.number(),
-  entries: z.array(repositoryTimelineEntrySchema)
+  entries: z.array(repositoryTimelineEntrySchema),
+  remoteUrl: z.string().nullable()
 } as const;
 
 const repositoryTimelineOutputSchema = z.object(repositoryTimelineOutputShape);

@@ -27,6 +27,28 @@ export interface RepositoryTimelineFileChange {
   net: number | null;
 }
 
+export interface RepositoryTimelineTopFile {
+  path: string;
+  insertions: number;
+  deletions: number;
+  net: number;
+}
+
+export interface RepositoryTimelineDirectoryChurn {
+  path: string;
+  insertions: number;
+  deletions: number;
+  net: number;
+  filesChanged: number;
+}
+
+export interface RepositoryTimelineDiffSummary {
+  filesChanged: number;
+  insertions: number;
+  deletions: number;
+  net: number;
+}
+
 export interface RepositoryTimelineEntry {
   sha: string;
   subject: string;
@@ -49,6 +71,11 @@ export interface RepositoryTimelineEntry {
   deletions: number;
   fileChanges: RepositoryTimelineFileChange[];
   diff?: string | null;
+  topFiles: RepositoryTimelineTopFile[];
+  directoryChurn: RepositoryTimelineDirectoryChurn[];
+  diffSummary: RepositoryTimelineDiffSummary;
+  highlights: string[];
+  pullRequestUrl: string | null;
 }
 
 export interface RepositoryTimelineResult {
@@ -66,6 +93,7 @@ export interface RepositoryTimelineResult {
   totalInsertions: number;
   totalDeletions: number;
   entries: RepositoryTimelineEntry[];
+  remoteUrl: string | null;
 }
 
 async function verifyGitRepository(root: string): Promise<string> {
@@ -129,10 +157,141 @@ function parsePullRequestNumber(subject: string): number | null {
   return null;
 }
 
+function toTopFiles(fileChanges: RepositoryTimelineFileChange[], limit: number): RepositoryTimelineTopFile[] {
+  const computeMagnitude = (item: RepositoryTimelineTopFile): number =>
+    Math.abs(item.insertions) + Math.abs(item.deletions);
+
+  return fileChanges
+    .map((change) => {
+      const insertions = change.insertions ?? 0;
+      const deletions = change.deletions ?? 0;
+      return {
+        path: change.path,
+        insertions,
+        deletions,
+        net: insertions - deletions
+      } satisfies RepositoryTimelineTopFile;
+    })
+    .sort((a, b) => computeMagnitude(b) - computeMagnitude(a) || a.path.localeCompare(b.path))
+    .slice(0, limit);
+}
+
+function aggregateDirectoryChurn(
+  fileChanges: RepositoryTimelineFileChange[],
+  limit: number
+): RepositoryTimelineDirectoryChurn[] {
+  const map = new Map<string, { insertions: number; deletions: number; files: Set<string> }>();
+  for (const change of fileChanges) {
+    const dir = change.path.includes('/') ? change.path.slice(0, change.path.lastIndexOf('/')) : '.';
+    const entry = map.get(dir) ?? {
+      insertions: 0,
+      deletions: 0,
+      files: new Set<string>()
+    };
+    entry.insertions += change.insertions ?? 0;
+    entry.deletions += change.deletions ?? 0;
+    entry.files.add(change.path);
+    map.set(dir, entry);
+  }
+
+  const computeMagnitude = (item: RepositoryTimelineDirectoryChurn): number =>
+    Math.abs(item.insertions) + Math.abs(item.deletions);
+
+  return Array.from(map.entries())
+    .map(([path, value]) => ({
+      path,
+      insertions: value.insertions,
+      deletions: value.deletions,
+      net: value.insertions - value.deletions,
+      filesChanged: value.files.size
+    }) satisfies RepositoryTimelineDirectoryChurn)
+    .sort((a, b) => computeMagnitude(b) - computeMagnitude(a) || a.path.localeCompare(b.path))
+    .slice(0, limit);
+}
+
+function buildHighlights(entry: RepositoryTimelineEntry): string[] {
+  const highlights: string[] = [];
+  if (entry.pullRequestNumber && entry.pullRequestUrl) {
+    highlights.push(`PR #${entry.pullRequestNumber} · ${entry.pullRequestUrl}`);
+  } else if (entry.pullRequestNumber) {
+    highlights.push(`PR #${entry.pullRequestNumber}`);
+  }
+
+  if (entry.isMerge) {
+    highlights.push('Merge commit');
+  }
+
+  const summary = entry.diffSummary;
+  highlights.push(
+    `Diff +${summary.insertions}/-${summary.deletions} across ${summary.filesChanged} file${summary.filesChanged === 1 ? '' : 's'}`
+  );
+
+  for (const file of entry.topFiles) {
+    highlights.push(`${file.path}: +${file.insertions}/-${file.deletions}`);
+  }
+
+  if (entry.directoryChurn.length > 0) {
+    const dir = entry.directoryChurn[0];
+    highlights.push(
+      `${dir.path} hotspot: +${dir.insertions}/-${dir.deletions} (${dir.filesChanged} file${dir.filesChanged === 1 ? '' : 's'})`
+    );
+  }
+
+  return highlights;
+}
+
+function normalizeRemoteUrl(raw: string | null): string | null {
+  if (!raw) {
+    return null;
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+    try {
+      const url = new URL(trimmed);
+      url.pathname = url.pathname.replace(/\.git$/, '');
+      url.search = '';
+      url.hash = '';
+      url.username = '';
+      url.password = '';
+      return `${url.origin}${url.pathname}`;
+    } catch {
+      return null;
+    }
+  }
+
+  const sshMatch = /^git@([^:]+):(.+)$/.exec(trimmed);
+  if (sshMatch) {
+    const host = sshMatch[1];
+    const pathPart = sshMatch[2].replace(/\.git$/, '');
+    return `https://${host}/${pathPart}`;
+  }
+
+  const sshUrlMatch = /^ssh:\/\/([^@]+)@([^/]+)\/(.+)$/.exec(trimmed);
+  if (sshUrlMatch) {
+    const host = sshUrlMatch[2];
+    const pathPart = sshUrlMatch[3].replace(/\.git$/, '');
+    return `https://${host}/${pathPart}`;
+  }
+
+  return null;
+}
+
+function buildPullRequestUrl(remoteUrl: string | null, pullRequestNumber: number | null): string | null {
+  if (!remoteUrl || pullRequestNumber === null) {
+    return null;
+  }
+  return `${remoteUrl.replace(/\/$/, '')}/pull/${pullRequestNumber}`;
+}
+
 function parseGitLog(
   output: string,
   includeFileStats: boolean,
-  includeDiffs: boolean
+  includeDiffs: boolean,
+  remoteUrl: string | null
 ): RepositoryTimelineEntry[] {
   const entries: RepositoryTimelineEntry[] = [];
   const records = output.split(GIT_LOG_RECORD_SEPARATOR);
@@ -226,6 +385,16 @@ function parseGitLog(
       }
     }
 
+    const topFiles = includeFileStats ? toTopFiles(fileChanges, 3) : [];
+    const directoryChurn = includeFileStats ? aggregateDirectoryChurn(fileChanges, 5) : [];
+    const diffSummary: RepositoryTimelineDiffSummary = {
+      filesChanged: fileChanges.length,
+      insertions,
+      deletions,
+      net: insertions - deletions
+    };
+    const pullRequestNumber = parsePullRequestNumber(subject);
+
     const entry: RepositoryTimelineEntry = {
       sha,
       subject,
@@ -242,13 +411,20 @@ function parseGitLog(
       committerDate,
       parents,
       isMerge,
-      pullRequestNumber: parsePullRequestNumber(subject),
+      pullRequestNumber,
       filesChanged: includeFileStats ? fileChanges.length : 0,
       insertions,
       deletions,
       fileChanges,
-      ...(includeDiffs ? { diff: diff ?? null } : {})
+      ...(includeDiffs ? { diff: diff ?? null } : {}),
+      topFiles,
+      directoryChurn,
+      diffSummary,
+      highlights: [],
+      pullRequestUrl: buildPullRequestUrl(remoteUrl, pullRequestNumber)
     };
+
+    entry.highlights = buildHighlights(entry);
 
     entries.push(entry);
   }
@@ -326,11 +502,13 @@ export async function getRepositoryTimeline(
   const absoluteRoot = path.resolve(options.root);
   const repoRoot = await verifyGitRepository(absoluteRoot);
 
+  const remoteUrl = normalizeRemoteUrl(await resolveRemoteUrl(repoRoot));
   const logOutput = await runGitLog(options, repoRoot);
   const entries = parseGitLog(
     logOutput,
     options.includeFileStats !== false,
-    options.includeDiffs === true
+    options.includeDiffs === true,
+    remoteUrl
   );
 
   let totalInsertions = 0;
@@ -365,6 +543,20 @@ export async function getRepositoryTimeline(
     mergeCommits,
     totalInsertions,
     totalDeletions,
-    entries
+    entries,
+    remoteUrl
   };
+}
+
+async function resolveRemoteUrl(repoRoot: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync('git', ['config', '--get', 'remote.origin.url'], {
+      cwd: repoRoot,
+      maxBuffer: 1024 * 1024,
+      encoding: 'utf8'
+    });
+    return stdout.trim() ? stdout.trim() : null;
+  } catch {
+    return null;
+  }
 }

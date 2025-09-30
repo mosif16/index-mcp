@@ -30,6 +30,9 @@ export interface SemanticSearchMatch {
   path: string;
   chunkIndex: number;
   score: number;
+  normalizedScore: number;
+  language: string | null;
+  classification: 'function' | 'comment' | 'code';
   content: string;
   embeddingModel: string;
   byteStart: number | null;
@@ -51,6 +54,33 @@ export interface SemanticSearchResult {
 const DEFAULT_RESULT_LIMIT = 8;
 const MAX_RESULT_LIMIT = 50;
 const CONTEXT_LINE_PADDING = 2;
+
+const LANGUAGE_BY_EXTENSION: Record<string, string> = {
+  '.ts': 'TypeScript',
+  '.tsx': 'TypeScript',
+  '.js': 'JavaScript',
+  '.jsx': 'JavaScript',
+  '.mjs': 'JavaScript',
+  '.cjs': 'JavaScript',
+  '.json': 'JSON',
+  '.py': 'Python',
+  '.rs': 'Rust',
+  '.go': 'Go',
+  '.java': 'Java',
+  '.rb': 'Ruby',
+  '.php': 'PHP',
+  '.swift': 'Swift',
+  '.kt': 'Kotlin',
+  '.cs': 'C#',
+  '.cpp': 'C++',
+  '.cc': 'C++',
+  '.c': 'C',
+  '.h': 'C/C++ Header',
+  '.hpp': 'C++ Header',
+  '.md': 'Markdown',
+  '.yml': 'YAML',
+  '.yaml': 'YAML'
+};
 
 interface FileCacheEntry {
   content: string | null;
@@ -108,6 +138,30 @@ function normalizeResultLimit(limit: number | undefined): number {
   const coerced = Math.floor(limit);
   const positive = Math.max(coerced, 1);
   return Math.min(positive, MAX_RESULT_LIMIT);
+}
+
+function detectLanguageFromPath(filePath: string): string | null {
+  const ext = path.extname(filePath).toLowerCase();
+  return LANGUAGE_BY_EXTENSION[ext] ?? null;
+}
+
+function classifySnippetText(snippet: string): 'function' | 'comment' | 'code' {
+  const trimmed = snippet.trim();
+  if (!trimmed) {
+    return 'code';
+  }
+
+  const lines = trimmed.split(/\r?\n/u);
+  const commentLines = lines.filter((line) => /^\s*(?:\/\/|#|\/\*|\*|<!--)/u.test(line));
+  if (commentLines.length === lines.length) {
+    return 'comment';
+  }
+
+  if (/\bfunction\b|=>|class\s+\w+|def\s+\w+/u.test(trimmed)) {
+    return 'function';
+  }
+
+  return 'code';
 }
 
 export async function semanticSearch(options: SemanticSearchOptions): Promise<SemanticSearchResult> {
@@ -257,6 +311,7 @@ export async function semanticSearch(options: SemanticSearchOptions): Promise<Se
       evaluatedChunks += 1;
       const chunkEmbedding = bufferToFloat32Array(row.embedding);
       const score = dotProduct(queryEmbedding, chunkEmbedding);
+      const normalizedScore = Math.max(0, Math.min(1, (score + 1) / 2));
       insertIntoTopMatches(
         topMatches,
         {
@@ -264,6 +319,9 @@ export async function semanticSearch(options: SemanticSearchOptions): Promise<Se
           chunkIndex: row.chunkIndex,
           content: row.content,
           score,
+          normalizedScore,
+          language: detectLanguageFromPath(row.path),
+          classification: classifySnippetText(row.content),
           embeddingModel: row.embeddingModel,
           byteStart: row.byteStart ?? null,
           byteEnd: row.byteEnd ?? null,
@@ -295,6 +353,10 @@ export async function semanticSearch(options: SemanticSearchOptions): Promise<Se
       const context = extractContext(entry, match.lineStart, match.lineEnd);
       match.contextBefore = context.before;
       match.contextAfter = context.after;
+
+      if (!match.language) {
+        match.language = detectLanguageFromPath(match.path);
+      }
     }
 
     return {

@@ -44,6 +44,9 @@ export interface BundleDefinition {
   rangeStart: number | null;
   rangeEnd: number | null;
   metadata: Record<string, unknown> | null;
+  visibility?: string | null;
+  docstring?: string | null;
+  todoCount?: number;
 }
 
 export interface BundleEdgeNeighbor {
@@ -79,6 +82,16 @@ export interface ContextBundleResult {
   snippets: BundleSnippet[];
   latestIngestion: BundleIngestionSummary | null;
   warnings: string[];
+  quickLinks: ContextBundleQuickLink[];
+}
+
+export interface ContextBundleQuickLink {
+  type: 'file' | 'relatedSymbol';
+  label: string;
+  path: string | null;
+  direction?: 'incoming' | 'outgoing';
+  symbolId?: string;
+  symbolKind?: string;
 }
 
 interface FileRow {
@@ -141,6 +154,133 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
+function extractDocstring(content: string, rangeStart: number | null): string | null {
+  if (rangeStart === null || rangeStart <= 0) {
+    return null;
+  }
+
+  const prefix = content.slice(0, rangeStart);
+  const blockMatch = /\/\*\*[\s\S]*?\*\/\s*$/u.exec(prefix);
+  if (blockMatch) {
+    const cleaned = blockMatch[0]
+      .replace(/^\/\*\*/u, '')
+      .replace(/\*\/\s*$/u, '')
+      .split(/\r?\n/u)
+      .map((line) => line.replace(/^\s*\*?\s?/u, '').trimEnd())
+      .join('\n')
+      .trim();
+    return cleaned.length ? cleaned : null;
+  }
+
+  const lineMatch = /((?:\/\/.*\n)+)\s*$/u.exec(prefix);
+  if (lineMatch) {
+    const cleaned = lineMatch[1]
+      .split(/\r?\n/u)
+      .map((line) => line.replace(/^\s*\/\//u, '').trim())
+      .filter((line) => line.length > 0)
+      .join('\n')
+      .trim();
+    return cleaned.length ? cleaned : null;
+  }
+
+  return null;
+}
+
+function determineVisibility(
+  content: string,
+  rangeStart: number | null,
+  kind: string,
+  metadata: Record<string, unknown> | null
+): string | null {
+  if (rangeStart === null) {
+    return null;
+  }
+
+  const preceding = content.slice(0, rangeStart);
+  const lastLineStart = preceding.lastIndexOf('\n') + 1;
+  const line = content.slice(lastLineStart, rangeStart + 200).split(/\r?\n/u)[0]?.trim() ?? '';
+
+  if (/\bprivate\b/u.test(line)) {
+    return 'private';
+  }
+  if (/\bprotected\b/u.test(line)) {
+    return 'protected';
+  }
+  if (/\bpublic\b/u.test(line) || /\bexport\b/u.test(line)) {
+    return 'public';
+  }
+  if (kind === 'method' && metadata && typeof metadata.className === 'string') {
+    return 'public';
+  }
+  return 'internal';
+}
+
+function countTodos(content: string, rangeStart: number | null, rangeEnd: number | null): number {
+  if (rangeStart === null || rangeEnd === null || rangeEnd <= rangeStart) {
+    return 0;
+  }
+  const snippet = content.slice(rangeStart, rangeEnd);
+  const matches = snippet.match(/\b(?:TODO|FIXME)\b/gi);
+  return matches ? matches.length : 0;
+}
+
+function createQuickLinks(
+  file: BundleFileMetadata,
+  definitions: BundleDefinition[],
+  related: BundleEdgeNeighbor[],
+  focusDefinition: BundleDefinition | null
+): ContextBundleQuickLink[] {
+  const links = new Map<string, ContextBundleQuickLink>();
+
+  links.set(`file:${file.path}`, {
+    type: 'file',
+    label: file.path,
+    path: file.path
+  });
+
+  if (focusDefinition) {
+    links.set(`symbol:${focusDefinition.id}`, {
+      type: 'relatedSymbol',
+      label: focusDefinition.name,
+      path: file.path,
+      symbolId: focusDefinition.id,
+      symbolKind: focusDefinition.kind
+    });
+  }
+
+  for (const definition of definitions) {
+    if (definition === focusDefinition) {
+      continue;
+    }
+    const key = `symbol:${definition.id}`;
+    if (!links.has(key)) {
+      links.set(key, {
+        type: 'relatedSymbol',
+        label: definition.name,
+        path: file.path,
+        symbolId: definition.id,
+        symbolKind: definition.kind
+      });
+    }
+  }
+
+  for (const neighbor of related) {
+    const key = `neighbor:${neighbor.neighbor.id}:${neighbor.direction}`;
+    if (!links.has(key)) {
+      links.set(key, {
+        type: 'relatedSymbol',
+        label: neighbor.neighbor.name,
+        path: neighbor.neighbor.path,
+        direction: neighbor.direction,
+        symbolId: neighbor.neighbor.id,
+        symbolKind: neighbor.neighbor.kind
+      });
+    }
+  }
+
+  return Array.from(links.values()).slice(0, 12);
+}
+
 export async function getContextBundle(options: ContextBundleOptions): Promise<ContextBundleResult> {
   const absoluteRoot = path.resolve(options.root);
   const stats = await fs.stat(absoluteRoot);
@@ -188,15 +328,37 @@ export async function getContextBundle(options: ContextBundleOptions): Promise<C
       )
       .all(options.file) as NodeRow[];
 
-    const definitions: BundleDefinition[] = nodeRows.map((row) => ({
-      id: row.id,
-      name: row.name,
-      kind: row.kind,
-      signature: row.signature,
-      rangeStart: row.rangeStart,
-      rangeEnd: row.rangeEnd,
-      metadata: parseMetadata(row.metadata)
-    }));
+    let fileContentString = typeof fileRow.content === 'string' ? fileRow.content : null;
+    if (!fileContentString) {
+      try {
+        fileContentString = await fs.readFile(path.join(absoluteRoot, fileRow.path), 'utf8');
+      } catch {
+        fileContentString = null;
+      }
+    }
+    const definitions: BundleDefinition[] = nodeRows.map((row) => {
+      const parsedMetadata = parseMetadata(row.metadata);
+      const rangeStart = row.rangeStart ?? (typeof parsedMetadata?.startOffset === 'number' ? parsedMetadata.startOffset : null);
+      const rangeEnd = row.rangeEnd ?? (typeof parsedMetadata?.endOffset === 'number' ? parsedMetadata.endOffset : null);
+      const visibility = fileContentString
+        ? determineVisibility(fileContentString, rangeStart, row.kind, parsedMetadata)
+        : null;
+      const docstring = fileContentString ? extractDocstring(fileContentString, rangeStart) : null;
+      const todoCount = fileContentString ? countTodos(fileContentString, rangeStart, rangeEnd) : 0;
+
+      return {
+        id: row.id,
+        name: row.name,
+        kind: row.kind,
+        signature: row.signature,
+        rangeStart: row.rangeStart,
+        rangeEnd: row.rangeEnd,
+        metadata: parsedMetadata,
+        visibility,
+        docstring,
+        todoCount
+      };
+    });
 
     let focusDefinition: BundleDefinition | null = null;
     if (options.symbol) {
@@ -326,6 +488,8 @@ export async function getContextBundle(options: ContextBundleOptions): Promise<C
       warnings.push('No graph metadata recorded for the requested file.');
     }
 
+    const quickLinks = createQuickLinks(file, definitions, related, focusDefinition);
+
     return {
       databasePath,
       file,
@@ -334,7 +498,8 @@ export async function getContextBundle(options: ContextBundleOptions): Promise<C
       related,
       snippets,
       latestIngestion,
-      warnings
+      warnings,
+      quickLinks
     };
   } finally {
     db.close();

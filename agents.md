@@ -154,7 +154,9 @@ Environment variables scoped in the `env` table support both the `INDEX_MCP_*` n
 | `index_status`    | Tool  | Summarizes database freshness (file counts, chunk totals, graph coverage) and recent ingestion runs so callers know whether they need to re-index before querying. |
 | `info`            | Tool  | Reports server diagnostics including package version, instruction banner, platform, native addon status, and other environment details useful for debugging deployments. |
 
-`semantic_search` responses now surface the top matches with their sanitized content, cosine score, byte offsets, line spans, and two lines of context before/after the hit. Re-run `ingest_codebase` after updating this server so existing databases backfill the new metadata columns.
+`semantic_search` responses now include normalized scores, language guesses, snippet classification (function/comment/code), the raw cosine score, byte offsets, line spans, and two lines of context before/after the hit.
+`context_bundle` enriches each definition with inferred visibility, extracted docstrings, TODO counters, and a `quickLinks` array that jumps to related symbols or files.
+`repository_timeline` entries bundle per-commit highlights, top files, directory churn summaries, diff totals, and pull-request URLs when the origin remote is known.
 
 ### Prompts
 
