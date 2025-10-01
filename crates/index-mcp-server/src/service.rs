@@ -3,15 +3,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::bundle::{
-    context_bundle, ContextBundleError, ContextBundleParams, ContextBundleResponse,
+    context_bundle, ContextBundleError, ContextBundleParams, ContextBundleResponse, SymbolSelector,
 };
+use crate::environment::{collect_model_cache_info, ModelCacheInfo};
 use crate::git_timeline::{
     repository_timeline, RepositoryTimelineError, RepositoryTimelineParams,
     RepositoryTimelineResponse,
 };
 use crate::graph_neighbors::{
     graph_neighbors, GraphNeighborDirection, GraphNeighborsError, GraphNeighborsParams,
-    GraphNeighborsResponse,
+    GraphNeighborsResponse, GraphNodeSelector,
 };
 use crate::index_status::{
     get_index_status, IndexStatusError, IndexStatusParams, IndexStatusResponse,
@@ -22,12 +23,13 @@ use crate::search::{
     semantic_search, summarize_semantic_search, SemanticSearchError, SemanticSearchParams,
     SemanticSearchResponse,
 };
+use once_cell::sync::Lazy;
+use rustc_version_runtime::version as rustc_version;
+use std::process;
 
 use rmcp::{
     handler::server::{
-        router::prompt::PromptRouter,
-        router::tool::ToolRouter,
-        wrapper::Parameters,
+        router::prompt::PromptRouter, router::tool::ToolRouter, wrapper::Parameters,
     },
     model::{
         CallToolResult, Content, GetPromptRequestParam, GetPromptResult, Implementation,
@@ -51,9 +53,44 @@ struct CodeLookupParams {
     #[serde(default)]
     query: Option<String>,
     #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    symbol: Option<CodeLookupSymbol>,
+    #[serde(default)]
+    node: Option<CodeLookupGraphNode>,
+    #[serde(default)]
+    direction: Option<GraphNeighborDirection>,
+    #[serde(default)]
     limit: Option<u32>,
     #[serde(default)]
+    max_snippets: Option<u32>,
+    #[serde(default)]
+    max_neighbors: Option<u32>,
+    #[serde(default)]
     model: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct CodeLookupSymbol {
+    name: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    path: Option<Option<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct CodeLookupGraphNode {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    path: Option<Option<String>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -83,8 +120,61 @@ struct SemanticSearchRequest {
     model: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct EmptyParams {}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct IndexingGuidanceToolResponse {
+    guidance: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct InfoResponse {
+    name: String,
+    version: String,
+    description: Option<String>,
+    instructions: String,
+    native_module: NativeModuleStatus,
+    environment: InfoEnvironment,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct NativeModuleStatus {
+    status: NativeModuleState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum NativeModuleState {
+    Ready,
+    Unavailable,
+    Error,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct InfoEnvironment {
+    node_version: String,
+    platform: String,
+    cwd: String,
+    pid: u32,
+    model_cache: ModelCacheInfo,
+}
+
 /// Textual instructions shared with MCP clients.
-const SERVER_INSTRUCTIONS: &str = "Rust rewrite in progress. Rust server currently supports ingest_codebase, semantic_search, code_lookup (search mode), index_status, graph_neighbors, and repository_timeline; additional tooling is being ported.";
+static SERVER_INSTRUCTIONS: Lazy<String> = Lazy::new(|| {
+    format!(
+        "Tools available from {} v{}: code_lookup (routes to semantic search, context bundles, or graph neighbors), ingest_codebase (refresh the SQLite index; pass autoEvict/maxDatabaseSizeBytes to prune cold data), index_status (verify index freshness), semantic_search (direct embedding-powered retrieval with hotness tracking), context_bundle (assemble focused file context trimmed to the budgetTokens limit), graph_neighbors (inspect structural relationships), repository_timeline (summarize recent git commits and file churn), indexing_guidance_tool (return these reminders as a tool), indexing_guidance (prompt form of the guidance), and info (runtime diagnostics). Preferred workflow: (1) on a new checkout or after edits, run ingest_codebase with the workspace root or specific changed paths; (2) call index_status whenever you are unsure the index is current; (3) reach for code_lookup first—use query=\"...\" for discovery, file=\"...\" plus optional symbol for file context, and mode=\"graph\" when you need relationship exploration. Call semantic_search when you want raw retrieval snippets, context_bundle for a structured file packet, or graph_neighbors to expand through the GraphRAG index; each call updates hit counters so eviction keeps frequently used data resident. Set the INDEX_MCP_BUDGET_TOKENS environment variable or pass budgetTokens/context_bundle arguments to cap tokens and avoid overloading downstream LLM context, and enable autoEvict on ingest when you need the server to trim the database automatically. Use repository_timeline to review recent commits, merges, and churn so plan-of-action agents can factor fresh changes into their reasoning; diffs ship by default so code changes stay visible. If ingest_codebase reports \"UNIQUE constraint failed: code_graph_nodes...\", rerun it with graph.enabled set to false while the duplicate-node bug is addressed, and always respect ignore files so repeated ingests stay clean.",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+    )
+});
 const INDEXING_GUIDANCE_PROMPT_TEXT: &str = "Tools: code_lookup (routes to semantic search, context bundles, or graph neighbors), ingest_codebase (refresh the SQLite index; enable autoEvict/maxDatabaseSizeBytes to prune unused chunks), index_status (check freshness), semantic_search (direct embedding-powered retrieval that updates hotness), context_bundle (structured bundle trimmed to budgetTokens or INDEX_MCP_BUDGET_TOKENS), graph_neighbors (relationship explorer), indexing_guidance_tool (tool-form reminders), indexing_guidance (prompt version), repository_timeline (summarize recent git commits), and info (runtime diagnostics). Workflow: run ingest_codebase on a new checkout or after edits while respecting .gitignore, call index_status when freshness is uncertain, then reach for code_lookup—use query=\"...\" for discovery, file=\"...\" plus optional symbol for file context, and mode=\"graph\" for relationship exploration. If ingest_codebase hits a \"UNIQUE constraint failed: code_graph_nodes...\" error, rerun it with graph.enabled=false until the duplicate-node fix lands. Invoke the specialist tools directly when you need their richer metadata, and tune budgetTokens to keep downstream LLM context under control.";
 
 /// Primary server state for the Rust MCP implementation.
@@ -215,21 +305,70 @@ impl IndexMcpService {
             database_name,
             mode,
             query,
+            file,
+            symbol,
+            node,
+            direction,
             limit,
+            max_snippets,
+            max_neighbors,
             model,
         } = params;
 
-        let mode = mode.unwrap_or_else(|| "search".to_string());
+        let trimmed_query = query
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty());
+        let trimmed_file = file
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty());
+        let has_graph_descriptor = node
+            .as_ref()
+            .map(|candidate| {
+                candidate.id.is_some()
+                    || candidate
+                        .name
+                        .as_ref()
+                        .map(|value| !value.is_empty())
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false)
+            || symbol
+                .as_ref()
+                .map(|candidate| !candidate.name.trim().is_empty())
+                .unwrap_or(false);
 
-        match mode.as_str() {
+        if mode.is_none()
+            && trimmed_query.is_none()
+            && trimmed_file.is_none()
+            && !has_graph_descriptor
+        {
+            return Err(McpError::invalid_params(
+                "Provide a query, file, or graph node to look up.",
+                None,
+            ));
+        }
+
+        let resolved_mode = mode.unwrap_or_else(|| {
+            if trimmed_query.is_some() {
+                "search".to_string()
+            } else if trimmed_file.is_some() {
+                "bundle".to_string()
+            } else {
+                "graph".to_string()
+            }
+        });
+
+        match resolved_mode.as_str() {
             "search" => {
-                let query = query.ok_or_else(|| {
+                let query = trimmed_query.ok_or_else(|| {
                     McpError::invalid_params("code_lookup search mode requires a query.", None)
                 })?;
 
                 let search_params = SemanticSearchParams {
                     root,
-                    query,
+                    query: query.to_string(),
                     database_name,
                     limit,
                     model,
@@ -239,23 +378,20 @@ impl IndexMcpService {
                     .await
                     .map_err(convert_semantic_search_error)?;
 
-                build_code_lookup_result(mode, response)
+                build_code_lookup_result(resolved_mode, response)
             }
             "bundle" => {
-                let file = query.ok_or_else(|| {
-                    McpError::invalid_params(
-                        "code_lookup bundle mode expects the file path in the query field.",
-                        None,
-                    )
+                let file = file.ok_or_else(|| {
+                    McpError::invalid_params("code_lookup bundle mode requires a file path.", None)
                 })?;
 
                 let bundle_params = ContextBundleParams {
                     root,
                     database_name,
                     file,
-                    symbol: None,
-                    max_snippets: limit,
-                    max_neighbors: None,
+                    symbol: symbol.map(convert_symbol_selector),
+                    max_snippets,
+                    max_neighbors,
                     budget_tokens: None,
                 };
 
@@ -263,10 +399,27 @@ impl IndexMcpService {
                     .await
                     .map_err(convert_context_bundle_error)?;
 
-                build_code_lookup_bundle_response(mode, response)
+                build_code_lookup_bundle_response(resolved_mode, response)
+            }
+            "graph" => {
+                let selector = determine_graph_node(node, symbol.clone(), file.clone())?;
+                let graph_params = GraphNeighborsParams {
+                    root,
+                    database_name,
+                    node: selector,
+                    direction,
+                    limit,
+                };
+
+                let graph_direction = direction.unwrap_or_default();
+                let response = graph_neighbors(graph_params)
+                    .await
+                    .map_err(convert_graph_neighbors_error)?;
+
+                build_code_lookup_graph_response(resolved_mode, graph_direction, response)
             }
             _ => Err(McpError::invalid_params(
-                "Unsupported code_lookup mode. Supported modes: search, bundle.",
+                "Unsupported code_lookup mode. Supported modes: search, bundle, graph.",
                 None,
             )),
         }
@@ -320,6 +473,30 @@ impl IndexMcpService {
 
         build_repository_timeline_result(response)
     }
+
+    #[tool(
+        name = "info",
+        description = "Report server metadata, version, environment, and model cache diagnostics."
+    )]
+    async fn info_tool(
+        &self,
+        Parameters(_params): Parameters<EmptyParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        build_info_result()
+    }
+
+    #[tool(
+        name = "indexing_guidance_tool",
+        description = "Return indexing reminders as a tool for clients that cannot invoke prompts."
+    )]
+    async fn indexing_guidance_tool(
+        &self,
+        Parameters(_params): Parameters<EmptyParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        build_indexing_guidance_tool_result()
+    }
 }
 
 #[tool_handler]
@@ -333,7 +510,7 @@ impl ServerHandler for IndexMcpService {
                 .enable_prompts()
                 .build(),
             server_info: Implementation::from_build_env(),
-            instructions: Some(SERVER_INSTRUCTIONS.to_string()),
+            instructions: Some(SERVER_INSTRUCTIONS.clone()),
         }
     }
 }
@@ -613,6 +790,239 @@ fn build_code_lookup_bundle_response(
     })
 }
 
+fn build_code_lookup_graph_response(
+    mode: String,
+    direction: GraphNeighborDirection,
+    graph: GraphNeighborsResponse,
+) -> Result<CallToolResult, McpError> {
+    let summary = summarize_graph_neighbors(direction, &graph);
+    let payload = CodeLookupResponse {
+        mode,
+        summary: summary.clone(),
+        search_result: None,
+        bundle_result: None,
+        graph_result: Some(serde_json::to_value(&graph).map_err(|error| {
+            McpError::internal_error(
+                format!("Failed to serialize graph neighbors result: {error}"),
+                None,
+            )
+        })?),
+    };
+
+    let value: Value = serde_json::to_value(&payload).map_err(|error| {
+        McpError::internal_error(
+            format!("Failed to serialize code_lookup result: {error}"),
+            None,
+        )
+    })?;
+
+    let json_content = Content::json(value.clone()).map_err(|error| {
+        McpError::internal_error(format!("Failed to encode JSON content: {error}"), None)
+    })?;
+
+    Ok(CallToolResult {
+        content: vec![Content::text(summary), json_content],
+        structured_content: Some(value),
+        is_error: Some(false),
+        meta: None,
+    })
+}
+
+fn convert_symbol_selector(symbol: CodeLookupSymbol) -> SymbolSelector {
+    SymbolSelector {
+        name: symbol.name,
+        kind: symbol.kind,
+        path: symbol.path,
+    }
+}
+
+fn determine_graph_node(
+    node: Option<CodeLookupGraphNode>,
+    symbol: Option<CodeLookupSymbol>,
+    file: Option<String>,
+) -> Result<GraphNodeSelector, McpError> {
+    if let Some(node) = node {
+        let mut resolved_name = node.name.and_then(|value| {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        });
+
+        if resolved_name.is_none() {
+            if let Some(symbol) = symbol.as_ref() {
+                let trimmed = symbol.name.trim();
+                if !trimmed.is_empty() {
+                    resolved_name = Some(trimmed.to_string());
+                }
+            }
+        }
+
+        if resolved_name.is_none() {
+            if let Some(file) = file.as_ref() {
+                let trimmed = file.trim();
+                if !trimmed.is_empty() {
+                    resolved_name = Some(trimmed.to_string());
+                }
+            }
+        }
+
+        if resolved_name.is_none() {
+            if let Some(id) = node.id.as_ref() {
+                resolved_name = Some(id.clone());
+            }
+        }
+
+        let name = resolved_name.ok_or_else(|| {
+            McpError::invalid_params(
+                "code_lookup graph mode requires node name when id is not provided.",
+                None,
+            )
+        })?;
+
+        return Ok(GraphNodeSelector {
+            name,
+            id: node.id,
+            kind: node.kind,
+            path: node.path,
+        });
+    }
+
+    if let Some(symbol) = symbol {
+        let CodeLookupSymbol { name, kind, path } = symbol;
+        let trimmed = name.trim().to_string();
+        if trimmed.is_empty() {
+            return Err(McpError::invalid_params(
+                "code_lookup graph mode requires node or symbol with a name.",
+                None,
+            ));
+        }
+
+        let mut resolved_path = path;
+        if resolved_path.is_none() {
+            if let Some(file) = file.as_ref() {
+                let trimmed = file.trim();
+                if !trimmed.is_empty() {
+                    resolved_path = Some(Some(trimmed.to_string()));
+                }
+            }
+        }
+
+        return Ok(GraphNodeSelector {
+            name: trimmed,
+            id: None,
+            kind,
+            path: resolved_path,
+        });
+    }
+
+    if let Some(file) = file {
+        let trimmed = file.trim().to_string();
+        if trimmed.is_empty() {
+            return Err(McpError::invalid_params(
+                "code_lookup graph mode requires node or symbol with a name.",
+                None,
+            ));
+        }
+        return Ok(GraphNodeSelector {
+            name: trimmed.clone(),
+            id: None,
+            kind: None,
+            path: Some(Some(trimmed)),
+        });
+    }
+
+    Err(McpError::invalid_params(
+        "code_lookup graph mode requires node or symbol with a name.",
+        None,
+    ))
+}
+
+fn build_indexing_guidance_tool_result() -> Result<CallToolResult, McpError> {
+    let payload = IndexingGuidanceToolResponse {
+        guidance: INDEXING_GUIDANCE_PROMPT_TEXT.to_string(),
+    };
+
+    let value: Value = serde_json::to_value(&payload).map_err(|error| {
+        McpError::internal_error(
+            format!("Failed to serialize indexing guidance result: {error}"),
+            None,
+        )
+    })?;
+
+    let json_content = Content::json(value.clone()).map_err(|error| {
+        McpError::internal_error(format!("Failed to encode JSON content: {error}"), None)
+    })?;
+
+    Ok(CallToolResult {
+        content: vec![
+            Content::text(
+                "Indexing guidance provided. See structured guidance field for full reminders.",
+            ),
+            json_content,
+        ],
+        structured_content: Some(value),
+        is_error: Some(false),
+        meta: None,
+    })
+}
+
+fn build_info_result() -> Result<CallToolResult, McpError> {
+    let name = env!("CARGO_PKG_NAME").to_string();
+    let version = env!("CARGO_PKG_VERSION").to_string();
+    let description = option_env!("CARGO_PKG_DESCRIPTION").map(|value| value.to_string());
+    let instructions = SERVER_INSTRUCTIONS.clone();
+    let native_module = NativeModuleStatus {
+        status: NativeModuleState::Ready,
+        message: None,
+    };
+
+    let cwd = std::env::current_dir().map_err(|error| {
+        McpError::internal_error(
+            format!("Unable to resolve current directory: {error}"),
+            None,
+        )
+    })?;
+
+    let model_cache = collect_model_cache_info();
+    let environment = InfoEnvironment {
+        node_version: format!("rustc {}", rustc_version()),
+        platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        cwd: cwd.display().to_string(),
+        pid: process::id(),
+        model_cache,
+    };
+
+    let payload = InfoResponse {
+        name: name.clone(),
+        version: version.clone(),
+        description,
+        instructions: instructions.clone(),
+        native_module,
+        environment,
+    };
+
+    let value: Value = serde_json::to_value(&payload).map_err(|error| {
+        McpError::internal_error(format!("Failed to serialize info result: {error}"), None)
+    })?;
+
+    let json_content = Content::json(value.clone()).map_err(|error| {
+        McpError::internal_error(format!("Failed to encode JSON content: {error}"), None)
+    })?;
+
+    Ok(CallToolResult {
+        content: vec![
+            Content::text(format!("{} v{} is ready.", name, version)),
+            json_content,
+        ],
+        structured_content: Some(value),
+        is_error: Some(false),
+        meta: None,
+    })
+}
+
 fn convert_context_bundle_error(error: ContextBundleError) -> McpError {
     match error {
         ContextBundleError::InvalidRoot { path, source } => {
@@ -705,26 +1115,7 @@ fn build_graph_neighbors_result(
     response: GraphNeighborsResponse,
     direction: GraphNeighborDirection,
 ) -> Result<CallToolResult, McpError> {
-    let direction_descriptor = match direction {
-        GraphNeighborDirection::Incoming => "incoming",
-        GraphNeighborDirection::Outgoing => "outgoing",
-        GraphNeighborDirection::Both => "incoming/outgoing",
-    };
-
-    let summary = if response.neighbors.is_empty() {
-        format!(
-            "Graph query found no {} neighbors for node '{}'.",
-            direction_descriptor, response.node.name
-        )
-    } else {
-        format!(
-            "Graph query found {} neighbor(s) ({}) for node '{}'.",
-            response.neighbors.len(),
-            direction_descriptor,
-            response.node.name
-        )
-    };
-
+    let summary = summarize_graph_neighbors(direction, &response);
     let value: Value = serde_json::to_value(&response).map_err(|error| {
         McpError::internal_error(
             format!("Failed to serialize graph neighbors result: {error}"),
@@ -742,6 +1133,31 @@ fn build_graph_neighbors_result(
         is_error: Some(false),
         meta: None,
     })
+}
+
+fn summarize_graph_neighbors(
+    direction: GraphNeighborDirection,
+    response: &GraphNeighborsResponse,
+) -> String {
+    let direction_descriptor = match direction {
+        GraphNeighborDirection::Incoming => "incoming",
+        GraphNeighborDirection::Outgoing => "outgoing",
+        GraphNeighborDirection::Both => "incoming/outgoing",
+    };
+
+    if response.neighbors.is_empty() {
+        format!(
+            "Graph query found no {} neighbors for node '{}'.",
+            direction_descriptor, response.node.name
+        )
+    } else {
+        format!(
+            "Graph query found {} neighbor(s) ({}) for node '{}'.",
+            response.neighbors.len(),
+            direction_descriptor,
+            response.node.name
+        )
+    }
 }
 
 fn build_repository_timeline_result(

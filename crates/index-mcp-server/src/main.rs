@@ -1,4 +1,5 @@
 mod bundle;
+mod environment;
 mod git_timeline;
 mod graph;
 mod graph_neighbors;

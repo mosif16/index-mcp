@@ -42,6 +42,8 @@ pub struct SymbolSelector {
     pub name: String,
     #[serde(default)]
     pub kind: Option<String>,
+    #[serde(default)]
+    pub path: Option<Option<String>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -725,7 +727,7 @@ fn find_focus_definition(
     definitions: &[BundleDefinition],
     selector: SymbolSelector,
 ) -> Option<BundleDefinition> {
-    let SymbolSelector { name, kind } = selector;
+    let SymbolSelector { name, kind, .. } = selector;
     let name_lower = name.to_lowercase();
     definitions
         .iter()

@@ -14,13 +14,15 @@ with a native binary that reuses the existing SQLite index and native ingestion 
   - `ingest_codebase` with filesystem scanning, SQLite schema upkeep, ingestion history tracking,
     chunk embeddings, TypeScript graph extraction, changed-path ingestion, and auto-eviction (80 %
     target, least-used chunks/nodes, runtime stats).
-  - `semantic_search`, `context_bundle`, and `code_lookup` (search + bundle modes) with matching
-    response envelopes.
+  - `semantic_search`, `context_bundle`, and `code_lookup` (search, bundle, and graph modes) with
+    matching response envelopes.
   - `graph_neighbors` (GraphRAG exploration) and `repository_timeline` (git history summaries)
     implemented natively.
   - `index_status` mirrors the Node freshness checks (database metrics, embedding models, commit
     comparison).
   - `indexing_guidance_tool` + `indexing_guidance` prompt registered through the rmcp prompt API.
+  - `info` tool mirrors runtime diagnostics, environment details, and model cache checks from the
+    Node server banner.
   - Watch mode (`--watch`, `--watch-debounce`, `--watch-no-initial`, `--watch-quiet`) drives
     incremental ingests via the Rust pipeline.
 - Shared schema/database updates (hits columns, graph tables, meta entries) are respected by the

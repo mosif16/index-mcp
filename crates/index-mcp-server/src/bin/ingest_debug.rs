@@ -1,9 +1,9 @@
-#[path = "../ingest.rs"]
-mod ingest;
 #[path = "../graph.rs"]
 mod graph;
 #[path = "../index_status.rs"]
 mod index_status;
+#[path = "../ingest.rs"]
+mod ingest;
 
 use ingest::{ingest_codebase, IngestParams};
 
