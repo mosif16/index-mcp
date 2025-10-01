@@ -1279,7 +1279,7 @@ async function main() {
 
         if (resolvedMode === 'search') {
           if (!parsedInput.query) {
-            throw new Error('code_lookup search mode requires a query.');
+            throw new Error('code_lookup search mode requires a query. Please provide a search query using the "query" parameter.');
           }
           const searchInput = {
             root: resolvedRoot,
@@ -1313,7 +1313,7 @@ async function main() {
 
         if (resolvedMode === 'bundle') {
           if (!parsedInput.file) {
-            throw new Error('code_lookup bundle mode requires a file path.');
+            throw new Error('code_lookup bundle mode requires a file path. Please provide the "file" parameter with the path to the file you want to bundle.');
           }
 
           const bundleInput = {
@@ -1367,7 +1367,7 @@ async function main() {
           const resolvedName =
             name ?? parsedInput.symbol?.name ?? parsedInput.file ?? (id ? id : undefined);
           if (!resolvedName) {
-            throw new Error('code_lookup graph mode requires node name when id is not provided.');
+            throw new Error('code_lookup graph mode requires node name when id is not provided. Please provide either "node.name", "node.id", "symbol.name", or "file" parameter.');
           }
           graphNode = {
             name: resolvedName,
@@ -1396,7 +1396,7 @@ async function main() {
         }
 
         if (!graphNode || (!graphNode.id && !graphNode.name)) {
-          throw new Error('code_lookup graph mode requires node or symbol with a name.');
+          throw new Error('code_lookup graph mode requires node or symbol with a name. Please provide "node.name", "node.id", "symbol.name", or "file" parameter to identify the graph node.');
         }
 
         const graphInput = {

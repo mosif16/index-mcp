@@ -156,7 +156,9 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 function estimateTokens(text: string): number {
-  // Simple token estimation: ~4 characters per token on average
+  // Token estimation using industry-standard heuristic:
+  // ~4 characters per token on average for English text (OpenAI guideline)
+  // This is a reasonable approximation for code as well, erring on the side of overestimation
   return Math.ceil(text.length / 4);
 }
 
