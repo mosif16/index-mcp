@@ -1,0 +1,41 @@
+[workspace]
+members = [
+    "crates/index_mcp_native",
+    "crates/index-mcp-server",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+clap = { version = "4.5", features = ["derive"] }
+indexmap = "2.6"
+rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk.git", branch = "main", features = ["server", "client", "transport-io", "transport-sse-client-reqwest"] }
+rmcp-macros = { git = "https://github.com/modelcontextprotocol/rust-sdk.git", branch = "main" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+schemars = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+uuid = { version = "1.10", features = ["v4"] }
+walkdir = "2.5"
+globset = "0.4"
+sha2 = "0.10"
+hex = "0.4"
+fastembed = "5.2"
+regex = "1.11"
+swc_common = "14.0"
+swc_ecma_parser = "24.0"
+swc_ecma_visit = "15.0"
+swc_ecma_ast = "15.0"
+once_cell = "1.19"
+url = "2.5"
+notify = "6.1"
+reqwest = { version = "0.12", default-features = true, features = ["json"] }

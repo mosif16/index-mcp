@@ -1,0 +1,39 @@
+[package]
+name = "index-mcp-server"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+rmcp = { workspace = true, features = ["server", "client", "transport-io", "transport-sse-client-reqwest"] }
+rmcp-macros = { workspace = true }
+rusqlite = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-trait = { workspace = true }
+indexmap = { workspace = true }
+uuid = { workspace = true }
+walkdir = { workspace = true }
+globset = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+fastembed = { workspace = true }
+regex = { workspace = true }
+swc_common = { workspace = true }
+swc_ecma_parser = { workspace = true }
+swc_ecma_visit = { workspace = true }
+swc_ecma_ast = { workspace = true }
+once_cell = { workspace = true }
+url = { workspace = true }
+notify = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

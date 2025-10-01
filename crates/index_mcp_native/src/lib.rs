@@ -290,12 +290,10 @@ pub fn analyze_file_content(options: AnalyzeOptions) -> Result<NativeAnalysisRes
 }
 
 #[napi]
-pub fn analyze_file_content_batch(options: BatchAnalyzeOptions) -> Result<NativeBatchAnalysisResult> {
-    let chunk_size = options
-        .chunk_size_tokens
-        .unwrap_or(256.0)
-        .max(0.0)
-        .floor() as usize;
+pub fn analyze_file_content_batch(
+    options: BatchAnalyzeOptions,
+) -> Result<NativeBatchAnalysisResult> {
+    let chunk_size = options.chunk_size_tokens.unwrap_or(256.0).max(0.0).floor() as usize;
     let chunk_overlap = options
         .chunk_overlap_tokens
         .unwrap_or(32.0)

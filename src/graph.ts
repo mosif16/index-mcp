@@ -97,7 +97,19 @@ export function extractGraphMetadata(relativePath: string, content: string): Gra
   entitiesMap.set(fileEntity.id, fileEntity);
 
   const localSymbolIndex = new Map<string, string>();
-  const scopeStack: { entityId: string; path: string | null }[] = [{ entityId: fileEntity.id, path: relativePath }];
+  interface ScopeFrame {
+    entityId: string;
+    path: string | null;
+    displayName: string | null;
+  }
+
+  const scopeStack: ScopeFrame[] = [
+    {
+      entityId: fileEntity.id,
+      path: relativePath,
+      displayName: fileEntity.name ?? relativePath
+    }
+  ];
   const classStack: { entityId: string; name: string }[] = [];
 
   function registerEntity(key: string, factory: () => GraphEntity): GraphEntity {
@@ -125,16 +137,38 @@ export function extractGraphMetadata(relativePath: string, content: string): Gra
     });
   }
 
-  function enterScope(entity: GraphEntity) {
-    scopeStack.push({ entityId: entity.id, path: entity.path });
+  function enterScope(entity: GraphEntity, displayNameOverride?: string | null) {
+    scopeStack.push({
+      entityId: entity.id,
+      path: entity.path ?? null,
+      displayName: displayNameOverride ?? entity.name ?? null
+    });
   }
 
   function exitScope() {
     scopeStack.pop();
   }
 
-  function currentScope(): { entityId: string; path: string | null } {
+  function currentScope(): ScopeFrame {
     return scopeStack[scopeStack.length - 1];
+  }
+
+  function getScopeNames(): string[] {
+    return scopeStack
+      .slice(1) // Skip the file-level frame for readability.
+      .map((frame) => frame.displayName)
+      .filter((name): name is string => typeof name === 'string' && name.trim().length > 0);
+  }
+
+  function makeScopedName(baseName: string): { scopedName: string; scopeChain: string[] } {
+    const scopeNames = getScopeNames();
+    if (scopeNames.length === 0) {
+      return { scopedName: baseName, scopeChain: [] };
+    }
+    return {
+      scopedName: `${scopeNames.join('::')}::${baseName}`,
+      scopeChain: scopeNames
+    };
   }
 
   function ensureLocalSymbol(name: string, entity: GraphEntity): void {
@@ -191,27 +225,30 @@ export function extractGraphMetadata(relativePath: string, content: string): Gra
     visitChildren: () => void
   ) {
     const signature = functionSignature(node, name);
-    const entityId = stableId([kind, relativePath, name, node.pos.toString(), node.end.toString()]);
+    const { scopedName, scopeChain } = makeScopedName(name);
+    const entityId = stableId([kind, relativePath, scopedName, node.pos.toString(), node.end.toString()]);
     const lineInfo = getLineInfo(sourceFile, node);
+    const metadataPayload: Record<string, unknown> = {
+      ...(metadata ?? {}),
+      ...(scopeChain.length > 0 ? { scopeChain } : {}),
+      startLine: lineInfo.startLine,
+      startColumn: lineInfo.startColumn,
+      endLine: lineInfo.endLine,
+      endColumn: lineInfo.endColumn
+    };
     const entity = registerEntity(entityId, () => ({
       id: entityId,
       path: relativePath,
       kind,
-      name,
+      name: scopedName,
       signature,
       rangeStart: node.getStart(sourceFile),
       rangeEnd: node.getEnd(),
-      metadata: {
-        ...(metadata ?? {}),
-        startLine: lineInfo.startLine,
-        startColumn: lineInfo.startColumn,
-        endLine: lineInfo.endLine,
-        endColumn: lineInfo.endColumn
-      }
+      metadata: metadataPayload
     }));
 
     ensureLocalSymbol(name, entity);
-    enterScope(entity);
+    enterScope(entity, name);
     visitChildren();
     exitScope();
   }
@@ -278,6 +315,11 @@ export function extractGraphMetadata(relativePath: string, content: string): Gra
     }
 
     if (ts.isMethodDeclaration(node) && node.name && ts.isIdentifier(node.name)) {
+      if (!node.body) {
+        // Skip signature-only overloads so we don't emit duplicate graph nodes for the same method name.
+        ts.forEachChild(node, visit);
+        return;
+      }
       const methodName = node.name.text;
       const currentClass = classStack[classStack.length - 1];
       const metadata = currentClass ? { className: currentClass.name } : null;
@@ -288,8 +330,12 @@ export function extractGraphMetadata(relativePath: string, content: string): Gra
     }
 
     if (ts.isConstructorDeclaration(node)) {
+      if (!node.body) {
+        ts.forEachChild(node, visit);
+        return;
+      }
       const currentClass = classStack[classStack.length - 1];
-      const name = currentClass ? `${currentClass.name}#constructor` : 'constructor';
+      const name = 'constructor';
       const metadata = currentClass ? { className: currentClass.name } : null;
       withFunctionEntity(node, name, 'method', metadata, () => {
         ts.forEachChild(node, visit);
@@ -298,6 +344,11 @@ export function extractGraphMetadata(relativePath: string, content: string): Gra
     }
 
     if (ts.isFunctionDeclaration(node) && node.name) {
+      if (!node.body) {
+        // Overload signatures have no body; traversing children keeps nested declarations discoverable.
+        ts.forEachChild(node, visit);
+        return;
+      }
       withFunctionEntity(node, node.name.text, 'function', null, () => {
         ts.forEachChild(node, visit);
       });

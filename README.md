@@ -1,3 +1,7 @@
+USE NODE-RUNTIME BRANCH. MAIN BRANCH UNDER WORK 
+
+
+
 # index-mcp
 
 An MCP (Model Context Protocol) server that scans a source-code workspace and builds a searchable SQLite index (`.mcp-index.sqlite` by default) in the project root. The index stores file metadata, hashes, and optionally file contents so MCP-compatible clients can perform fast lookups, semantic search, and graph exploration.
@@ -16,25 +20,30 @@ An MCP (Model Context Protocol) server that scans a source-code workspace and bu
 
 ## Requirements
 
-- Node.js **18.17 or newer**
-- npm **9+**
+- Rust toolchain (`cargo`) 1.75+ (default runtime)
+- Node.js **18.17 or newer** and npm **9+** (needed for the legacy Node runtime and native addon builds)
 
 Optional but recommended:
 
-- Rust toolchain (`rustup`) for native builds
-- [`@napi-rs/cli`](https://github.com/napi-rs/napi-rs/tree/main/cli) to compile the native addon manually
+- [`@napi-rs/cli`](https://github.com/napi-rs/napi-rs/tree/main/cli) to compile the native addon manually when using the Node runtime
 
 ## Quick start
 
-Install dependencies:
+### Run the Rust server (default)
+
+```bash
+cargo run -p index-mcp-server --release
+```
+
+Omit `--release` for faster incremental builds or pass additional CLI flags with
+`INDEX_MCP_ARGS="--watch --watch-debounce=250" ./start.sh`.
+
+### Legacy Node runtime
+
+Install dependencies and build the TypeScript bundles:
 
 ```bash
 npm install
-```
-
-Build the TypeScript bundles (emitted to `dist/`):
-
-```bash
 npm run build
 ```
 
@@ -50,9 +59,9 @@ During development you can run the TypeScript entrypoint directly:
 npm run dev
 ```
 
-## Native acceleration
+## Native acceleration (Node runtime)
 
-The native module in `crates/index_mcp_native` is loaded automatically on startup. When present it accelerates ingestion; when it fails to load (or if you set `INDEX_MCP_NATIVE_DISABLE=true`) the server falls back to the TypeScript implementation and logs a warning.
+When running the legacy Node server, the native module in `crates/index_mcp_native` is loaded automatically on startup. When present it accelerates ingestion; when it fails to load (or if you set `INDEX_MCP_NATIVE_DISABLE=true`) the server falls back to the TypeScript implementation and logs a warning.
 
 To build the addon manually:
 
@@ -65,6 +74,24 @@ npm run build
 Restart the server after rebuilding—the next `ingest_codebase` call will attempt to load the native scanner and report issues through the `info` tool.
 
 ## Watch mode and cleanup
+
+### Rust runtime
+
+The Rust binary ships with a built-in watcher. Prefix your launch command with the desired flags:
+
+```bash
+cargo run -p index-mcp-server --release -- --watch --watch-debounce=250
+```
+
+Or, when using `start.sh`, populate `INDEX_MCP_ARGS`:
+
+```bash
+INDEX_MCP_ARGS="--watch --watch-debounce=250" ./start.sh
+```
+
+Flags mirror the Node watcher (`--watch-root`, `--watch-no-initial`, `--watch-quiet`, `--watch-database`).
+
+### Node runtime
 
 Keep the SQLite index synchronized with local edits by enabling the watcher:
 
@@ -79,7 +106,7 @@ You can also pass flags through `npm run dev` (e.g. `npm run dev -- --watch`). U
 - `--watch-no-initial` – Skip the initial full ingest.
 - `--watch-quiet` – Silence watcher logs.
 
-When embedding the server in another process, call `await runCleanup()` from `src/cleanup.ts` before exit so watchers, transports, and embedding pipelines shut down cleanly.
+When embedding the Node server in another process, call `await runCleanup()` from `src/cleanup.ts` before exit so watchers, transports, and embedding pipelines shut down cleanly.
 
 ## Context Budget and Hotness Tracking
 
@@ -126,9 +153,30 @@ The `index_status` tool now compares the current git commit with the indexed com
 
 This allows agents to automatically detect when re-indexing is needed after git operations.
 
+## Rust runtime
+
+The Rust MCP server in `crates/index-mcp-server` now serves the full tool surface—ingest, semantic
+search, context bundles, graph neighbors, repository timelines, remote MCP proxying, prompts, and
+watch mode—using the official [Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk).
+
+Build or run the Rust binary with:
+
+```bash
+cargo check -p index-mcp-server
+cargo run -p index-mcp-server --release
+```
+
+The executable communicates over stdio, so it can be registered with MCP-compatible clients like
+Claude Desktop in the same way as the Node entrypoint. Use `INDEX_MCP_ARGS` (or pass CLI flags
+directly) to enable watcher mode, override the working directory, or tweak debounce settings.
+
 ## Codex CLI setup
 
-The project root includes a `start.sh` helper that rebuilds both the stdio server bundle and the bundled local backend, refreshes the native addon, waits for the backend health check, and finally launches `node dist/server.js`. Point your Codex configuration at this script and customize paths for your machine:
+The project root includes a `start.sh` helper. By default it compiles and launches the Rust binary,
+passing through any `INDEX_MCP_*` environment variables. Set `INDEX_MCP_RUNTIME=node` to boot the
+legacy JavaScript stack instead (which rebuilds `dist/`, refreshes the native addon, and starts the
+local backend before launching `node dist/server.js`). Point your Codex configuration at this script
+and customize paths for your machine:
 
 ```json
 {
@@ -138,7 +186,8 @@ The project root includes a `start.sh` helper that rebuilds both the stdio serve
       "env": {
         "INDEX_MCP_LOG_LEVEL": "info",
         "INDEX_MCP_LOG_DIR": "/absolute/path/to/.index-mcp/logs",
-        "INDEX_MCP_REMOTE_SERVERS": "[]"
+        "INDEX_MCP_LOG_CONSOLE": "false",
+        "INDEX_MCP_BUDGET_TOKENS": "3000"
       }
     }
   }
@@ -176,9 +225,12 @@ env = {
 }
 ```
 
+Set `INDEX_MCP_RUNTIME = "node"` in either configuration if you prefer the TypeScript server.
+
 ### Local backend options
 
-`start.sh` launches a lightweight HTTP/SSE backend implemented in `src/local-backend/server.ts`. Configure it with environment variables before invoking the script:
+When `INDEX_MCP_RUNTIME=node`, `start.sh` launches a lightweight HTTP/SSE backend implemented in
+`src/local-backend/server.ts`. Configure it with environment variables before invoking the script:
 
 - `LOCAL_BACKEND_HOST` (default `127.0.0.1`)
 - `LOCAL_BACKEND_PORT` (default `8765`)
@@ -216,5 +268,5 @@ On startup the server opens SSE channels to each remote. Connection failures ret
 ## Additional resources
 
 - `docs/` – Reference material for Codex CLI integration and MCP best practices.
+- `docs/rust-migration.md` – Status tracker for the ongoing Rust server migration.
 - `agents.md` – High-level guidance for running the MCP server alongside Codex.
-

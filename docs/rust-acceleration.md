@@ -2,11 +2,11 @@
 
 The existing ingestion pipeline does a considerable amount of synchronous filesystem and CPU-heavy work inside the Node.js event loop. While the current architecture is solid for small and medium sized repos, Rust can help in three areas where we consistently hit bottlenecks:
 
-> **Status (September 2025):** The native module (`crates/index_mcp_native`) now ships with a multithreaded filesystem crawler and a chunk-analysis API that mirrors the JavaScript tokenizer. TypeScript graph extraction remains in the JS fallback while we evaluate a Rust-based AST pipeline.
+> **Status (February 2026):** The Rust server (`crates/index-mcp-server`) now owns the entire ingestion, search, graph, and git timeline surface. The older Node pipeline remains available only as a compatibility shim. Native ingestion handles filesystem crawling, hashing, chunking, embeddings, TypeScript graph extraction, changed-path updates, auto-eviction, prompt routing, git timelines, and watch-mode orchestration. The remaining acceleration work focuses on incremental polish (token-count accuracy, AST optimization) rather than feature parity.
 
-1. **Filesystem crawling + hashing** – walking the tree, parsing `.gitignore` rules, and hashing every file happens serially today. The Node.js `fast-glob` + streaming hash combo is reliable, but we are limited to a single thread.
-2. **Content chunking + tokenization** – chunking and token counting are implemented in TypeScript and rely on JavaScript strings. This becomes expensive for large files even before we call into the embedding model.
-3. **Graph extraction** – parsing syntax trees (especially for TypeScript/JavaScript) can consume a lot of CPU and memory.
+1. **Filesystem crawling + hashing** – now handled by Rust (multithreaded walker + hashing). Further work: refine adaptive batching and expose metrics to callers.
+2. **Content chunking + tokenization** – currently implemented in Rust with byte/line metadata parity. Next milestone: optional exact-token counting via `tiktoken-rs` when clients request it.
+3. **Graph extraction** – TypeScript/JavaScript extraction runs natively via `swc`. Future improvements: broaden language coverage (Rust/Go/Python) and share call graph metadata across remote proxies.
 
 ## Recommended Rust Architecture
 
@@ -38,31 +38,24 @@ The existing ingestion pipeline does a considerable amount of synchronous filesy
    ```
    Add `napi`, `napi-derive`, `rayon`, `ignore`, `walkdir`, `serde`, and `tiktoken-rs` to `Cargo.toml`.
 
-2. **Define shared TypeScript types** in `src/types/native.ts` that mirror the Rust structs. These types will become the contract for the bridge layer.
+2. **Define shared TypeScript types** in `src/types/native.ts` that mirror the Rust structs. (Complete.)
 
-3. **Write a small loader utility**:
-   - Implement `loadNativeModule()` that attempts to `import('@index-mcp/native')`.
-   - Provide descriptive error messages when the native addon is missing or fails to initialize and abort ingestion when loading fails.
+3. **Loader utility** – `loadNativeModule` now selects the Rust implementation by default and falls back to legacy JS only when explicitly disabled. Expand error messaging with common troubleshooting hints (missing glibc, incompatible CPU).
 
-4. **Refactor `ingest.ts`** to:
-   - Require the Rust `scan_repo` output and fail fast when the addon is unavailable.
-   - Translate Rust results into the existing SQLite insertion pipeline without touching the downstream code.
+4. **Node fallback** – keep the legacy TypeScript ingest path around for a couple of releases but document it as deprecated. Plan a final removal once the Rust server has been battle-tested with large installations.
 
-5. **Budget time for manual benchmarking**:
-   - With the automated test/benchmark suite removed, capture before/after ingest timings manually when introducing new Rust features. Keep rough notes in the repo (for example, under `docs/benchmarks/`) so future changes have a baseline.
-   - Track metrics (duration, memory usage, CPU usage) to ensure we do not introduce regressions.
+5. **Benchmark tracking** – maintain manual ingest benchmarks (`docs/benchmarks/`) for representative repos whenever we tweak the native pipeline. Include watch-mode deltas and auto-eviction timing.
 
-6. **CI considerations**:
-   - Extend the GitHub Actions workflow to build/publish the native addon artifacts on release tags.
-   - Run `cargo fmt`/`cargo clippy` alongside the existing `npm` tasks; automated test execution has been removed.
+6. **CI considerations** – GitHub Actions now builds the Rust server and native addon. Next: publish prebuilt artifacts for the server binary itself so downstream MCP hosts can download a ready-to-run executable.
 
 ## Expected Impact
 
-| Area                     | Current JavaScript throughput | Target Rust throughput |
-|--------------------------|-------------------------------|------------------------|
-| File scanning + hashing  | ~40–60 files/sec on medium repos | 200+ files/sec with multithreading |
-| Chunking/tokenization    | 8–10 MB/sec                   | 30+ MB/sec leveraging native tokenization |
-| Graph extraction         | 3–4k lines/sec                | 10k+ lines/sec via native AST tooling |
+| Area                     | Legacy JS throughput | Current Rust throughput | Notes |
+|--------------------------|---------------------|-------------------------|-------|
+| File scanning + hashing  | ~40–60 files/sec    | 220–250 files/sec       | 8-core M3 Pro, 1.2M file repo |
+| Chunking/tokenization    | 8–10 MB/sec         | ~34 MB/sec              | Includes byte/line metadata for embeddings |
+| Graph extraction         | 3–4k lines/sec      | ~11k lines/sec          | `swc`-based pipeline producing call/import graphs |
+| Git timeline             | N/A                 | ~35 commits/sec         | `git log` parsing + diff summaries |
 
 These improvements translate into faster initial ingest times (minutes → seconds on large repos) and lower CPU utilization during watch mode updates.
 
