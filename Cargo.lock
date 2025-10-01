@@ -1535,6 +1535,7 @@ dependencies = [
  "fastembed",
  "globset",
  "hex",
+ "ignore",
  "indexmap",
  "notify",
  "once_cell",

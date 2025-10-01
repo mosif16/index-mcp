@@ -137,7 +137,7 @@ fn perform_semantic_search(
         absolute_root.join(database_name.unwrap_or_else(|| DEFAULT_DB_FILENAME.to_string()));
     let db_path_string = db_path.to_string_lossy().to_string();
 
-    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
         .map_err(SemanticSearchError::Sqlite)?;
 
     let total_chunks: u64 = conn
@@ -343,15 +343,10 @@ fn blob_to_vec(blob: &[u8]) -> Vec<f32> {
 
 fn create_embedder(model_name: &str) -> Result<TextEmbedding, SemanticSearchError> {
     let name = model_name.trim();
-    let options = if name.eq_ignore_ascii_case(DEFAULT_EMBEDDING_MODEL) {
-        TextInitOptions::default()
-    } else {
-        let parsed = EmbeddingModel::from_str(name).map_err(|error| {
-            SemanticSearchError::Embedding(format!("Unknown embedding model '{name}': {error}"))
-        })?;
-        TextInitOptions::new(parsed)
-    }
-    .with_show_download_progress(false);
+    let parsed = EmbeddingModel::from_str(name).map_err(|error| {
+        SemanticSearchError::Embedding(format!("Unknown embedding model '{name}': {error}"))
+    })?;
+    let options = TextInitOptions::new(parsed).with_show_download_progress(false);
 
     TextEmbedding::try_new(options)
         .map_err(|error| SemanticSearchError::Embedding(error.to_string()))

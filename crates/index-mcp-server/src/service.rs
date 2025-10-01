@@ -25,9 +25,7 @@ use crate::search::{
 
 use rmcp::{
     handler::server::{
-        router::prompt::PromptRouter,
-        router::tool::ToolRouter,
-        wrapper::Parameters,
+        router::prompt::PromptRouter, router::tool::ToolRouter, wrapper::Parameters,
     },
     model::{
         CallToolResult, Content, GetPromptRequestParam, GetPromptResult, Implementation,

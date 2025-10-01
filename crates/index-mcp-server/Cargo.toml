@@ -34,6 +34,7 @@ once_cell = { workspace = true }
 url = { workspace = true }
 notify = { workspace = true }
 reqwest = { workspace = true }
+ignore = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

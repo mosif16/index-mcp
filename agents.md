@@ -1,3 +1,5 @@
+Keep the rust-migration.md updated
+
 # Codex MCP Best Practices
 
 Transport

@@ -5,15 +5,21 @@ use std::sync::Arc;
 
 use once_cell::sync::Lazy;
 use regex::Regex;
-use rmcp::model::{CallToolRequestParam, CallToolResult, ClientResult, JsonObject, ServerNotification, ServerRequest, Tool};
-use rmcp::service::{self, serve_client, NotificationContext, Peer, RequestContext, RunningService, Service, ServiceError};
+use rmcp::model::{
+    CallToolRequestParam, CallToolResult, ClientResult, JsonObject, ServerNotification,
+    ServerRequest, Tool,
+};
+use rmcp::service::{
+    self, serve_client, NotificationContext, Peer, RequestContext, RunningService, Service,
+    ServiceError,
+};
 use rmcp::transport::SseClientTransport;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use rmcp::RoleClient;
 use rmcp::ErrorData as McpError;
+use rmcp::RoleClient;
 
 static WHITESPACE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
 
@@ -308,9 +314,13 @@ impl Service<RoleClient> for RemoteClientHandler {
         &self,
         _request: ServerRequest,
         _context: RequestContext<RoleClient>,
-    ) -> impl Future<Output = Result<ClientResult, McpError>> + Send + '_
-    {
-        async { Err(McpError::internal_error("Client does not handle requests", None)) }
+    ) -> impl Future<Output = Result<ClientResult, McpError>> + Send + '_ {
+        async {
+            Err(McpError::internal_error(
+                "Client does not handle requests",
+                None,
+            ))
+        }
     }
 
     fn handle_notification(

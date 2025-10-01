@@ -12,8 +12,9 @@ with a native binary that reuses the existing SQLite index and native ingestion 
   SDK (git dependency on `main`).
 - Native tooling matches the Node implementation for first-party features:
   - `ingest_codebase` with filesystem scanning, SQLite schema upkeep, ingestion history tracking,
-    chunk embeddings, TypeScript graph extraction, changed-path ingestion, and auto-eviction (80 %
-    target, least-used chunks/nodes, runtime stats).
+    chunk embeddings, TypeScript graph extraction, changed-path ingestion, auto-eviction (80 %
+    target, least-used chunks/nodes, runtime stats), and `.gitignore` awareness via the shared
+    `ignore` crate walker (respects repo-local, global, and exclude files by default).
   - `semantic_search`, `context_bundle`, and `code_lookup` (search + bundle modes) with matching
     response envelopes.
   - `graph_neighbors` (GraphRAG exploration) and `repository_timeline` (git history summaries)
@@ -28,6 +29,9 @@ with a native binary that reuses the existing SQLite index and native ingestion 
 - Remote MCP proxy routing (`INDEX_MCP_REMOTE_SERVERS`) now works end-to-end via the new
   `remote_proxy` module. It bootstraps remote tool descriptors, establishes SSE connections over
   `reqwest`, forwards tool calls, and recovers cleanly on transport errors.
+- A dedicated debug harness lives at `cargo run --bin ingest_debug`, exercising ingest, semantic
+  search, code lookup (search + bundle), context bundles, graph neighbors, index status, and git
+  timeline tooling in one pass with optional environment-variable overrides.
 
 ## Progress Snapshot
 
@@ -68,6 +72,9 @@ with a native binary that reuses the existing SQLite index and native ingestion 
 - Watcher ingests reuse the changed-path fast path, so long-running agents can keep the database
   fresh without leaving Node in the loop.
 - Git interactions (`git rev-parse`, `git log`) run inside blocking tasks to avoid stalling the async runtime.
+- Embedding initialisation now routes every requested model name (including the default
+  `Xenova/bge-small-en-v1.5`) through `fastembed::EmbeddingModel::from_str`, ensuring the exact
+  model descriptor is loaded regardless of `TextInitOptions` defaults.
 - Keep both implementations building in CI so schema or protocol changes are detected early.
 
 ## Usage
@@ -75,6 +82,7 @@ with a native binary that reuses the existing SQLite index and native ingestion 
 ```bash
 cargo run -p index-mcp-server          # Launch Rust server over stdio
 cargo check -p index-mcp-server        # Compile and lint without running
+cargo run --bin ingest_debug            # Smoke-test all Rust tools end-to-end (env overrides available)
 ```
 
 Point MCP clients at the compiled binary exactly like the Node server. The instructions banner is

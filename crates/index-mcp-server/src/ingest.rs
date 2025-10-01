@@ -6,6 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use ignore::WalkBuilder;
 use rmcp::schemars::{self, JsonSchema};
 use rusqlite::{params, Connection, OpenFlags, Transaction};
 use serde::{Deserialize, Serialize};
@@ -13,7 +14,6 @@ use serde_json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
-use walkdir::WalkDir;
 
 use crate::{
     graph::{extract_graph, GraphExtraction},
@@ -785,14 +785,10 @@ fn scan_workspace(
                 continue;
             }
 
-            let mut walker = WalkDir::new(&entry.absolute).follow_links(false);
-            if !entry.is_dir {
-                walker = walker.max_depth(0);
-            }
-
+            let walker = build_ignore_walk(&entry.absolute, entry.is_dir);
             collect_files_from_walk(
                 root,
-                walker.into_iter(),
+                walker,
                 include_globs.as_ref(),
                 exclude_globs.as_ref(),
                 store_file_content,
@@ -802,10 +798,10 @@ fn scan_workspace(
             );
         }
     } else {
-        let walker = WalkDir::new(root).follow_links(false);
+        let walker = build_ignore_walk(root, true);
         collect_files_from_walk(
             root,
-            walker.into_iter(),
+            walker,
             include_globs.as_ref(),
             exclude_globs.as_ref(),
             store_file_content,
@@ -818,9 +814,22 @@ fn scan_workspace(
     Ok(ScanOutcome { files, skipped })
 }
 
+fn build_ignore_walk(path: &Path, is_dir: bool) -> ignore::Walk {
+    let mut builder = WalkBuilder::new(path);
+    builder.follow_links(false);
+    builder.hidden(false);
+    builder.git_ignore(true);
+    builder.git_global(true);
+    builder.git_exclude(true);
+    if !is_dir {
+        builder.max_depth(Some(1));
+    }
+    builder.build()
+}
+
 fn collect_files_from_walk(
     root: &Path,
-    walker: walkdir::IntoIter,
+    walker: ignore::Walk,
     include_globs: Option<&GlobSet>,
     exclude_globs: Option<&GlobSet>,
     store_file_content: bool,
@@ -832,13 +841,8 @@ fn collect_files_from_walk(
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                let path = error
-                    .path()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| root.to_path_buf());
-                let relative = relative_path(root, &path);
                 skipped.push(SkippedFile {
-                    path: relative,
+                    path: root.to_string_lossy().to_string(),
                     reason: "walk_error".to_string(),
                     size: None,
                     message: Some(error.to_string()),
@@ -847,14 +851,19 @@ fn collect_files_from_walk(
             }
         };
 
-        if entry.file_type().is_dir() {
+        if entry
+            .file_type()
+            .map(|file_type| file_type.is_dir())
+            .unwrap_or(false)
+        {
             continue;
         }
 
-        let relative_path_buf = entry
-            .path()
+        let absolute_path = entry.path().to_path_buf();
+        let relative_path_buf = absolute_path
             .strip_prefix(root)
-            .map_or_else(|_| entry.path().to_path_buf(), PathBuf::from);
+            .map(|relative| relative.to_path_buf())
+            .unwrap_or_else(|_| absolute_path.clone());
         let relative_path = normalize_path(relative_path_buf.to_string_lossy().as_ref());
 
         let include_ok = include_globs
@@ -897,7 +906,7 @@ fn collect_files_from_walk(
             }
         }
 
-        let bytes = match fs::read(entry.path()) {
+        let bytes = match fs::read(&absolute_path) {
             Ok(bytes) => bytes,
             Err(error) => {
                 skipped.push(SkippedFile {
@@ -1144,15 +1153,10 @@ fn upsert_meta(
 
 fn create_embedder(config: &EmbeddingConfig) -> Result<TextEmbedding, IngestError> {
     let model_name = config.model.trim();
-    let options = if model_name.eq_ignore_ascii_case(DEFAULT_EMBEDDING_MODEL) {
-        TextInitOptions::default()
-    } else {
-        let parsed = EmbeddingModel::from_str(model_name).map_err(|error| {
-            IngestError::Embedding(format!("Unknown embedding model '{model_name}': {error}"))
-        })?;
-        TextInitOptions::new(parsed)
-    }
-    .with_show_download_progress(false);
+    let parsed = EmbeddingModel::from_str(model_name).map_err(|error| {
+        IngestError::Embedding(format!("Unknown embedding model '{model_name}': {error}"))
+    })?;
+    let options = TextInitOptions::new(parsed).with_show_download_progress(false);
 
     TextEmbedding::try_new(options).map_err(|error| IngestError::Embedding(error.to_string()))
 }
@@ -1192,13 +1196,6 @@ fn get_current_commit_sha(root: &Path) -> Result<String, std::io::Error> {
 
 fn normalize_path(path: &str) -> String {
     path.replace("\\", "/")
-}
-
-fn relative_path(root: &Path, path: &Path) -> String {
-    match path.strip_prefix(root) {
-        Ok(relative) => normalize_path(relative.to_string_lossy().as_ref()),
-        Err(_) => normalize_path(path.to_string_lossy().as_ref()),
-    }
 }
 
 fn file_modified_to_ms(metadata: &fs::Metadata) -> i64 {
