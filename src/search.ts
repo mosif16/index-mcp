@@ -179,7 +179,7 @@ export async function semanticSearch(options: SemanticSearchOptions): Promise<Se
   const dbPath = path.join(absoluteRoot, options.databaseName ?? DEFAULT_DB_FILENAME);
   const limit = normalizeResultLimit(options.limit);
 
-  const db = new Database(dbPath, { readonly: true });
+  const db = new Database(dbPath);
   try {
     const totalChunkRow = db
       .prepare('SELECT COUNT(*) as count FROM file_chunks')
@@ -357,6 +357,15 @@ export async function semanticSearch(options: SemanticSearchOptions): Promise<Se
       if (!match.language) {
         match.language = detectLanguageFromPath(match.path);
       }
+    }
+
+    const updateHitsStmt = db.prepare(
+      'UPDATE file_chunks SET hits = COALESCE(hits, 0) + 1 WHERE id = ?'
+    );
+    
+    for (const match of results) {
+      const chunkId = `${match.path}:${match.chunkIndex}`;
+      updateHitsStmt.run(chunkId);
     }
 
     return {

@@ -1,8 +1,12 @@
 import Database from 'better-sqlite3';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 
 import { DEFAULT_DB_FILENAME } from './constants.js';
+
+const execFileAsync = promisify(execFile);
 
 export interface IndexStatusOptions {
   root: string;
@@ -32,6 +36,10 @@ export interface IndexStatusResult {
   totalGraphEdges: number;
   latestIngestion: IndexStatusIngestion | null;
   recentIngestions: IndexStatusIngestion[];
+  commitSha: string | null;
+  indexedAt: number | null;
+  currentCommitSha: string | null;
+  isStale: boolean;
 }
 
 interface RawIngestionRow {
@@ -51,6 +59,18 @@ function mapIngestionRow(row: RawIngestionRow): IndexStatusIngestion {
     ...row,
     durationMs: row.finishedAt - row.startedAt
   };
+}
+
+async function getCurrentGitCommitSha(root: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], { 
+      cwd: root,
+      maxBuffer: 1024 * 1024
+    });
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
 }
 
 export async function getIndexStatus(options: IndexStatusOptions): Promise<IndexStatusResult> {
@@ -80,6 +100,7 @@ export async function getIndexStatus(options: IndexStatusOptions): Promise<Index
   }
 
   if (!databaseExists) {
+    const currentCommitSha = await getCurrentGitCommitSha(absoluteRoot);
     return {
       databasePath: dbPath,
       databaseExists: false,
@@ -90,9 +111,15 @@ export async function getIndexStatus(options: IndexStatusOptions): Promise<Index
       totalGraphNodes: 0,
       totalGraphEdges: 0,
       latestIngestion: null,
-      recentIngestions: []
+      recentIngestions: [],
+      commitSha: null,
+      indexedAt: null,
+      currentCommitSha,
+      isStale: true
     };
   }
+
+  const currentCommitSha = await getCurrentGitCommitSha(absoluteRoot);
 
   const db = new Database(dbPath, { readonly: true, fileMustExist: true });
   try {
@@ -108,6 +135,14 @@ export async function getIndexStatus(options: IndexStatusOptions): Promise<Index
     const embeddingRows = db
       .prepare('SELECT DISTINCT embedding_model as embeddingModel FROM file_chunks ORDER BY embedding_model ASC')
       .all() as { embeddingModel: string }[];
+
+    const commitShaRow = db
+      .prepare('SELECT value FROM meta WHERE key = ?')
+      .get('commit_sha') as { value: string } | undefined;
+    
+    const indexedAtRow = db
+      .prepare('SELECT value FROM meta WHERE key = ?')
+      .get('indexed_at') as { value: string } | undefined;
 
     const historyLimit = options.historyLimit ?? DEFAULT_HISTORY_LIMIT;
     const ingestionRows = historyLimit > 0
@@ -130,6 +165,10 @@ export async function getIndexStatus(options: IndexStatusOptions): Promise<Index
 
     const ingestions = ingestionRows.map(mapIngestionRow);
 
+    const storedCommitSha = commitShaRow?.value || null;
+    const indexedAt = indexedAtRow?.value ? parseInt(indexedAtRow.value, 10) : null;
+    const isStale = currentCommitSha !== null && storedCommitSha !== null && currentCommitSha !== storedCommitSha;
+
     return {
       databasePath: dbPath,
       databaseExists: true,
@@ -140,7 +179,11 @@ export async function getIndexStatus(options: IndexStatusOptions): Promise<Index
       totalGraphNodes: totalGraphNodesRow?.count ?? 0,
       totalGraphEdges: totalGraphEdgesRow?.count ?? 0,
       latestIngestion: ingestions[0] ?? null,
-      recentIngestions: ingestions
+      recentIngestions: ingestions,
+      commitSha: storedCommitSha,
+      indexedAt,
+      currentCommitSha,
+      isStale
     };
   } finally {
     db.close();

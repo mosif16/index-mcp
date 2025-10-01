@@ -5,6 +5,8 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 
 import { embedTexts, float32ArrayToBuffer, getDefaultEmbeddingModel } from './embedding.js';
 import { extractGraphMetadata } from './graph.js';
@@ -17,6 +19,8 @@ import type {
   NativeScanResult,
   NativeSkippedFile
 } from './types/native.js';
+
+const execFileAsync = promisify(execFile);
 const DEFAULT_MAX_FILE_SIZE_BYTES = 8 * 1024 * 1024; // 8 MiB
 
 const DEFAULT_CHUNK_SIZE_TOKENS = 256;
@@ -83,6 +87,8 @@ export interface IngestOptions {
   embedding?: EmbeddingOptions;
   graph?: GraphOptions;
   paths?: string[];
+  autoEvict?: boolean;
+  maxDatabaseSizeBytes?: number;
 }
 
 export interface SkippedFile {
@@ -104,6 +110,10 @@ export interface IngestResult {
   embeddingModel: string | null;
   graphNodeCount: number;
   graphEdgeCount: number;
+  evicted?: {
+    chunks: number;
+    nodes: number;
+  };
 }
 
 interface FileRow {
@@ -329,6 +339,11 @@ function ensureSchema(db: DatabaseInstance) {
       skipped_count INTEGER NOT NULL,
       deleted_count INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS files_hash_idx ON files(hash);
     CREATE INDEX IF NOT EXISTS file_chunks_path_idx ON file_chunks(path);
     CREATE TABLE IF NOT EXISTS code_graph_nodes (
@@ -359,6 +374,7 @@ function ensureSchema(db: DatabaseInstance) {
   `);
 
   ensureFileChunkMetadataColumns(db);
+  ensureHitsColumns(db);
 }
 
 function ensureFileChunkMetadataColumns(db: DatabaseInstance): void {
@@ -376,6 +392,34 @@ function ensureFileChunkMetadataColumns(db: DatabaseInstance): void {
     if (!columnNames.has(migration.name)) {
       db.prepare(migration.statement).run();
     }
+  }
+}
+
+function ensureHitsColumns(db: DatabaseInstance): void {
+  const chunkColumns = db.prepare("PRAGMA table_info('file_chunks')").all() as { name: string }[];
+  const chunkColumnNames = new Set(chunkColumns.map((column) => column.name));
+  
+  if (!chunkColumnNames.has('hits')) {
+    db.prepare('ALTER TABLE file_chunks ADD COLUMN hits INTEGER DEFAULT 0').run();
+  }
+
+  const nodeColumns = db.prepare("PRAGMA table_info('code_graph_nodes')").all() as { name: string }[];
+  const nodeColumnNames = new Set(nodeColumns.map((column) => column.name));
+  
+  if (!nodeColumnNames.has('hits')) {
+    db.prepare('ALTER TABLE code_graph_nodes ADD COLUMN hits INTEGER DEFAULT 0').run();
+  }
+}
+
+async function getCurrentGitCommitSha(root: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], { 
+      cwd: root,
+      maxBuffer: 1024 * 1024
+    });
+    return stdout.trim() || null;
+  } catch {
+    return null;
   }
 }
 
@@ -1016,8 +1060,18 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
        VALUES (:id, :root, :started, :finished, :fileCount, :skippedCount, :deletedCount)`
     );
 
+    const upsertMetaStmt = db.prepare(
+      `INSERT INTO meta (key, value, updated_at)
+       VALUES (@key, @value, @updatedAt)
+       ON CONFLICT(key) DO UPDATE SET
+         value = excluded.value,
+         updated_at = excluded.updated_at`
+    );
+
     const ingestionId = crypto.randomUUID();
     const endTime = Date.now();
+    
+    const currentCommitSha = await getCurrentGitCommitSha(absoluteRoot);
 
     let graphNodeCount = 0;
     let graphEdgeCount = 0;
@@ -1069,11 +1123,49 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
         skippedCount: skipped.length,
         deletedCount: deletedPaths.length
       });
+      
+      if (currentCommitSha) {
+        upsertMetaStmt.run({
+          key: 'commit_sha',
+          value: currentCommitSha,
+          updatedAt: endTime
+        });
+      }
+      
+      upsertMetaStmt.run({
+        key: 'indexed_at',
+        value: endTime.toString(),
+        updatedAt: endTime
+      });
     });
 
     transaction();
 
-    const dbStats = await fs.stat(dbPath);
+    db.close();
+
+    let dbStats = await fs.stat(dbPath);
+    let evictionResult: { chunks: number; nodes: number } | undefined;
+
+    // Check if eviction is needed
+    const autoEvict = options.autoEvict ?? false;
+    const maxDatabaseSizeBytes = options.maxDatabaseSizeBytes ?? 150 * 1024 * 1024; // 150 MB default
+
+    if (autoEvict && dbStats.size > maxDatabaseSizeBytes) {
+      const { evictLeastUsed } = await import('./eviction.js');
+      const evicted = await evictLeastUsed({
+        root: absoluteRoot,
+        databaseName: databaseName,
+        maxSizeBytes: maxDatabaseSizeBytes
+      });
+      
+      if (evicted.wasEvictionNeeded) {
+        evictionResult = {
+          chunks: evicted.evictedChunks,
+          nodes: evicted.evictedNodes
+        };
+        dbStats = await fs.stat(dbPath);
+      }
+    }
 
     return {
       root: absoluteRoot,
@@ -1086,9 +1178,11 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
       embeddedChunkCount,
       embeddingModel: embeddingConfig.enabled ? embeddingConfig.model : null,
       graphNodeCount,
-      graphEdgeCount
+      graphEdgeCount,
+      evicted: evictionResult
     };
-  } finally {
+  } catch (error) {
     db.close();
+    throw error;
   }
 }

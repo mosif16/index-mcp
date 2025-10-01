@@ -6,7 +6,7 @@ import type { ReadStream, WriteStream } from 'node:tty';
 import { parseArgs } from 'node:util';
 import { z } from 'zod';
 
-import { getEnvironmentDiagnostics, getModelCacheConfiguration } from './environment.js';
+import { getEnvironmentDiagnostics, getModelCacheConfiguration, getBudgetTokens } from './environment.js';
 import { ingestCodebase } from './ingest.js';
 import { semanticSearch } from './search.js';
 import { graphNeighbors, type GraphNodeDescriptor } from './graph-query.js';
@@ -167,6 +167,15 @@ const ingestToolJsonSchema = {
       type: 'array',
       description: 'Restrict ingest to specific relative paths (aliases: target_paths, changed_paths).',
       items: { type: 'string' }
+    },
+    autoEvict: {
+      type: 'boolean',
+      description: 'Automatically evict least-used data if database exceeds maxDatabaseSizeBytes. Defaults to false.'
+    },
+    maxDatabaseSizeBytes: {
+      type: 'integer',
+      description: 'Maximum database size before eviction (aliases: max_db_size). Defaults to 150 MB.',
+      minimum: 1
     }
   },
   required: [],
@@ -247,6 +256,16 @@ const ingestToolSchema = z
     paths: z
       .array(z.string())
       .describe('Restrict ingest to specific relative paths (aliases: target_paths, changed_paths).')
+      .optional(),
+    autoEvict: z
+      .boolean()
+      .describe('Automatically evict least-used data if database exceeds maxDatabaseSizeBytes. Defaults to false.')
+      .optional(),
+    maxDatabaseSizeBytes: z
+      .number()
+      .int()
+      .positive()
+      .describe('Maximum database size before eviction (aliases: max_db_size). Defaults to 150 MB.')
       .optional()
   })
   .strict();
@@ -268,7 +287,13 @@ const ingestToolOutputShape = {
   embeddedChunkCount: z.number().int().min(0),
   embeddingModel: z.string().nullable(),
   graphNodeCount: z.number().int().min(0),
-  graphEdgeCount: z.number().int().min(0)
+  graphEdgeCount: z.number().int().min(0),
+  evicted: z
+    .object({
+      chunks: z.number().int().min(0),
+      nodes: z.number().int().min(0)
+    })
+    .optional()
 } as const;
 const ingestToolOutputSchema = z.object(ingestToolOutputShape);
 
@@ -489,6 +514,11 @@ const contextBundleJsonSchema = {
       description: 'Maximum related edges to include per direction (aliases: neighbor_limit, edge_limit). Defaults to 12, max 50.',
       minimum: 0,
       maximum: 50
+    },
+    budgetTokens: {
+      type: 'integer',
+      description: 'Token budget for content trimming (alias: budget, token_budget). Defaults to INDEX_MCP_BUDGET_TOKENS environment variable or 3000.',
+      minimum: 1
     }
   },
   required: ['file'],
@@ -529,7 +559,13 @@ const contextBundleInputSchema = z
       .min(0)
       .max(50)
       .optional()
-      .describe('Maximum related edges per direction (defaults to 12, caps at 50).')
+      .describe('Maximum related edges per direction (defaults to 12, caps at 50).'),
+    budgetTokens: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe('Token budget for content trimming (defaults to INDEX_MCP_BUDGET_TOKENS or 3000).')
   })
   .strict();
 
@@ -1037,7 +1073,11 @@ const indexStatusOutputShape = {
   totalGraphNodes: z.number(),
   totalGraphEdges: z.number(),
   latestIngestion: indexStatusIngestionSchema.nullable(),
-  recentIngestions: z.array(indexStatusIngestionSchema)
+  recentIngestions: z.array(indexStatusIngestionSchema),
+  commitSha: z.string().nullable(),
+  indexedAt: z.number().nullable(),
+  currentCommitSha: z.string().nullable(),
+  isStale: z.boolean()
 } as const;
 
 const indexStatusOutputSchema = z.object(indexStatusOutputShape);
@@ -1484,7 +1524,11 @@ async function main() {
         const parsedInput = contextBundleInputSchema.parse(normalizedInput);
         const context = createRootResolutionContext(extra);
         const resolvedRoot = resolveRootPath(parsedInput.root, context);
-        const bundleInput = { ...parsedInput, root: resolvedRoot };
+        
+        // Apply budget tokens from environment if not specified
+        const budgetTokens = parsedInput.budgetTokens ?? getBudgetTokens();
+        
+        const bundleInput = { ...parsedInput, root: resolvedRoot, budgetTokens };
         const result = contextBundleOutputSchema.parse(await getContextBundle(bundleInput));
 
         const summaryPieces: string[] = [
