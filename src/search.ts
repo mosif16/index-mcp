@@ -179,7 +179,7 @@ export async function semanticSearch(options: SemanticSearchOptions): Promise<Se
   const dbPath = path.join(absoluteRoot, options.databaseName ?? DEFAULT_DB_FILENAME);
   const limit = normalizeResultLimit(options.limit);
 
-  const db = new Database(dbPath);
+  const db = new Database(dbPath, { fileMustExist: true });
   try {
     const totalChunkRow = db
       .prepare('SELECT COUNT(*) as count FROM file_chunks')
@@ -305,6 +305,7 @@ export async function semanticSearch(options: SemanticSearchOptions): Promise<Se
     const [queryEmbedding] = await embedTexts([trimmedQuery], { model: requestedModel });
 
     const topMatches: SemanticSearchMatch[] = [];
+    const chunkIdsByMatch = new WeakMap<SemanticSearchMatch, string>();
     let evaluatedChunks = 0;
 
     for (const row of chunkStmt.iterate(requestedModel) as Iterable<ChunkRow>) {
@@ -312,26 +313,25 @@ export async function semanticSearch(options: SemanticSearchOptions): Promise<Se
       const chunkEmbedding = bufferToFloat32Array(row.embedding);
       const score = dotProduct(queryEmbedding, chunkEmbedding);
       const normalizedScore = Math.max(0, Math.min(1, (score + 1) / 2));
-      insertIntoTopMatches(
-        topMatches,
-        {
-          path: row.path,
-          chunkIndex: row.chunkIndex,
-          content: row.content,
-          score,
-          normalizedScore,
-          language: detectLanguageFromPath(row.path),
-          classification: classifySnippetText(row.content),
-          embeddingModel: row.embeddingModel,
-          byteStart: row.byteStart ?? null,
-          byteEnd: row.byteEnd ?? null,
-          lineStart: row.lineStart ?? null,
-          lineEnd: row.lineEnd ?? null,
-          contextBefore: null,
-          contextAfter: null
-        },
-        limit
-      );
+      const matchCandidate: SemanticSearchMatch = {
+        path: row.path,
+        chunkIndex: row.chunkIndex,
+        content: row.content,
+        score,
+        normalizedScore,
+        language: detectLanguageFromPath(row.path),
+        classification: classifySnippetText(row.content),
+        embeddingModel: row.embeddingModel,
+        byteStart: row.byteStart ?? null,
+        byteEnd: row.byteEnd ?? null,
+        lineStart: row.lineStart ?? null,
+        lineEnd: row.lineEnd ?? null,
+        contextBefore: null,
+        contextAfter: null
+      };
+
+      insertIntoTopMatches(topMatches, matchCandidate, limit);
+      chunkIdsByMatch.set(matchCandidate, row.id);
     }
 
     const results = limit > 0 ? [...topMatches].reverse() : [];
@@ -364,8 +364,10 @@ export async function semanticSearch(options: SemanticSearchOptions): Promise<Se
     );
     
     for (const match of results) {
-      const chunkId = `${match.path}:${match.chunkIndex}`;
-      updateHitsStmt.run(chunkId);
+      const chunkId = chunkIdsByMatch.get(match);
+      if (chunkId) {
+        updateHitsStmt.run(chunkId);
+      }
     }
 
     return {
