@@ -56,3 +56,4 @@ temp/
 *.swo
 *.orig
 .fastembed_cache
+full.json

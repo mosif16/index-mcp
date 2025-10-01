@@ -20,7 +20,7 @@ if [[ "$RUNTIME" == "rust" ]]; then
     EXTRA_ARGS=()
   fi
 
-  CMD=("$CARGO_BIN" run --manifest-path "$SCRIPT_DIR/Cargo.toml" -p index-mcp-server)
+  CMD=("$CARGO_BIN" run --manifest-path "$SCRIPT_DIR/Cargo.toml" -p index-mcp-server --bin index-mcp-server)
   case "$PROFILE" in
     release)
       CMD+=(--release)

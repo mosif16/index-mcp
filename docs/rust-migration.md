@@ -32,6 +32,14 @@ with a native binary that reuses the existing SQLite index and native ingestion 
 - A dedicated debug harness lives at `cargo run --bin ingest_debug`, exercising ingest, semantic
   search, code lookup (search + bundle), context bundles, graph neighbors, index status, and git
   timeline tooling in one pass with optional environment-variable overrides.
+  - The binary now uses a structured CLI (`--section`/`--skip-section`, `--json-report`,
+    `--log-format text|json`, limits for snippets/neighbors/tokens) so it can double as a CI smoke
+    test or targeted troubleshooting tool.
+  - Summaries include per-section timings and optional JSON dumps (`--verbose`), making it easier
+    to capture diagnostics without re-running the Node server.
+  - Repository timelines now persist commit metadata and diffs into `.mcp-index.sqlite`; default
+    responses return lightweight pointers plus previews so the LLM context stays small. Use the new
+    `repository_timeline_entry` tool to retrieve full cached diffs on demand.
 
 ## Progress Snapshot
 

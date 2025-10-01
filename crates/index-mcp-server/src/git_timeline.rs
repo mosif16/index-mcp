@@ -1,15 +1,21 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use once_cell::sync::Lazy;
 use regex::Regex;
 use rmcp::schemars::{self, JsonSchema};
+use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::index_status::DEFAULT_DB_FILENAME;
+
 const GIT_LOG_FIELD_SEPARATOR: &str = "\u{001f}";
 const GIT_LOG_RECORD_SEPARATOR: &str = "\u{001e}";
+const DIFF_PREVIEW_MAX_LINES: usize = 200;
+const DIFF_PREVIEW_MAX_CHARS: usize = 4_000;
 
 static RELATIVE_SINCE_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^(\d+)\s*(d|w|m|y)$").expect("valid regex"));
@@ -26,6 +32,8 @@ static PR_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
 pub struct RepositoryTimelineParams {
     #[serde(default)]
     pub root: Option<String>,
+    #[serde(default)]
+    pub database_name: Option<String>,
     #[serde(default)]
     pub branch: Option<String>,
     #[serde(default)]
@@ -44,7 +52,7 @@ pub struct RepositoryTimelineParams {
     pub diff_pattern: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryTimelineFileChange {
     pub path: String,
@@ -53,7 +61,7 @@ pub struct RepositoryTimelineFileChange {
     pub net: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryTimelineTopFile {
     pub path: String,
@@ -62,7 +70,7 @@ pub struct RepositoryTimelineTopFile {
     pub net: i64,
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryTimelineDirectoryChurn {
     pub path: String,
@@ -72,7 +80,7 @@ pub struct RepositoryTimelineDirectoryChurn {
     pub files_changed: usize,
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryTimelineDiffSummary {
     pub files_changed: usize,
@@ -81,7 +89,7 @@ pub struct RepositoryTimelineDiffSummary {
     pub net: i64,
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryTimelineEntry {
     pub sha: String,
@@ -100,22 +108,28 @@ pub struct RepositoryTimelineEntry {
     pub file_changes: Vec<RepositoryTimelineFileChange>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_pointer: Option<String>,
     pub top_files: Vec<RepositoryTimelineTopFile>,
     pub directory_churn: Vec<RepositoryTimelineDirectoryChurn>,
     pub diff_summary: RepositoryTimelineDiffSummary,
     pub highlights: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pull_request_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub captured_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TimelineIdentity {
     pub name: String,
     pub email: String,
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryTimelineResponse {
     pub repository_root: String,
@@ -137,6 +151,27 @@ pub struct RepositoryTimelineResponse {
     pub entries: Vec<RepositoryTimelineEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryTimelineEntryLookupParams {
+    #[serde(default)]
+    pub root: Option<String>,
+    #[serde(default)]
+    pub database_name: Option<String>,
+    pub commit_sha: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryTimelineEntryLookupResponse {
+    pub database_path: String,
+    pub entry: RepositoryTimelineEntry,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -153,6 +188,16 @@ pub enum RepositoryTimelineError {
     Git(String),
     #[error("blocking task panicked: {0}")]
     Join(#[from] tokio::task::JoinError),
+    #[error("failed to persist timeline entries to '{path}': {source}")]
+    Database {
+        path: String,
+        #[source]
+        source: rusqlite::Error,
+    },
+    #[error("failed to serialize repository timeline entry: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("timeline entry '{commit_sha}' not found in database '{path}'")]
+    EntryNotFound { commit_sha: String, path: String },
 }
 
 pub async fn repository_timeline(
@@ -161,11 +206,18 @@ pub async fn repository_timeline(
     tokio::task::spawn_blocking(move || perform_repository_timeline(params)).await?
 }
 
+pub async fn repository_timeline_entry_detail(
+    params: RepositoryTimelineEntryLookupParams,
+) -> Result<RepositoryTimelineEntryLookupResponse, RepositoryTimelineError> {
+    tokio::task::spawn_blocking(move || fetch_repository_timeline_entry(params)).await?
+}
+
 fn perform_repository_timeline(
     params: RepositoryTimelineParams,
 ) -> Result<RepositoryTimelineResponse, RepositoryTimelineError> {
     let RepositoryTimelineParams {
         root,
+        database_name,
         branch,
         limit,
         since,
@@ -182,9 +234,11 @@ fn perform_repository_timeline(
 
     let remote_url = normalize_remote_url(resolve_remote_url(&repo_root)?);
 
+    let branch_name = branch.unwrap_or_else(|| "HEAD".to_string());
+
     let log_output = run_git_log(
         &repo_root,
-        branch.as_deref().unwrap_or("HEAD"),
+        &branch_name,
         limit.unwrap_or(20),
         since.as_deref(),
         include_merges.unwrap_or(true),
@@ -194,7 +248,7 @@ fn perform_repository_timeline(
         diff_pattern.clone(),
     )?;
 
-    let entries = parse_git_log(
+    let mut entries = parse_git_log(
         &log_output,
         include_file_stats.unwrap_or(true),
         include_diffs.unwrap_or(false),
@@ -213,6 +267,22 @@ fn perform_repository_timeline(
         }
     }
 
+    let captured_at = current_time_millis();
+    for entry in &mut entries {
+        entry.captured_at = Some(captured_at);
+    }
+
+    let storage_entries = entries.clone();
+    let database_path = persist_timeline_entries(
+        &absolute_root,
+        database_name.as_deref(),
+        &branch_name,
+        captured_at,
+        &storage_entries,
+    )?;
+
+    let response_entries = transform_entries_for_response(entries);
+
     let normalized_paths = paths.as_ref().map(|values| {
         values
             .iter()
@@ -229,7 +299,7 @@ fn perform_repository_timeline(
 
     Ok(RepositoryTimelineResponse {
         repository_root: repo_root,
-        branch: branch.unwrap_or_else(|| "HEAD".to_string()),
+        branch: branch_name,
         limit: limit.unwrap_or(20),
         since,
         include_merges: include_merges.unwrap_or(true),
@@ -237,12 +307,85 @@ fn perform_repository_timeline(
         include_diffs: include_diffs.unwrap_or(false),
         paths: normalized_paths,
         diff_pattern: normalized_diff_pattern,
-        total_commits: entries.len(),
+        total_commits: response_entries.len(),
         merge_commits,
         total_insertions,
         total_deletions,
-        entries,
+        entries: response_entries,
         remote_url,
+        database_path,
+    })
+}
+
+fn fetch_repository_timeline_entry(
+    params: RepositoryTimelineEntryLookupParams,
+) -> Result<RepositoryTimelineEntryLookupResponse, RepositoryTimelineError> {
+    let RepositoryTimelineEntryLookupParams {
+        root,
+        database_name,
+        commit_sha,
+    } = params;
+
+    let root_param = root.unwrap_or_else(|| "./".to_string());
+    let absolute_root = resolve_root(&root_param)?;
+    let db_path = resolve_database_path(&absolute_root, database_name.as_deref());
+    let db_path_string = db_path.to_string_lossy().to_string();
+
+    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
+        |error| RepositoryTimelineError::Database {
+            path: db_path_string.clone(),
+            source: error,
+        },
+    )?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT branch, captured_at, payload, diff FROM repository_timeline_entries WHERE commit_sha = ?1",
+        )
+        .map_err(|error| RepositoryTimelineError::Database {
+            path: db_path_string.clone(),
+            source: error,
+        })?;
+
+    let result = stmt.query_row(params![&commit_sha], |row| {
+        let branch: String = row.get(0)?;
+        let captured_at: i64 = row.get(1)?;
+        let payload: String = row.get(2)?;
+        let diff: Option<String> = row.get(3)?;
+        Ok((branch, captured_at, payload, diff))
+    });
+
+    let (_branch, captured_at, payload, diff) = match result {
+        Ok(values) => values,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return Err(RepositoryTimelineError::EntryNotFound {
+                commit_sha,
+                path: db_path_string,
+            })
+        }
+        Err(error) => {
+            return Err(RepositoryTimelineError::Database {
+                path: db_path_string,
+                source: error,
+            })
+        }
+    };
+
+    let mut entry: RepositoryTimelineEntry = serde_json::from_str(&payload)?;
+    let diff_preview = diff.as_ref().map(|value| build_diff_preview(value));
+    let diff_pointer = diff
+        .as_ref()
+        .map(|_| format!("stored://repository_timeline/{}", commit_sha));
+
+    entry.diff = diff_pointer;
+    entry.diff_preview = diff_preview;
+    entry.diff_pointer = diff.as_ref().map(|_| commit_sha.clone());
+    entry.captured_at = Some(captured_at);
+
+    Ok(RepositoryTimelineEntryLookupResponse {
+        database_path: db_path_string,
+        entry,
+        diff,
     })
 }
 
@@ -525,11 +668,14 @@ fn parse_git_log(
             deletions,
             file_changes,
             diff,
+            diff_preview: None,
+            diff_pointer: None,
             top_files,
             directory_churn,
             diff_summary,
             highlights: Vec::new(),
             pull_request_url,
+            captured_at: None,
         };
 
         entry.highlights = build_highlights(&entry);
@@ -665,6 +811,173 @@ fn build_highlights(entry: &RepositoryTimelineEntry) -> Vec<String> {
     }
 
     highlights
+}
+
+fn build_diff_preview(diff: &str) -> String {
+    let mut preview = String::new();
+    let mut char_count = 0usize;
+    let mut truncated = false;
+
+    for (index, line) in diff.lines().enumerate() {
+        if index >= DIFF_PREVIEW_MAX_LINES {
+            truncated = true;
+            break;
+        }
+
+        if index > 0 {
+            if char_count + 1 >= DIFF_PREVIEW_MAX_CHARS {
+                truncated = true;
+                break;
+            }
+            preview.push('\n');
+            char_count += 1;
+        }
+
+        for ch in line.chars() {
+            if char_count >= DIFF_PREVIEW_MAX_CHARS {
+                truncated = true;
+                break;
+            }
+            preview.push(ch);
+            char_count += 1;
+        }
+
+        if truncated {
+            break;
+        }
+    }
+
+    if truncated {
+        if !preview.ends_with('\n') {
+            preview.push('\n');
+        }
+        preview.push('…');
+    }
+
+    preview
+}
+
+fn transform_entries_for_response(
+    entries: Vec<RepositoryTimelineEntry>,
+) -> Vec<RepositoryTimelineEntry> {
+    entries
+        .into_iter()
+        .map(|mut entry| {
+            if let Some(raw_diff) = entry.diff.take() {
+                let pointer = entry.sha.clone();
+                entry.diff_preview = Some(build_diff_preview(&raw_diff));
+                entry.diff_pointer = Some(pointer.clone());
+                entry.diff = Some(format!("stored://repository_timeline/{pointer}"));
+            }
+            entry
+        })
+        .collect()
+}
+
+fn persist_timeline_entries(
+    root: &Path,
+    database_name: Option<&str>,
+    branch: &str,
+    captured_at: i64,
+    entries: &[RepositoryTimelineEntry],
+) -> Result<Option<String>, RepositoryTimelineError> {
+    let db_path = resolve_database_path(root, database_name);
+    let db_path_string = db_path.to_string_lossy().to_string();
+
+    if entries.is_empty() {
+        return Ok(Some(db_path_string));
+    }
+
+    let mut conn = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )
+    .map_err(|error| RepositoryTimelineError::Database {
+        path: db_path_string.clone(),
+        source: error,
+    })?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS repository_timeline_entries (
+            commit_sha TEXT PRIMARY KEY,
+            branch TEXT NOT NULL,
+            captured_at INTEGER NOT NULL,
+            payload TEXT NOT NULL,
+            diff TEXT
+        )",
+        [],
+    )
+    .map_err(|error| RepositoryTimelineError::Database {
+        path: db_path_string.clone(),
+        source: error,
+    })?;
+
+    let tx = conn
+        .transaction()
+        .map_err(|error| RepositoryTimelineError::Database {
+            path: db_path_string.clone(),
+            source: error,
+        })?;
+
+    let mut stmt = tx
+        .prepare(
+            "INSERT INTO repository_timeline_entries (commit_sha, branch, captured_at, payload, diff)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(commit_sha) DO UPDATE SET
+                 branch = excluded.branch,
+                 captured_at = excluded.captured_at,
+                 payload = excluded.payload,
+                 diff = excluded.diff",
+        )
+        .map_err(|error| RepositoryTimelineError::Database {
+            path: db_path_string.clone(),
+            source: error,
+        })?;
+
+    for entry in entries {
+        let mut payload_entry = entry.clone();
+        payload_entry.diff = None;
+        payload_entry.diff_preview = None;
+        payload_entry.diff_pointer = None;
+        payload_entry.captured_at = Some(captured_at);
+
+        let payload_json = serde_json::to_string(&payload_entry)?;
+        let diff_value = entry.diff.as_deref();
+
+        stmt.execute(params![
+            entry.sha,
+            branch,
+            captured_at,
+            payload_json,
+            diff_value
+        ])
+        .map_err(|error| RepositoryTimelineError::Database {
+            path: db_path_string.clone(),
+            source: error,
+        })?;
+    }
+
+    drop(stmt);
+
+    tx.commit()
+        .map_err(|error| RepositoryTimelineError::Database {
+            path: db_path_string.clone(),
+            source: error,
+        })?;
+
+    Ok(Some(db_path_string))
+}
+
+fn resolve_database_path(root: &Path, database_name: Option<&str>) -> PathBuf {
+    let filename = database_name.unwrap_or(DEFAULT_DB_FILENAME);
+    root.join(filename)
+}
+
+fn current_time_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn normalize_remote_url(raw: Option<String>) -> Option<String> {

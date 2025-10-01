@@ -13,124 +13,635 @@ mod ingest;
 #[path = "../search.rs"]
 mod search;
 
-use bundle::{context_bundle, ContextBundleParams, ContextBundleResponse};
-use git_timeline::{repository_timeline, RepositoryTimelineParams};
+use bundle::{
+    context_bundle, BundleDefinition, ContextBundleError, ContextBundleParams,
+    ContextBundleResponse,
+};
+use clap::{builder::BoolishValueParser, Parser, ValueEnum, ValueHint};
+use git_timeline::{
+    repository_timeline, repository_timeline_entry_detail, RepositoryTimelineEntryLookupParams,
+    RepositoryTimelineEntryLookupResponse, RepositoryTimelineError, RepositoryTimelineParams,
+    RepositoryTimelineResponse,
+};
 use graph_neighbors::{
-    graph_neighbors, GraphNeighborDirection, GraphNeighborsParams, GraphNodeSelector,
+    graph_neighbors, GraphNeighborDirection, GraphNeighborsError, GraphNeighborsParams,
+    GraphNeighborsResponse, GraphNodeSelector,
 };
-use index_status::{get_index_status, IndexStatusParams};
-use ingest::{ingest_codebase, IngestParams, IngestResponse};
+use index_status::{get_index_status, IndexStatusError, IndexStatusParams, IndexStatusResponse};
+use ingest::{ingest_codebase, IngestError, IngestParams, IngestResponse};
 use search::{
-    semantic_search, summarize_semantic_search, SemanticSearchParams, SemanticSearchResponse,
+    semantic_search, summarize_semantic_search, SemanticSearchError, SemanticSearchParams,
+    SemanticSearchResponse,
 };
+use serde::Serialize;
+use std::collections::HashSet;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::process;
+use std::time::Instant;
 
-#[tokio::main]
-async fn main() {
-    let root = std::env::var("INDEX_MCP_DEBUG_ROOT").unwrap_or_else(|_| ".".to_string());
-    let query = std::env::var("INDEX_MCP_DEBUG_QUERY").unwrap_or_else(|_| "mcp".to_string());
-    let verbose = std::env::var("INDEX_MCP_DEBUG_VERBOSE")
-        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true"))
-        .unwrap_or(false);
+#[derive(Parser, Debug)]
+#[command(
+    author,
+    version,
+    about = "Debug harness that exercises core MCP tools against a workspace SQLite index",
+    long_about = None
+)]
+struct Cli {
+    #[arg(
+        long,
+        env = "INDEX_MCP_DEBUG_ROOT",
+        value_hint = ValueHint::DirPath,
+        default_value = "."
+    )]
+    root: PathBuf,
 
-    println!("=== ingest_codebase (root={root}) ===");
-    let ingest_response = match run_ingest(&root).await {
-        Ok(response) => {
-            summarize_ingest(&response, verbose);
-            Some(response)
-        }
-        Err(error) => {
-            eprintln!("ingest_codebase failed: {error:?}");
-            None
-        }
-    };
+    #[arg(long, env = "INDEX_MCP_DEBUG_DATABASE")]
+    database: Option<String>,
 
-    println!("\n=== semantic_search query='{query}' ===");
-    let search_response = match run_semantic_search(&root, &query).await {
-        Ok(response) => {
-            summarize_search(&response, verbose);
-            Some(response)
-        }
-        Err(error) => {
-            eprintln!("semantic_search failed: {error:?}");
-            None
-        }
-    };
+    #[arg(long, env = "INDEX_MCP_DEBUG_QUERY", default_value = "mcp")]
+    query: String,
 
-    println!("\n=== code_lookup (search mode approximation) ===");
-    if let Some(response) = search_response.as_ref() {
-        summarize_code_lookup_search(response);
-    } else {
-        println!("code_lookup (search) skipped due to missing semantic_search result");
+    #[arg(long, env = "INDEX_MCP_DEBUG_FILE")]
+    file: Option<String>,
+
+    #[arg(long = "section", value_enum)]
+    section: Vec<Section>,
+
+    #[arg(long = "skip-section", value_enum)]
+    skip_section: Vec<Section>,
+
+    #[arg(long, env = "INDEX_MCP_DEBUG_LIMIT", default_value_t = 5)]
+    limit: u32,
+
+    #[arg(long, env = "INDEX_MCP_DEBUG_MAX_SNIPPETS", default_value_t = 5)]
+    max_snippets: u32,
+
+    #[arg(long, env = "INDEX_MCP_DEBUG_MAX_NEIGHBORS", default_value_t = 10)]
+    max_neighbors: u32,
+
+    #[arg(long, env = "INDEX_MCP_DEBUG_BUDGET_TOKENS", default_value_t = 3_000)]
+    budget_tokens: u32,
+
+    #[arg(
+        long,
+        env = "INDEX_MCP_DEBUG_VERBOSE",
+        default_value_t = false,
+        value_parser = BoolishValueParser::new()
+    )]
+    verbose: bool,
+
+    #[arg(
+        long,
+        env = "INDEX_MCP_DEBUG_LOG_FORMAT",
+        value_enum,
+        default_value_t = LogFormat::Text
+    )]
+    log_format: LogFormat,
+
+    #[arg(long, env = "INDEX_MCP_DEBUG_JSON_REPORT")]
+    json_report: Option<PathBuf>,
+
+    #[arg(
+        long,
+        env = "INDEX_MCP_DEBUG_FAIL_FAST",
+        default_value_t = false,
+        value_parser = BoolishValueParser::new()
+    )]
+    fail_fast: bool,
+
+    #[arg(
+        long,
+        env = "INDEX_MCP_DEBUG_INCLUDE_DIFFS",
+        default_value_t = false,
+        value_parser = BoolishValueParser::new()
+    )]
+    include_diffs: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, ValueEnum)]
+enum Section {
+    Ingest,
+    SemanticSearch,
+    CodeLookupSearch,
+    ContextBundle,
+    CodeLookupBundle,
+    GraphNeighbors,
+    IndexStatus,
+    RepositoryTimeline,
+}
+
+impl Section {
+    fn all() -> Vec<Self> {
+        vec![
+            Self::Ingest,
+            Self::SemanticSearch,
+            Self::CodeLookupSearch,
+            Self::ContextBundle,
+            Self::CodeLookupBundle,
+            Self::GraphNeighbors,
+            Self::IndexStatus,
+            Self::RepositoryTimeline,
+        ]
     }
 
-    let candidate_files = gather_candidate_files(&root, &search_response);
-    let bundle_path = candidate_files
-        .iter()
-        .find(|path| Path::new(&root).join(path).exists())
-        .cloned()
-        .unwrap_or_else(|| "README.md".to_string());
-
-    println!("\n=== context_bundle file='{bundle_path}' ===");
-    let bundle_response = match run_context_bundle(&root, &bundle_path).await {
-        Ok(response) => {
-            summarize_context_bundle(&response, verbose);
-            Some(response)
+    fn key(&self) -> &'static str {
+        match self {
+            Self::Ingest => "ingest_codebase",
+            Self::SemanticSearch => "semantic_search",
+            Self::CodeLookupSearch => "code_lookup_search",
+            Self::ContextBundle => "context_bundle",
+            Self::CodeLookupBundle => "code_lookup_bundle",
+            Self::GraphNeighbors => "graph_neighbors",
+            Self::IndexStatus => "index_status",
+            Self::RepositoryTimeline => "repository_timeline",
         }
-        Err(error) => {
-            eprintln!("context_bundle failed: {error:?}");
-            None
-        }
-    };
-
-    println!("\n=== code_lookup (bundle mode approximation) ===");
-    if let Some(response) = bundle_response.as_ref() {
-        summarize_code_lookup_bundle(response, &bundle_path);
-    } else {
-        println!("code_lookup (bundle) skipped due to missing context_bundle result");
-    }
-
-    println!("\n=== graph_neighbors ===");
-    if let Some(response) = bundle_response.as_ref() {
-        if let Some(definition) = response
-            .focus_definition
-            .as_ref()
-            .or_else(|| response.definitions.first())
-        {
-            if let Err(error) = run_graph_neighbors(&root, &definition.id, &definition.name).await {
-                eprintln!("graph_neighbors failed: {error:?}");
-            }
-        } else {
-            println!("graph_neighbors skipped: no definition found in bundle response");
-        }
-    } else {
-        println!("graph_neighbors skipped due to missing context_bundle result");
-    }
-
-    println!("\n=== index_status ===");
-    match run_index_status(&root).await {
-        Ok(response) => summarize_index_status(&response, verbose),
-        Err(error) => eprintln!("index_status failed: {error:?}"),
-    }
-
-    println!("\n=== repository_timeline ===");
-    match run_repository_timeline(&root).await {
-        Ok(response) => summarize_repository_timeline(&response, verbose),
-        Err(error) => eprintln!("repository_timeline failed: {error:?}"),
-    }
-
-    println!("\n=== debug run complete ===");
-    if ingest_response.is_none() {
-        println!("Reminder: ingest_codebase failed; downstream results may be stale or empty.");
     }
 }
 
-async fn run_ingest(root: &str) -> Result<IngestResponse, ingest::IngestError> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
+}
+
+impl Default for LogFormat {
+    fn default() -> Self {
+        Self::Text
+    }
+}
+
+struct RunConfig {
+    root: PathBuf,
+    database: Option<String>,
+    query: String,
+    bundle_file: Option<String>,
+    limit: u32,
+    max_snippets: u32,
+    max_neighbors: u32,
+    budget_tokens: u32,
+    verbose: bool,
+    log_format: LogFormat,
+    json_report: Option<PathBuf>,
+    sections: Vec<Section>,
+    fail_fast: bool,
+    include_diffs: bool,
+}
+
+impl RunConfig {
+    fn from_cli(cli: Cli) -> Self {
+        let Cli {
+            root,
+            database,
+            query,
+            file,
+            section,
+            skip_section,
+            limit,
+            max_snippets,
+            max_neighbors,
+            budget_tokens,
+            verbose,
+            log_format,
+            json_report,
+            fail_fast,
+            include_diffs,
+        } = cli;
+
+        let sections = determine_sections(section, skip_section);
+
+        Self {
+            root,
+            database,
+            query,
+            bundle_file: file,
+            limit,
+            max_snippets,
+            max_neighbors,
+            budget_tokens,
+            verbose,
+            log_format,
+            json_report,
+            sections,
+            fail_fast,
+            include_diffs,
+        }
+    }
+}
+
+fn determine_sections(requested: Vec<Section>, skipped: Vec<Section>) -> Vec<Section> {
+    let mut sections = if requested.is_empty() {
+        Section::all()
+    } else {
+        let mut seen = HashSet::new();
+        let mut ordered = Vec::new();
+        for section in requested {
+            if seen.insert(section) {
+                ordered.push(section);
+            }
+        }
+        ordered
+    };
+
+    for section in skipped {
+        sections.retain(|candidate| candidate != &section);
+    }
+
+    if sections.is_empty() {
+        sections = Section::all();
+    }
+
+    sections
+}
+
+#[derive(Default)]
+struct RunState {
+    ingest: Option<IngestResponse>,
+    search: Option<SemanticSearchResponse>,
+    bundle: Option<ContextBundleResponse>,
+    timeline: Option<RepositoryTimelineResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct SectionSummary {
+    name: &'static str,
+    status: &'static str,
+    duration_ms: u128,
+    message: Option<String>,
+}
+
+enum SectionExecution {
+    Success { message: Option<String> },
+    Skipped { reason: Option<String> },
+    Failed { error: String },
+}
+
+impl SectionExecution {
+    fn status(&self) -> &'static str {
+        match self {
+            Self::Success { .. } => "success",
+            Self::Skipped { .. } => "skipped",
+            Self::Failed { .. } => "failed",
+        }
+    }
+
+    fn message(&self) -> Option<&String> {
+        match self {
+            Self::Success { message } => message.as_ref(),
+            Self::Skipped { reason } => reason.as_ref(),
+            Self::Failed { error } => Some(error),
+        }
+    }
+
+    fn is_failure(&self) -> bool {
+        matches!(self, Self::Failed { .. })
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+    let config = RunConfig::from_cli(cli);
+    let exit_code = execute(config).await;
+    if exit_code != 0 {
+        process::exit(exit_code);
+    }
+}
+
+async fn execute(config: RunConfig) -> i32 {
+    let mut state = RunState::default();
+    let mut summaries = Vec::new();
+    let mut exit_code = 0;
+
+    for section in &config.sections {
+        let start = Instant::now();
+        let execution = execute_section(*section, &config, &mut state).await;
+        let duration_ms = start.elapsed().as_millis();
+        let header = section_header(*section, &config);
+
+        emit_log(
+            config.log_format,
+            *section,
+            &header,
+            duration_ms,
+            &execution,
+        );
+
+        summaries.push(SectionSummary {
+            name: section.key(),
+            status: execution.status(),
+            duration_ms,
+            message: execution.message().map(|m| m.to_owned()),
+        });
+
+        if execution.is_failure() {
+            exit_code = 1;
+            if config.fail_fast {
+                break;
+            }
+        }
+    }
+
+    if let Some(path) = &config.json_report {
+        if let Err(error) = write_json_report(path, &summaries) {
+            eprintln!(
+                "failed to write JSON report to {}: {}",
+                path.display(),
+                error
+            );
+            exit_code = 1;
+        }
+    }
+
+    exit_code
+}
+
+async fn execute_section(
+    section: Section,
+    config: &RunConfig,
+    state: &mut RunState,
+) -> SectionExecution {
+    match section {
+        Section::Ingest => ingest_section(config, state).await,
+        Section::SemanticSearch => semantic_search_section(config, state).await,
+        Section::CodeLookupSearch => code_lookup_search_section(state),
+        Section::ContextBundle => context_bundle_section(config, state).await,
+        Section::CodeLookupBundle => code_lookup_bundle_section(state),
+        Section::GraphNeighbors => graph_neighbors_section(config, state).await,
+        Section::IndexStatus => index_status_section(config).await,
+        Section::RepositoryTimeline => repository_timeline_section(config, state).await,
+    }
+}
+
+fn section_header(section: Section, config: &RunConfig) -> String {
+    match section {
+        Section::Ingest => format!("ingest_codebase (root={})", config.root.display()),
+        Section::SemanticSearch => {
+            format!("semantic_search query='{}'", config.query)
+        }
+        Section::CodeLookupSearch => "code_lookup (search mode approximation)".to_string(),
+        Section::ContextBundle => match &config.bundle_file {
+            Some(file) => format!("context_bundle file='{file}'"),
+            None => "context_bundle".to_string(),
+        },
+        Section::CodeLookupBundle => "code_lookup (bundle mode approximation)".to_string(),
+        Section::GraphNeighbors => "graph_neighbors".to_string(),
+        Section::IndexStatus => "index_status".to_string(),
+        Section::RepositoryTimeline => "repository_timeline".to_string(),
+    }
+}
+
+fn emit_log(
+    format: LogFormat,
+    section: Section,
+    header: &str,
+    duration_ms: u128,
+    execution: &SectionExecution,
+) {
+    match format {
+        LogFormat::Text => {
+            println!("=== {header} ===");
+            match execution {
+                SectionExecution::Success { message } => {
+                    if let Some(message) = message {
+                        println!("{message}");
+                    }
+                    println!("status: success ({} ms)", duration_ms);
+                }
+                SectionExecution::Skipped { reason } => {
+                    println!("status: skipped ({} ms)", duration_ms);
+                    if let Some(reason) = reason {
+                        println!("reason: {reason}");
+                    }
+                }
+                SectionExecution::Failed { error } => {
+                    println!("status: failed ({} ms)", duration_ms);
+                    println!("error: {error}");
+                }
+            }
+            println!();
+        }
+        LogFormat::Json => {
+            let entry = SectionSummary {
+                name: section.key(),
+                status: execution.status(),
+                duration_ms,
+                message: execution.message().map(|m| m.to_owned()),
+            };
+            match serde_json::to_string(&entry) {
+                Ok(line) => println!("{line}"),
+                Err(error) => eprintln!("failed to serialize log entry: {error}"),
+            }
+        }
+    }
+}
+
+fn write_json_report(path: &Path, summaries: &[SectionSummary]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    let payload = serde_json::to_string_pretty(summaries)
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    fs::write(path, payload)
+}
+
+async fn ingest_section(config: &RunConfig, state: &mut RunState) -> SectionExecution {
+    match run_ingest(config).await {
+        Ok(response) => {
+            let message = summarize_ingest(&response);
+            if config.verbose {
+                dump_json("ingest_codebase response", &response);
+            }
+            state.ingest = Some(response);
+            SectionExecution::Success {
+                message: Some(message),
+            }
+        }
+        Err(error) => SectionExecution::Failed {
+            error: error.to_string(),
+        },
+    }
+}
+
+async fn semantic_search_section(config: &RunConfig, state: &mut RunState) -> SectionExecution {
+    match run_semantic_search(config).await {
+        Ok(response) => {
+            let mut lines = vec![summarize_semantic_search(&response)];
+            if let Some(first) = response.results.first() {
+                lines.push(format!(
+                    "top match: {} (score={:.4})",
+                    first.path, first.normalized_score
+                ));
+            }
+            if config.verbose {
+                dump_json("semantic_search response", &response);
+            }
+            state.search = Some(response);
+            SectionExecution::Success {
+                message: Some(lines.join("\n")),
+            }
+        }
+        Err(error) => SectionExecution::Failed {
+            error: error.to_string(),
+        },
+    }
+}
+
+fn code_lookup_search_section(state: &RunState) -> SectionExecution {
+    match state.search.as_ref() {
+        Some(response) => SectionExecution::Success {
+            message: Some(summarize_code_lookup_search(response)),
+        },
+        None => SectionExecution::Skipped {
+            reason: Some(
+                "semantic_search has not completed; skipping code_lookup search snapshot"
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+async fn context_bundle_section(config: &RunConfig, state: &mut RunState) -> SectionExecution {
+    let Some(target) = resolve_bundle_target(config, state) else {
+        return SectionExecution::Skipped {
+            reason: Some("no candidate file available for context_bundle".to_string()),
+        };
+    };
+
+    match run_context_bundle(config, &target).await {
+        Ok(response) => {
+            let message = summarize_context_bundle(&response);
+            if config.verbose {
+                dump_json("context_bundle response", &response);
+            }
+            state.bundle = Some(response);
+            SectionExecution::Success {
+                message: Some(message),
+            }
+        }
+        Err(error) => SectionExecution::Failed {
+            error: error.to_string(),
+        },
+    }
+}
+
+fn code_lookup_bundle_section(state: &RunState) -> SectionExecution {
+    match state.bundle.as_ref() {
+        Some(response) => SectionExecution::Success {
+            message: Some(summarize_code_lookup_bundle(response)),
+        },
+        None => SectionExecution::Skipped {
+            reason: Some(
+                "context_bundle has not completed; skipping code_lookup bundle snapshot"
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+async fn graph_neighbors_section(config: &RunConfig, state: &RunState) -> SectionExecution {
+    let Some(bundle) = state.bundle.as_ref() else {
+        return SectionExecution::Skipped {
+            reason: Some("context_bundle missing; unable to infer graph node".to_string()),
+        };
+    };
+
+    let Some(definition) = bundle
+        .focus_definition
+        .as_ref()
+        .or_else(|| bundle.definitions.first())
+    else {
+        return SectionExecution::Skipped {
+            reason: Some("no definition found in bundle response".to_string()),
+        };
+    };
+
+    match run_graph_neighbors(config, definition).await {
+        Ok(response) => {
+            if config.verbose {
+                dump_json("graph_neighbors response", &response);
+            }
+            let message = format!(
+                "graph_neighbors: found {} neighbor(s) for node {}",
+                response.neighbors.len(),
+                response.node.name
+            );
+            SectionExecution::Success {
+                message: Some(message),
+            }
+        }
+        Err(error) => SectionExecution::Failed {
+            error: error.to_string(),
+        },
+    }
+}
+
+async fn index_status_section(config: &RunConfig) -> SectionExecution {
+    match run_index_status(config).await {
+        Ok(response) => {
+            let message = summarize_index_status(&response);
+            if config.verbose {
+                dump_json("index_status response", &response);
+            }
+            SectionExecution::Success {
+                message: Some(message),
+            }
+        }
+        Err(error) => SectionExecution::Failed {
+            error: error.to_string(),
+        },
+    }
+}
+
+async fn repository_timeline_section(config: &RunConfig, state: &mut RunState) -> SectionExecution {
+    match run_repository_timeline(config).await {
+        Ok(response) => {
+            let message = summarize_repository_timeline(&response);
+            if config.verbose {
+                dump_json("repository_timeline response", &response);
+            }
+
+            if config.include_diffs {
+                if let Some(entry) = response.entries.first() {
+                    match run_repository_timeline_entry(config, &entry.sha).await {
+                        Ok(detail) => {
+                            if config.verbose {
+                                dump_json("repository_timeline_entry response", &detail);
+                            }
+                            println!("{}", summarize_repository_timeline_entry(&detail));
+                        }
+                        Err(error) => println!(
+                            "repository_timeline_entry failed for {}: {}",
+                            entry.sha, error
+                        ),
+                    }
+                } else {
+                    println!("repository_timeline_entry skipped: no commits present in response");
+                }
+            }
+
+            state.timeline = Some(response);
+
+            SectionExecution::Success {
+                message: Some(message),
+            }
+        }
+        Err(error) => SectionExecution::Failed {
+            error: error.to_string(),
+        },
+    }
+}
+
+async fn run_ingest(config: &RunConfig) -> Result<IngestResponse, IngestError> {
     let params = IngestParams {
-        root: Some(root.to_string()),
+        root: Some(config.root.to_string_lossy().to_string()),
         include: None,
         exclude: None,
-        database_name: None,
+        database_name: config.database.clone(),
         max_file_size_bytes: None,
         store_file_content: None,
         paths: None,
@@ -143,14 +654,13 @@ async fn run_ingest(root: &str) -> Result<IngestResponse, ingest::IngestError> {
 }
 
 async fn run_semantic_search(
-    root: &str,
-    query: &str,
-) -> Result<SemanticSearchResponse, search::SemanticSearchError> {
+    config: &RunConfig,
+) -> Result<SemanticSearchResponse, SemanticSearchError> {
     let params = SemanticSearchParams {
-        root: Some(root.to_string()),
-        query: query.to_string(),
-        database_name: None,
-        limit: Some(5),
+        root: Some(config.root.to_string_lossy().to_string()),
+        query: config.query.clone(),
+        database_name: config.database.clone(),
+        limit: Some(config.limit),
         model: None,
     };
 
@@ -158,56 +668,46 @@ async fn run_semantic_search(
 }
 
 async fn run_context_bundle(
-    root: &str,
+    config: &RunConfig,
     file: &str,
-) -> Result<ContextBundleResponse, bundle::ContextBundleError> {
+) -> Result<ContextBundleResponse, ContextBundleError> {
     let params = ContextBundleParams {
-        root: Some(root.to_string()),
-        database_name: None,
+        root: Some(config.root.to_string_lossy().to_string()),
+        database_name: config.database.clone(),
         file: file.to_string(),
         symbol: None,
-        max_snippets: Some(5),
-        max_neighbors: Some(10),
-        budget_tokens: Some(3_000),
+        max_snippets: Some(config.max_snippets),
+        max_neighbors: Some(config.max_neighbors),
+        budget_tokens: Some(config.budget_tokens),
     };
 
     context_bundle(params).await
 }
 
 async fn run_graph_neighbors(
-    root: &str,
-    node_id: &str,
-    node_name: &str,
-) -> Result<(), graph_neighbors::GraphNeighborsError> {
+    config: &RunConfig,
+    definition: &BundleDefinition,
+) -> Result<GraphNeighborsResponse, GraphNeighborsError> {
     let params = GraphNeighborsParams {
-        root: Some(root.to_string()),
-        database_name: None,
+        root: Some(config.root.to_string_lossy().to_string()),
+        database_name: config.database.clone(),
         node: GraphNodeSelector {
-            id: Some(node_id.to_string()),
+            id: Some(definition.id.clone()),
             path: None,
             kind: None,
-            name: node_name.to_string(),
+            name: definition.name.clone(),
         },
         direction: Some(GraphNeighborDirection::Both),
-        limit: Some(10),
+        limit: Some(config.max_neighbors),
     };
 
-    let response = graph_neighbors(params).await?;
-    println!(
-        "graph_neighbors: found {} neighbors for node {}",
-        response.neighbors.len(),
-        response.node.name
-    );
-
-    Ok(())
+    graph_neighbors(params).await
 }
 
-async fn run_index_status(
-    root: &str,
-) -> Result<index_status::IndexStatusResponse, index_status::IndexStatusError> {
+async fn run_index_status(config: &RunConfig) -> Result<IndexStatusResponse, IndexStatusError> {
     let params = IndexStatusParams {
-        root: Some(root.to_string()),
-        database_name: None,
+        root: Some(config.root.to_string_lossy().to_string()),
+        database_name: config.database.clone(),
         history_limit: Some(5),
     };
 
@@ -215,16 +715,17 @@ async fn run_index_status(
 }
 
 async fn run_repository_timeline(
-    root: &str,
-) -> Result<git_timeline::RepositoryTimelineResponse, git_timeline::RepositoryTimelineError> {
+    config: &RunConfig,
+) -> Result<RepositoryTimelineResponse, RepositoryTimelineError> {
     let params = RepositoryTimelineParams {
-        root: Some(root.to_string()),
+        root: Some(config.root.to_string_lossy().to_string()),
+        database_name: config.database.clone(),
         branch: None,
         limit: Some(5),
         since: None,
         include_merges: Some(true),
         include_file_stats: Some(true),
-        include_diffs: Some(false),
+        include_diffs: Some(config.include_diffs),
         paths: None,
         diff_pattern: None,
     };
@@ -232,153 +733,141 @@ async fn run_repository_timeline(
     repository_timeline(params).await
 }
 
-fn summarize_ingest(response: &IngestResponse, verbose: bool) {
-    println!(
-        "ingest_codebase: {files} file(s), {chunks} embedded chunk(s), db={path}",
-        files = response.ingested_file_count,
-        chunks = response.embedded_chunk_count,
-        path = response.database_path
-    );
+async fn run_repository_timeline_entry(
+    config: &RunConfig,
+    commit_sha: &str,
+) -> Result<RepositoryTimelineEntryLookupResponse, RepositoryTimelineError> {
+    let params = RepositoryTimelineEntryLookupParams {
+        root: Some(config.root.to_string_lossy().to_string()),
+        database_name: config.database.clone(),
+        commit_sha: commit_sha.to_string(),
+    };
 
-    if verbose {
-        dump_json("ingest_codebase response", response);
-    }
+    repository_timeline_entry_detail(params).await
 }
 
-fn summarize_search(response: &SemanticSearchResponse, verbose: bool) {
-    println!("{}", summarize_semantic_search(response));
+fn resolve_bundle_target(config: &RunConfig, state: &RunState) -> Option<String> {
+    let mut candidates = Vec::new();
 
-    if let Some(first) = response.results.first() {
-        println!(
-            "top match: {path} (score={score:.4})",
-            path = first.path,
-            score = first.normalized_score
-        );
+    if let Some(explicit) = &config.bundle_file {
+        candidates.push(explicit.clone());
     }
 
-    if verbose {
-        dump_json("semantic_search response", response);
+    if let Some(search) = state.search.as_ref() {
+        for result in &search.results {
+            candidates.push(result.path.clone());
+        }
     }
+
+    candidates.push("docs/rust-migration.md".to_string());
+    candidates.push("README.md".to_string());
+
+    let mut seen = HashSet::new();
+    for candidate in candidates {
+        if let Some(normalized) = normalize_candidate(&config.root, &candidate) {
+            if seen.insert(normalized.clone()) {
+                return Some(normalized);
+            }
+        }
+    }
+
+    None
 }
 
-fn summarize_code_lookup_search(response: &SemanticSearchResponse) {
-    println!(
-        "code_lookup (search): mirrored {count} semantic_search result(s)",
-        count = response.results.len()
-    );
+fn normalize_candidate(root: &Path, candidate: &str) -> Option<String> {
+    let candidate_path = PathBuf::from(candidate);
+    let absolute = if candidate_path.is_absolute() {
+        candidate_path
+    } else {
+        root.join(&candidate_path)
+    };
+
+    if !absolute.exists() {
+        return None;
+    }
+
+    let relative = absolute
+        .strip_prefix(root)
+        .unwrap_or_else(|_| absolute.as_path());
+    Some(relative.to_string_lossy().replace('\\', "/"))
 }
 
-fn summarize_context_bundle(response: &ContextBundleResponse, verbose: bool) {
-    println!(
-        "context_bundle: {definitions} definition(s), {snippets} snippet(s), {neighbors} related symbol(s)",
-        definitions = response.definitions.len(),
-        snippets = response.snippets.len(),
-        neighbors = response.related.len()
-    );
+fn summarize_ingest(response: &IngestResponse) -> String {
+    format!(
+        "ingest_codebase: {} file(s), {} embedded chunk(s), db={}",
+        response.ingested_file_count, response.embedded_chunk_count, response.database_path
+    )
+}
+
+fn summarize_code_lookup_search(response: &SemanticSearchResponse) -> String {
+    format!(
+        "code_lookup (search): mirrored {} semantic_search result(s)",
+        response.results.len()
+    )
+}
+
+fn summarize_context_bundle(response: &ContextBundleResponse) -> String {
+    let mut lines = vec![format!(
+        "context_bundle: {} definition(s), {} snippet(s), {} related symbol(s)",
+        response.definitions.len(),
+        response.snippets.len(),
+        response.related.len()
+    )];
 
     if let Some(focus) = response
         .focus_definition
         .as_ref()
         .or_else(|| response.definitions.first())
     {
-        println!("focus symbol: {} ({})", focus.name, focus.kind);
+        lines.push(format!("focus symbol: {} ({})", focus.name, focus.kind));
     }
 
-    if verbose {
-        dump_json("context_bundle response", response);
-    }
+    lines.push(format!("file: {}", response.file.path));
+    lines.join("\n")
 }
 
-fn summarize_code_lookup_bundle(response: &ContextBundleResponse, file: &str) {
-    println!(
-        "code_lookup (bundle): reused bundle for {file}, {definitions} definition(s)",
-        file = file,
-        definitions = response.definitions.len()
-    );
+fn summarize_code_lookup_bundle(response: &ContextBundleResponse) -> String {
+    format!(
+        "code_lookup (bundle): reused bundle for {}, {} definition(s)",
+        response.file.path,
+        response.definitions.len()
+    )
 }
 
-fn summarize_index_status(response: &index_status::IndexStatusResponse, verbose: bool) {
-    println!(
+fn summarize_index_status(response: &IndexStatusResponse) -> String {
+    format!(
         "index_status: db_exists={}, total_files={}, total_chunks={}, is_stale={}",
         response.database_exists, response.total_files, response.total_chunks, response.is_stale
-    );
-
-    if verbose {
-        dump_json("index_status response", response);
-    }
+    )
 }
 
-fn summarize_repository_timeline(
-    response: &git_timeline::RepositoryTimelineResponse,
-    verbose: bool,
-) {
-    println!(
-        "repository_timeline: {commits} commit(s), merge_commits={merges}, total_insertions={insertions}, total_deletions={deletions}",
-        commits = response.total_commits,
-        merges = response.merge_commits,
-        insertions = response.total_insertions,
-        deletions = response.total_deletions
-    );
+fn summarize_repository_timeline(response: &RepositoryTimelineResponse) -> String {
+    let mut lines = vec![format!(
+        "repository_timeline: {} commit(s), merge_commits={}, total_insertions={}, total_deletions={}",
+        response.total_commits,
+        response.merge_commits,
+        response.total_insertions,
+        response.total_deletions
+    )];
 
     if let Some(first) = response.entries.first() {
-        println!(
-            "latest commit: {sha} {subject}",
-            sha = first.sha,
-            subject = first.subject
-        );
+        lines.push(format!("latest commit: {} {}", first.sha, first.subject));
     }
 
-    if verbose {
-        dump_json("repository_timeline response", response);
-    }
+    lines.join("\n")
+}
+
+fn summarize_repository_timeline_entry(response: &RepositoryTimelineEntryLookupResponse) -> String {
+    let diff_len = response.diff.as_ref().map(|diff| diff.len()).unwrap_or(0);
+    format!(
+        "repository_timeline_entry: commit {} diff_bytes={}",
+        response.entry.sha, diff_len
+    )
 }
 
 fn dump_json<T: serde::Serialize>(label: &str, value: &T) {
     match serde_json::to_string_pretty(value) {
         Ok(output) => println!("{label} =>\n{output}"),
         Err(error) => eprintln!("failed to render {label} as JSON: {error}"),
-    }
-}
-
-fn gather_candidate_files(
-    root: &str,
-    search_response: &Option<SemanticSearchResponse>,
-) -> Vec<String> {
-    let mut candidates = Vec::new();
-
-    if let Ok(explicit) = std::env::var("INDEX_MCP_DEBUG_FILE") {
-        candidates.push(explicit);
-    }
-
-    if let Some(response) = search_response {
-        for entry in &response.results {
-            candidates.push(entry.path.clone());
-        }
-    }
-
-    let default_candidates = vec!["docs/rust-migration.md", "README.md"];
-    for candidate in default_candidates {
-        let path = Path::new(root).join(candidate);
-        if path.exists() {
-            candidates.push(candidate.to_string());
-        }
-    }
-
-    candidates
-        .into_iter()
-        .map(|candidate| normalize_path(root, candidate))
-        .collect()
-}
-
-fn normalize_path(root: &str, candidate: String) -> String {
-    let candidate_path = PathBuf::from(&candidate);
-    if candidate_path.is_absolute() {
-        candidate
-    } else {
-        let normalized = Path::new(root).join(&candidate_path);
-        normalized
-            .strip_prefix(Path::new(root))
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|_| candidate)
     }
 }

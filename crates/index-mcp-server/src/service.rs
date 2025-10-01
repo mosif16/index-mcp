@@ -6,7 +6,8 @@ use crate::bundle::{
     context_bundle, ContextBundleError, ContextBundleParams, ContextBundleResponse,
 };
 use crate::git_timeline::{
-    repository_timeline, RepositoryTimelineError, RepositoryTimelineParams,
+    repository_timeline, repository_timeline_entry_detail, RepositoryTimelineEntryLookupParams,
+    RepositoryTimelineEntryLookupResponse, RepositoryTimelineError, RepositoryTimelineParams,
     RepositoryTimelineResponse,
 };
 use crate::graph_neighbors::{
@@ -49,6 +50,16 @@ struct CodeLookupParams {
     #[serde(default)]
     query: Option<String>,
     #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    symbol: Option<crate::bundle::SymbolSelector>,
+    #[serde(default)]
+    max_snippets: Option<u32>,
+    #[serde(default)]
+    max_neighbors: Option<u32>,
+    #[serde(default)]
+    budget_tokens: Option<u32>,
+    #[serde(default)]
     limit: Option<u32>,
     #[serde(default)]
     model: Option<String>,
@@ -82,8 +93,8 @@ struct SemanticSearchRequest {
 }
 
 /// Textual instructions shared with MCP clients.
-const SERVER_INSTRUCTIONS: &str = "Rust rewrite in progress. Rust server currently supports ingest_codebase, semantic_search, code_lookup (search mode), index_status, graph_neighbors, and repository_timeline; additional tooling is being ported.";
-const INDEXING_GUIDANCE_PROMPT_TEXT: &str = "Tools: code_lookup (routes to semantic search, context bundles, or graph neighbors), ingest_codebase (refresh the SQLite index; enable autoEvict/maxDatabaseSizeBytes to prune unused chunks), index_status (check freshness), semantic_search (direct embedding-powered retrieval that updates hotness), context_bundle (structured bundle trimmed to budgetTokens or INDEX_MCP_BUDGET_TOKENS), graph_neighbors (relationship explorer), indexing_guidance_tool (tool-form reminders), indexing_guidance (prompt version), repository_timeline (summarize recent git commits), and info (runtime diagnostics). Workflow: run ingest_codebase on a new checkout or after edits while respecting .gitignore, call index_status when freshness is uncertain, then reach for code_lookup—use query=\"...\" for discovery, file=\"...\" plus optional symbol for file context, and mode=\"graph\" for relationship exploration. If ingest_codebase hits a \"UNIQUE constraint failed: code_graph_nodes...\" error, rerun it with graph.enabled=false until the duplicate-node fix lands. Invoke the specialist tools directly when you need their richer metadata, and tune budgetTokens to keep downstream LLM context under control.";
+const SERVER_INSTRUCTIONS: &str = "Rust rewrite in progress. Rust server currently supports ingest_codebase, semantic_search, code_lookup (search mode), index_status, graph_neighbors, repository_timeline, and repository_timeline_entry; additional tooling is being ported.";
+const INDEXING_GUIDANCE_PROMPT_TEXT: &str = "Tools: code_lookup (routes to semantic search, context bundles, or graph neighbors), ingest_codebase (refresh the SQLite index; enable autoEvict/maxDatabaseSizeBytes to prune unused chunks), index_status (check freshness), semantic_search (direct embedding-powered retrieval that updates hotness), context_bundle (structured bundle trimmed to budgetTokens or INDEX_MCP_BUDGET_TOKENS), graph_neighbors (relationship explorer), indexing_guidance_tool (tool-form reminders), indexing_guidance (prompt version), repository_timeline (summarize recent git commits), repository_timeline_entry (recover cached commit details), and info (runtime diagnostics). Workflow: run ingest_codebase on a new checkout or after edits while respecting .gitignore, call index_status when freshness is uncertain, then reach for code_lookup—use query=\"...\" for discovery, file=\"...\" plus optional symbol for file context, and mode=\"graph\" for relationship exploration. If ingest_codebase hits a \"UNIQUE constraint failed: code_graph_nodes...\" error, rerun it with graph.enabled=false until the duplicate-node fix lands. Invoke the specialist tools directly when you need their richer metadata, and tune budgetTokens to keep downstream LLM context under control.";
 
 /// Primary server state for the Rust MCP implementation.
 #[derive(Clone)]
@@ -213,13 +224,26 @@ impl IndexMcpService {
             database_name,
             mode,
             query,
+            file,
+            symbol,
+            max_snippets,
+            max_neighbors,
+            budget_tokens,
             limit,
             model,
         } = params;
 
-        let mode = mode.unwrap_or_else(|| "search".to_string());
+        let resolved_mode = mode.unwrap_or_else(|| {
+            if query.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+                "search".to_string()
+            } else if file.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+                "bundle".to_string()
+            } else {
+                "search".to_string()
+            }
+        });
 
-        match mode.as_str() {
+        match resolved_mode.as_str() {
             "search" => {
                 let query = query.ok_or_else(|| {
                     McpError::invalid_params("code_lookup search mode requires a query.", None)
@@ -237,31 +261,28 @@ impl IndexMcpService {
                     .await
                     .map_err(convert_semantic_search_error)?;
 
-                build_code_lookup_result(mode, response)
+                build_code_lookup_result(resolved_mode, response)
             }
             "bundle" => {
-                let file = query.ok_or_else(|| {
-                    McpError::invalid_params(
-                        "code_lookup bundle mode expects the file path in the query field.",
-                        None,
-                    )
+                let file = file.or(query).ok_or_else(|| {
+                    McpError::invalid_params("code_lookup bundle mode requires a file path.", None)
                 })?;
 
                 let bundle_params = ContextBundleParams {
                     root,
                     database_name,
                     file,
-                    symbol: None,
-                    max_snippets: limit,
-                    max_neighbors: None,
-                    budget_tokens: None,
+                    symbol,
+                    max_snippets: max_snippets.or(limit),
+                    max_neighbors,
+                    budget_tokens,
                 };
 
                 let response = context_bundle(bundle_params)
                     .await
                     .map_err(convert_context_bundle_error)?;
 
-                build_code_lookup_bundle_response(mode, response)
+                build_code_lookup_bundle_response(resolved_mode, response)
             }
             _ => Err(McpError::invalid_params(
                 "Unsupported code_lookup mode. Supported modes: search, bundle.",
@@ -317,6 +338,22 @@ impl IndexMcpService {
             .map_err(convert_repository_timeline_error)?;
 
         build_repository_timeline_result(response)
+    }
+
+    #[tool(
+        name = "repository_timeline_entry",
+        description = "Fetch a stored repository timeline entry, including full diff text if available."
+    )]
+    async fn repository_timeline_entry_tool(
+        &self,
+        Parameters(params): Parameters<RepositoryTimelineEntryLookupParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let response = repository_timeline_entry_detail(params)
+            .await
+            .map_err(convert_repository_timeline_error)?;
+
+        build_repository_timeline_entry_result(response)
     }
 }
 
@@ -667,6 +704,17 @@ fn convert_repository_timeline_error(error: RepositoryTimelineError) -> McpError
         RepositoryTimelineError::Join(source) => {
             McpError::internal_error(format!("Background task failed: {source}"), None)
         }
+        RepositoryTimelineError::Database { path, source } => {
+            McpError::internal_error(format!("SQLite error at {path}: {source}"), None)
+        }
+        RepositoryTimelineError::Serialization(source) => McpError::internal_error(
+            format!("Failed to serialize repository timeline data: {source}"),
+            None,
+        ),
+        RepositoryTimelineError::EntryNotFound { commit_sha, path } => McpError::invalid_params(
+            format!("Commit {commit_sha} not found in timeline cache at {path}"),
+            None,
+        ),
     }
 }
 
@@ -745,7 +793,7 @@ fn build_graph_neighbors_result(
 fn build_repository_timeline_result(
     response: RepositoryTimelineResponse,
 ) -> Result<CallToolResult, McpError> {
-    let summary = if response.total_commits == 0 {
+    let mut summary = if response.total_commits == 0 {
         let since_segment = response
             .since
             .as_ref()
@@ -787,9 +835,49 @@ fn build_repository_timeline_result(
         )
     };
 
+    if response.include_diffs {
+        summary
+            .push_str(" Diffs cached in SQLite; call repository_timeline_entry for full output.");
+    }
+
     let value: Value = serde_json::to_value(&response).map_err(|error| {
         McpError::internal_error(
             format!("Failed to serialize repository timeline result: {error}"),
+            None,
+        )
+    })?;
+
+    let json_content = Content::json(value.clone()).map_err(|error| {
+        McpError::internal_error(format!("Failed to encode JSON content: {error}"), None)
+    })?;
+
+    Ok(CallToolResult {
+        content: vec![Content::text(summary), json_content],
+        structured_content: Some(value),
+        is_error: Some(false),
+        meta: None,
+    })
+}
+
+fn build_repository_timeline_entry_result(
+    response: RepositoryTimelineEntryLookupResponse,
+) -> Result<CallToolResult, McpError> {
+    let diff_len = response.diff.as_ref().map(|diff| diff.len()).unwrap_or(0);
+    let summary = if diff_len > 0 {
+        format!(
+            "repository_timeline_entry: retrieved diff for commit {} ({} bytes cached).",
+            response.entry.sha, diff_len
+        )
+    } else {
+        format!(
+            "repository_timeline_entry: no diff stored for commit {}.",
+            response.entry.sha
+        )
+    };
+
+    let value: Value = serde_json::to_value(&response).map_err(|error| {
+        McpError::internal_error(
+            format!("Failed to serialize repository timeline entry result: {error}"),
             None,
         )
     })?;
