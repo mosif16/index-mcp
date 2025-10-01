@@ -773,7 +773,7 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
   const searchPatterns = usingTargetPaths ? targetPaths : includeGlobs;
   const rootStats = await fs.stat(absoluteRoot);
   if (!rootStats.isDirectory()) {
-    throw new Error(`Ingest root must be a directory: ${absoluteRoot}`);
+    throw new Error(`Ingest root must be a directory: ${absoluteRoot}. Please ensure the path points to a valid directory.`);
   }
 
   const dbPath = path.join(absoluteRoot, databaseName);
