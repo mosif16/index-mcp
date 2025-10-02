@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::sync::{Arc, RwLock};
 
 use crate::bundle::{
@@ -19,7 +19,7 @@ use crate::ingest::{ingest_codebase, warm_up_embedder, IngestError, IngestParams
 use crate::remote_proxy::RemoteProxyRegistry;
 use crate::search::{
     semantic_search, summarize_semantic_search, SemanticSearchError, SemanticSearchParams,
-    SemanticSearchResponse,
+    SemanticSearchResponse, SuggestedTool,
 };
 use tracing::warn;
 
@@ -408,9 +408,12 @@ impl IndexMcpService {
             model: params.model,
         };
 
-        let response = semantic_search(search_params)
+        let mut response = semantic_search(search_params)
             .await
             .map_err(convert_semantic_search_error)?;
+
+        let snapshot = self.environment.snapshot();
+        response.suggested_tools = build_search_suggestions(&snapshot, &response);
 
         let meta = self.environment.build_search_meta(&response);
         build_semantic_search_result(response, meta)
@@ -487,9 +490,11 @@ impl IndexMcpService {
                     model,
                 };
 
-                let response = semantic_search(search_params)
+                let mut response = semantic_search(search_params)
                     .await
                     .map_err(convert_semantic_search_error)?;
+                let snapshot = self.environment.snapshot();
+                response.suggested_tools = build_search_suggestions(&snapshot, &response);
                 let meta = self.environment.build_search_meta(&response);
                 build_code_lookup_result(resolved_mode, response, Some(meta))
             }
@@ -818,6 +823,111 @@ fn build_semantic_search_result(
         is_error: Some(false),
         meta: Some(meta),
     })
+}
+
+fn build_search_suggestions(
+    snapshot: &EnvironmentSnapshot,
+    response: &SemanticSearchResponse,
+) -> Vec<SuggestedTool> {
+    const MAX_SUGGESTIONS: usize = 3;
+    if response.results.is_empty() {
+        return Vec::new();
+    }
+
+    let budget_hint = snapshot.bundle_budget().min(u32::MAX as usize) as u32;
+
+    response
+        .results
+        .iter()
+        .take(MAX_SUGGESTIONS)
+        .enumerate()
+        .map(|(index, result)| {
+            let mut params = Map::new();
+            if let Some(cwd) = snapshot.cwd.clone() {
+                params.insert("root".to_string(), json!(cwd));
+            }
+            params.insert("file".to_string(), json!(result.path));
+            if let Some(database_name) = response.database_name.as_ref() {
+                params.insert("databaseName".to_string(), json!(database_name));
+            }
+            params.insert("maxSnippets".to_string(), json!(DEFAULT_SNIPPET_LIMIT_HINT));
+            params.insert("maxNeighbors".to_string(), json!(6));
+            params.insert("budgetTokens".to_string(), json!(budget_hint));
+
+            let mut description = result.path.clone();
+
+            if let Some(start_line) = result
+                .line_start
+                .and_then(|line| (line > 0).then(|| line as u32))
+            {
+                params.insert("focusLine".to_string(), json!(start_line));
+
+                if let Some(end_line) = result
+                    .line_end
+                    .and_then(|line| (line > 0).then(|| line as u32))
+                {
+                    let range_end = end_line.max(start_line);
+                    params.insert(
+                        "ranges".to_string(),
+                        json!([{"startLine": start_line, "endLine": range_end}]),
+                    );
+                    description = format!("{}:{}-{}", result.path, start_line, range_end);
+                } else {
+                    description = format!("{}#L{}", result.path, start_line);
+                }
+            }
+
+            let preview = snippet_preview(&result.content, result.context_before.as_deref());
+
+            SuggestedTool {
+                tool: "context_bundle".to_string(),
+                rank: (index as u32) + 1,
+                score: result.normalized_score,
+                description: Some(description),
+                preview,
+                parameters: Value::Object(params),
+            }
+        })
+        .collect()
+}
+
+fn snippet_preview(content: &str, context_before: Option<&str>) -> Option<String> {
+    let mut fragments = Vec::new();
+    if let Some(before) = context_before {
+        let trimmed = before.trim();
+        if !trimmed.is_empty() {
+            fragments.push(trimmed);
+        }
+    }
+
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        if fragments.is_empty() {
+            return None;
+        }
+        return Some(compose_preview(&fragments));
+    }
+    fragments.push(trimmed);
+
+    Some(compose_preview(&fragments))
+}
+
+fn compose_preview(segments: &[&str]) -> String {
+    const MAX_PREVIEW_LEN: usize = 160;
+    let joined = segments
+        .iter()
+        .flat_map(|segment| segment.lines())
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let trimmed = joined.trim();
+    let mut chars = trimmed.chars();
+    let mut preview: String = chars.by_ref().take(MAX_PREVIEW_LEN).collect();
+    if chars.next().is_some() {
+        preview.push_str("...");
+    }
+    preview
 }
 
 fn build_code_lookup_result(
@@ -1321,6 +1431,7 @@ mod tests {
     fn summarize_semantic_search_reports_top_hit_and_score() {
         let response = SemanticSearchResponse {
             database_path: "db.sqlite".into(),
+            database_name: Some("db.sqlite".into()),
             embedding_model: Some("custom-model".into()),
             total_chunks: 1_000,
             evaluated_chunks: 250,
@@ -1340,6 +1451,7 @@ mod tests {
                 context_before: None,
                 context_after: None,
             }],
+            suggested_tools: Vec::new(),
         };
 
         let summary = crate::search::summarize_semantic_search(&response);

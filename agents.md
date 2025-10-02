@@ -22,8 +22,8 @@ Update both documents together when workflows change so global expectations and 
 | Tool / Prompt | Purpose & When to Use |
 |---------------|-------|
 | `ingest_codebase` | Walks the workspace, respects `.gitignore`, stores metadata and embeddings, and can auto‑evict least‑used chunks when requested. Run at session start or when the codebase changes significantly. |
-| `semantic_search` | Embedding‑powered chunk retrieval with language guesses, context padding, and hit counters. Ideal for finding code by concept or behavior. |
-| `code_lookup` | Router: `mode="search"` → semantic search, `mode="bundle"` → context bundles. Your primary tool for discovering and retrieving code efficiently. |
+| `semantic_search` | Embedding‑powered chunk retrieval with language guesses, context padding, hit counters, and ranked follow-up suggestions. Ideal for finding code by concept or behavior before chaining into deeper tools. |
+| `code_lookup` | Router: `mode="search"` → semantic search, `mode="bundle"` → context bundles. Mirrors search results plus suggestions, then executes the follow-up you choose. |
 | `context_bundle` | Returns file metadata, focus definitions, nearby snippets, and quick links within a token budget. It memoizes responses by file hash/ranges and will downgrade to excerpts or summaries while warning when you hit the budget; raise `budgetTokens` or narrow ranges when prompted. Great for assembling focused context. |
 | `index_status` | Summarizes index freshness, embedding models, ingestion history, and git parity. Check this to understand the current state of your index. |
 | `repository_timeline` | Streams recent git commits with churn stats, directory highlights, optional diffs, and PR URLs. Useful for understanding recent changes and project history. |
@@ -41,12 +41,14 @@ Update both documents together when workflows change so global expectations and 
 
 3. **Understand recent history** — Use `repository_timeline` (and `repository_timeline_entry` for detail) to see recent commits and changes that might inform your approach.
 
-4. **Discover code with `code_lookup`** — Start with `query="..."` to narrow scope semantically, then request `file="..."` plus optional `symbol` bundles for the specific snippets you need. This is typically the most efficient discovery mechanism.
+4. **Scout with `semantic_search`** — Issue a search first to get lightweight hit summaries and the auto-generated “suggested tool chain.” Let those suggestions guide the next hop instead of immediately fetching large bundles.
 
-5. **Assemble focused context** — Use `context_bundle` with `budgetTokens` or `INDEX_MCP_BUDGET_TOKENS` to get relevant snippets with proper citations rather than retrieving entire files unnecessarily.
+5. **Select guided follow-ups** — Execute the provided `context_bundle`, `repository_timeline`, or other suggested tool payloads. They inherit cwd, focus lines, snippet limits, and budgets so results stay tight and token-efficient.
 
-6. **Iterate efficiently** — Use `semantic_search` or additional `context_bundle` calls for deeper exploration rather than broad re-ingests when refining your understanding.
+6. **Assemble focused context** — When deeper detail is required, run the suggested `context_bundle` (or craft one manually) with `budgetTokens` or `INDEX_MCP_BUDGET_TOKENS` to pull just the relevant snippets.
 
-7. **Keep the index current** — After editing files, re-run `ingest_codebase` (or rely on watch mode) and confirm with `index_status` so subsequent operations work with updated information.
+7. **Iterate efficiently** — Use additional `semantic_search` calls to branch into new areas. Breadcrumb-aware suggestions will avoid repeating the same symbols and keep your context window clear.
+
+8. **Keep the index current** — After editing files, re-run `ingest_codebase` (or rely on watch mode) and confirm with `index_status` so subsequent operations work with updated information.
 
 **Smart Tool Usage:** When index-mcp tools are available, they typically provide the most efficient and accurate way to search, navigate, and understand codebases. Use them intelligently as your primary approach, but apply judgment about when direct file access or other methods might be more appropriate for specific tasks.

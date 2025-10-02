@@ -472,6 +472,7 @@ async fn semantic_search_section(config: &RunConfig, state: &mut RunState) -> Se
                     first.path, first.normalized_score
                 ));
             }
+            lines.extend(suggestion_lines(&response));
             if config.verbose {
                 dump_json("semantic_search response", &response);
             }
@@ -746,10 +747,53 @@ fn summarize_ingest(response: &IngestResponse) -> String {
 }
 
 fn summarize_code_lookup_search(response: &SemanticSearchResponse) -> String {
-    format!(
+    let mut lines = vec![format!(
         "code_lookup (search): mirrored {} semantic_search result(s)",
         response.results.len()
-    )
+    )];
+    lines.extend(suggestion_lines(response));
+    lines.join("\n")
+}
+
+fn suggestion_lines(response: &SemanticSearchResponse) -> Vec<String> {
+    if response.suggested_tools.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    lines.push("suggested tool chain:".to_string());
+
+    for suggestion in response.suggested_tools.iter().take(3) {
+        let description = suggestion.description.as_deref().unwrap_or("search match");
+        let mut line = format!(
+            "  {}#{} -> {} (score {:.2})",
+            suggestion.tool, suggestion.rank, description, suggestion.score
+        );
+
+        if let Some(preview) = suggestion.preview.as_deref() {
+            let cleaned = preview.replace('\n', " ").trim().to_string();
+            if !cleaned.is_empty() {
+                let mut snippet = String::new();
+                let mut truncated = false;
+                for (idx, ch) in cleaned.chars().enumerate() {
+                    if idx >= 80 {
+                        truncated = true;
+                        break;
+                    }
+                    snippet.push(ch);
+                }
+                if truncated {
+                    snippet.push_str("...");
+                }
+                line.push_str(" — ");
+                line.push_str(&snippet);
+            }
+        }
+
+        lines.push(line);
+    }
+
+    lines
 }
 
 fn summarize_context_bundle(response: &ContextBundleResponse) -> String {

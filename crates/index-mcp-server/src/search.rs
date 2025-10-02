@@ -7,6 +7,7 @@ use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use rmcp::schemars::{self, JsonSchema};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 use tokio::task::JoinError;
 
@@ -60,12 +61,29 @@ pub struct SemanticSearchMatch {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct SuggestedTool {
+    pub tool: String,
+    pub rank: u32,
+    pub score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    pub parameters: Value,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct SemanticSearchResponse {
     pub database_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_name: Option<String>,
     pub embedding_model: Option<String>,
     pub total_chunks: u64,
     pub evaluated_chunks: u64,
     pub results: Vec<SemanticSearchMatch>,
+    #[serde(default)]
+    pub suggested_tools: Vec<SuggestedTool>,
 }
 
 #[derive(Debug, Error)]
@@ -128,13 +146,13 @@ fn perform_semantic_search(
 
     let trimmed_query = query.trim();
     if trimmed_query.is_empty() {
-        return Ok(empty_response("", None));
+        return Ok(empty_response("", None, None));
     }
 
     let root_param = root.unwrap_or_else(|| "./".to_string());
     let absolute_root = resolve_root(&root_param)?;
-    let db_path =
-        absolute_root.join(database_name.unwrap_or_else(|| DEFAULT_DB_FILENAME.to_string()));
+    let database_name_value = database_name.unwrap_or_else(|| DEFAULT_DB_FILENAME.to_string());
+    let db_path = absolute_root.join(&database_name_value);
     let db_path_string = db_path.to_string_lossy().to_string();
 
     let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
@@ -145,7 +163,11 @@ fn perform_semantic_search(
         .unwrap_or(0);
 
     if total_chunks == 0 {
-        return Ok(empty_response(&db_path_string, model));
+        return Ok(empty_response(
+            &db_path_string,
+            Some(database_name_value),
+            model,
+        ));
     }
 
     let available_models = available_embedding_models(&conn)?;
@@ -257,20 +279,28 @@ fn perform_semantic_search(
 
     Ok(SemanticSearchResponse {
         database_path: db_path_string,
+        database_name: Some(database_name_value),
         embedding_model: Some(requested_model),
         total_chunks,
         evaluated_chunks,
         results,
+        suggested_tools: Vec::new(),
     })
 }
 
-fn empty_response(db_path: &str, model: Option<String>) -> SemanticSearchResponse {
+fn empty_response(
+    db_path: &str,
+    database_name: Option<String>,
+    model: Option<String>,
+) -> SemanticSearchResponse {
     SemanticSearchResponse {
         database_path: db_path.to_string(),
+        database_name,
         embedding_model: model,
         total_chunks: 0,
         evaluated_chunks: 0,
         results: Vec::new(),
+        suggested_tools: Vec::new(),
     }
 }
 
@@ -542,6 +572,18 @@ pub fn summarize_semantic_search(payload: &SemanticSearchResponse) -> String {
         summary.push_str(&format!(
             " Top hit: {} (score {:.2}).",
             location, top.normalized_score
+        ));
+    }
+
+    if let Some(suggestion) = payload.suggested_tools.first() {
+        summary.push_str(&format!(
+            " Suggested follow-up: run {} with focus on {} (score {:.2}).",
+            suggestion.tool,
+            suggestion
+                .description
+                .as_deref()
+                .unwrap_or("selected search match"),
+            suggestion.score
         ));
     }
 
