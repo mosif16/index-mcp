@@ -1,199 +1,42 @@
-# Implementation Summary: Stop Blowing Context (Simple Mode)
+# Implementation Summary: index-mcp Rust Server
 
-This document summarizes the changes made to implement the "Stop Blowing Context" feature as specified in the requirements. The feature was originally delivered in the now-removed Node/TypeScript runtime and its logic has since been ported to the Rust server.
+This document describes the Rust implementation that now powers the `index-mcp` Model Context Protocol server. The binary `index-mcp-server` supersedes the legacy Node/TypeScript runtime and exposes an identical tool surface through the [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) stack.
 
-## Overview
+## Tool Surface & Routing
 
-The implementation ensures that **raw index data is not sent to the LLM**. Instead, everything is stored in SQLite, and only a small, focused bundle is sent when requested.
+- `crates/index-mcp-server/src/service.rs` wires the standard MCP tools (`ingest_codebase`, `semantic_search`, `context_bundle`, `code_lookup`, `index_status`, `repository_timeline`, `repository_timeline_entry`, `indexing_guidance`, and `info`) and forwards requests to the underlying modules while applying consistent error handling and summary strings ([service.rs:1-115,293-341]).
+- `RemoteProxyRegistry` loads JSON descriptors from the `INDEX_MCP_REMOTE_SERVERS` environment variable and mounts the advertised remote tools under a namespaced name, allowing the Rust server to proxy additional MCP services ([remote_proxy.rs:1-202]).
+- Prompt instructions embedded in `service.rs` keep clients on the mandated workflow: ingest first, check freshness with `index_status`, gather history via `repository_timeline`, and rely on `code_lookup` bundles for citations.
 
-## Changes Made
+## Ingestion Pipeline (`crates/index-mcp-server/src/ingest.rs`)
 
-### 1. Ingest → SQLite ✅
+- `perform_ingest` resolves the workspace root, applies default include/exclude glob sets (skipping `.git`, build artifacts, and `.mcp-index.sqlite`), and optionally restricts ingestion to targeted paths ([ingest.rs:1-120,233-317]).
+- The walker hashes files, respects a configurable max size, and stores metadata and (optionally) file contents in the `files` table. Chunks are built with `fastembed` using a cached embedder, then written to `file_chunks` with embeddings, byte/line ranges, and hit counters ([ingest.rs:57-206,703-317]).
+- Each ingest writes an `ingestions` row, updates the `meta` table with the current `commit_sha` (via `git rev-parse`) and `indexed_at` timestamp, and purges removed files before committing ([ingest.rs:434-472]).
+- Source files feed a lightweight TypeScript-oriented code graph extractor that populates `code_graph_nodes`/`code_graph_edges`, enabling relationship-aware bundles ([graph.rs:1-132]).
+- Auto-eviction keeps the SQLite database near the configured ceiling by removing the coldest chunks/nodes when `autoEvict` and `maxDatabaseSizeBytes` are provided ([ingest.rs:725-779]).
+- `warm_up_embedder` exposes one-shot model initialization so long-lived agents can prime embeddings up front ([ingest.rs:1310-1340]).
 
-**What was built:**
-- Enhanced the existing `ingestCodebase` function to track git commit SHA
-- Added `meta` table to store:
-  - `commit_sha`: Current git commit at index time
-  - `indexed_at`: Timestamp when indexing occurred
-- Added `hits` column to the `file_chunks` table
-- Already respected `.gitignore` (existing functionality)
+## Semantic Lookup & Bundling
 
-**Files modified:**
-- `src/ingest.ts`: Added git commit tracking, meta table, hits columns
-- `src/ingest.ts`: Added `getCurrentGitCommitSha()` helper function
+- `semantic_search` opens the SQLite database read-only, resolves the desired embedding model, streams chunk embeddings, and maintains a top-k heap. Returned chunks carry surrounding context and trigger `UPDATE file_chunks SET hits = hits + 1` so usage influences eviction ([search.rs:1-231]).
+- `context_bundle` assembles file metadata, symbol definitions, graph neighbors, and related snippets. It respects explicit `maxSnippets`/`maxNeighbors` and trims snippets to the configured token budget (default 3 000 tokens or `INDEX_MCP_BUDGET_TOKENS`), appending truncation warnings when necessary ([bundle.rs:1-203,585-643]).
+- `code_lookup` inside `service.rs` routes `mode="search"` requests to semantic search and `mode="bundle"` to contextual bundles, mirroring the legacy “auto” router ([service.rs:293-341]).
 
-**Schema changes:**
-```sql
-CREATE TABLE IF NOT EXISTS meta (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL,
-  updated_at INTEGER NOT NULL
-);
+## Freshness & History Tracking
 
-ALTER TABLE file_chunks ADD COLUMN hits INTEGER DEFAULT 0;
-```
+- `index_status` tallies files, chunks, graph nodes, embeddings, and ingestion history, then compares the stored `commit_sha` against the current HEAD to compute an `is_stale` flag ([index_status.rs:1-166]).
+- `repository_timeline` shells out to `git log`, normalizes relative `since` expressions, captures churn statistics, diff previews, top files, and directory summaries, and persists each commit to `repository_timeline_entries` for later retrieval ([git_timeline.rs:1-954]).
+- `repository_timeline_entry_detail` reloads cached commits (including stored diffs) when a client drills into a specific SHA ([git_timeline.rs:309-394]).
 
-### 2. Lookup → SQLite First ✅
+## Runtime & Operations
 
-**What was built:**
-- The existing `code_lookup` tool already implements intelligent routing:
-  - Tries exact symbol/file match
-  - Falls back to semantic search
-- Hit tracking is automatically incremented when data is accessed
+- `main.rs` provides a CLI with logging controls (including optional file logging), working-directory overrides, and a `--watch` mode that schedules background ingests with debounce, quiet, and alternate-database options ([main.rs:1-178]).
+- `watcher.rs` drives the filesystem watcher: it compiles default include/exclude patterns, de-duplicates change events, and batches path-specific ingests using the same `IngestParams` structure ([watcher.rs:65-269]).
+- The helper script `start.sh` (`cargo run --release -p index-mcp-server`) keeps launch ergonomics compatible with prior agents.
 
-**Files modified:**
-- `src/search.ts`: Added hit tracking after semantic search results
-- `src/context-bundle.ts`: Added hit tracking when snippets/definitions are accessed
+## Stored Data Summary
 
-### 3. Bundle (Token Budget) ✅
+- SQLite tables include `files`, `file_chunks` (with embeddings and `hits`), `code_graph_nodes`, `code_graph_edges`, `ingestions`, `meta`, and `repository_timeline_entries`. Every ingest produces ingestion metrics and updates hit counters that downstream tooling (e.g., auto-eviction and bundle ranking) relies on ([ingest.rs:1089-1290], [git_timeline.rs:900-954]).
 
-**What was built:**
-- Enhanced `context_bundle` to support token budget parameter
-- Implemented `trimSnippetsToFitBudget()` function that:
-  - Prioritizes key definitions first
-  - Includes nearby lines
-  - Trims to budget (no dumping whole files)
-  - Returns citations map with `{file: [[start, end], ...]}`
-- Default budget: 3000 tokens (configurable via `INDEX_MCP_BUDGET_TOKENS` env var)
-
-**Files modified:**
-- `src/context-bundle.ts`: Added `budgetTokens` option and trimming logic
-- `src/environment.ts`: Added `getBudgetTokens()` function
-- `src/server.ts`: Integrated budget tokens into context_bundle tool
-
-**Token estimation:**
-- Uses simple heuristic: ~4 characters per token on average
-- Prioritizes definitions over raw content
-- Warns when content is trimmed
-
-### 4. Freshness ✅
-
-**What was built:**
-- Enhanced `index_status` to:
-  - Compare current git commit to `meta.commit_sha`
-  - Return `isStale` boolean flag
-  - Include both `currentCommitSha` and stored `commitSha`
-  - Track `indexedAt` timestamp
-
-**Files modified:**
-- `src/status.ts`: Added git commit comparison logic
-- `src/server.ts`: Updated output schema with new fields
-
-**Output includes:**
-```typescript
-{
-  commitSha: string | null,        // Stored commit SHA from last ingest
-  indexedAt: number | null,         // Timestamp of last ingest
-  currentCommitSha: string | null,  // Current HEAD commit
-  isStale: boolean                  // true if commits don't match
-}
-```
-
-### 5. Hotness ✅
-
-**What was built:**
-- Every served symbol/snippet increments `hits` in SQLite:
-  - `file_chunks.hits` incremented on semantic search results
-- Optional eviction mechanism:
-  - New `eviction.ts` module
-  - Evicts least-used rows when DB > configurable limit (default 150 MB)
-  - Eviction prioritizes keeping high-hit data
-  - Runs automatically after ingest if `autoEvict: true`
-
-**Files created:**
-- `src/eviction.ts`: New module for database size management
-
-**Files modified:**
-- `src/ingest.ts`: Added `autoEvict` and `maxDatabaseSizeBytes` options
-- `src/server.ts`: Updated ingest tool schema
-
-## Agent Router (3 Rules) ✅
-
-The existing `code_lookup` tool already implements the router pattern:
-
-1. **Call index_status; if stale → ingest_codebase**
-   - `index_status` now returns `isStale` flag
-   - Agent can check and re-ingest if needed
-
-2. **Use code_lookup(mode="auto")**
-   - Already implemented in `src/server.ts`
-   - Routes to semantic_search or context_bundle
-   - Falls back to semantic_search for low confidence
-
-3. **Never exceed bundle budget**
-   - Context bundle now enforces `budgetTokens` limit
-   - Always includes citations `{file: [[start, end]]}`
-   - Trims content to fit budget
-
-## Configuration (TOML)
-
-The implementation supports the suggested configuration:
-
-```toml
-[mcp_servers.index_mcp]
-command = "/Users/mohammedsayf/Desktop/index-mcp/start.sh"
-env = {
-  INDEX_MCP_DB = "/Users/mohammedsayf/Desktop/index-mcp/.mcp-index.sqlite",
-  INDEX_MCP_BUDGET_TOKENS = "3000"
-}
-startup_timeout_ms = 120000
-```
-
-**Environment variables added:**
-- `INDEX_MCP_BUDGET_TOKENS`: Default token budget for context bundles (default: 3000)
-
-**Note:** `INDEX_MCP_DB` is not currently used as the database is always stored at the repository root as `.mcp-index.sqlite`. This could be enhanced in the future.
-
-## Current Practices Maintained ✅
-
-- **Transport**: stdio only; JSON-RPC on stdout; logs → stderr (unchanged)
-- **Security**: secrets via env; TLS for non-localhost; validate Origin (unchanged)
-- **Streaming/Obs/Compat/Testing**: All existing checklists maintained (unchanged)
-
-## API Changes
-
-### Enhanced Tools
-
-#### `context_bundle`
-**New parameter:**
-- `budgetTokens` (integer, optional): Token budget for content trimming. Defaults to `INDEX_MCP_BUDGET_TOKENS` or 3000.
-
-**New output field:**
-- Warning added when content is trimmed to fit budget
-
-#### `index_status`
-**New output fields:**
-- `commitSha` (string | null): Git commit SHA from last ingest
-- `indexedAt` (number | null): Timestamp of last ingest
-- `currentCommitSha` (string | null): Current HEAD commit
-- `isStale` (boolean): Whether index needs refresh
-
-#### `ingest_codebase`
-**New parameters:**
-- `autoEvict` (boolean, optional): Automatically evict least-used data if DB exceeds limit
-- `maxDatabaseSizeBytes` (integer, optional): Max DB size before eviction (default: 150 MB)
-
-**New output field:**
-- `evicted` (object, optional): Contains `chunks` and `nodes` counts if eviction occurred
-
-## Testing
-
-The implementation builds successfully:
-```bash
-npm run build
-```
-
-Testing with a real repository requires the native module to be built, which is beyond the scope of this implementation. However, the TypeScript implementation is complete and will work correctly once the native module is available.
-
-## Summary
-
-This implementation successfully transforms index-mcp to "stop blowing context" by:
-
-1. ✅ **Storing everything in SQLite** with metadata tracking
-2. ✅ **Only sending small bundles** controlled by token budget
-3. ✅ **Tracking freshness** via git commit comparison
-4. ✅ **Implementing hotness** with hit tracking and eviction
-5. ✅ **Providing intelligent routing** through code_lookup
-6. ✅ **Maintaining existing practices** without breaking changes
-
-The core principle is now enforced: **Ingest to SQLite → query SQLite first → build a tiny bundle → send only that to the LLM.**
+With these pieces, the Rust server preserves the “stop blowing context” contract—index everything once, serve tightly scoped bundles, and keep the workspace cache authoritative—while adding native performance, watch-mode ingest, remote tool proxying, and richer git awareness.

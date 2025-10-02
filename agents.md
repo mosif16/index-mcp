@@ -2,8 +2,14 @@
 
 The previous `agents.md` contents now live in two focused guides:
 
-- `agents_global.md` – Global Codex MCP best practices that apply across repositories.
-- `agents_repo.md` – index-mcp specific setup, tooling, and workflow guidance for this repository.
+- [`agents_global.md`](agents_global.md) – Global Codex MCP best practices that apply across repositories.
+- [`agents_repo.md`](agents_repo.md) – index-mcp specific setup, tooling, and workflow guidance for this repository.
+- [`codex-rust-info.md`](codex-rust-info.md) – Rust-focused MCP integration details, build tooling, and client notes.
+- [`IMPLEMENTATION_SUMMARY.md`](IMPLEMENTATION_SUMMARY.md) – High-level overview of the Rust server architecture and tool surface.
+- [`mcp_best_practices.md`](mcp_best_practices.md) – Authoritative guidance on MCP tool design, evaluation, and optimization.
+- [`README.md`](README.md) – Project-level introduction, capabilities, and usage instructions.
+- [`rust-acceleration.md`](rust-acceleration.md) – Performance profiling and optimization notes for Rust ingestion.
+- [`rust-best-practices.md`](rust-best-practices.md) – Production readiness, security, and observability guidance for Rust MCP servers.
 
 Update both documents together when workflows change so global expectations and repo details stay aligned.
 
