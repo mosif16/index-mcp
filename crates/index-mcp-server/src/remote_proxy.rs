@@ -114,7 +114,6 @@ impl RemoteProxyRegistry {
         }
         descriptors
     }
-
 }
 
 pub struct RemoteServerProxy {

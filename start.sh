@@ -21,6 +21,25 @@ fi
 
 MODE="${MODE_ARG:-${INDEX_MCP_MODE:-production}}"
 
+RUNTIME_RAW="${INDEX_MCP_RUNTIME:-rust}"
+RUNTIME_NORMALIZED="$(printf '%s' "$RUNTIME_RAW" | tr '[:upper:]' '[:lower:]')"
+case "$RUNTIME_NORMALIZED" in
+  rust)
+    RUNTIME="rust"
+    ;;
+  node)
+    echo "[index-mcp] Error: INDEX_MCP_RUNTIME=node is no longer supported. Set INDEX_MCP_RUNTIME=rust." >&2
+    exit 1
+    ;;
+  "")
+    RUNTIME="rust"
+    ;;
+  *)
+    echo "[index-mcp] Warning: unknown INDEX_MCP_RUNTIME='${RUNTIME_RAW}'. Defaulting to 'rust'." >&2
+    RUNTIME="rust"
+    ;;
+esac
+
 PROFILE_DEFAULT="release"
 DEFAULT_ARGS=()
 
@@ -80,6 +99,6 @@ if [[ ${#SERVER_ARGS[@]} -gt 0 ]]; then
   CMD+=(-- "${SERVER_ARGS[@]}")
 fi
 
-echo "[index-mcp] Launching Rust MCP server (mode: $MODE, profile: $PROFILE)" >&2
+echo "[index-mcp] Launching Rust MCP server (mode: $MODE, profile: $PROFILE, runtime: $RUNTIME)" >&2
 cd "$SCRIPT_DIR"
 exec "${CMD[@]}"
