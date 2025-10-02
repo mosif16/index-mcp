@@ -53,6 +53,16 @@ This guide explains how to run the **index-mcp** Rust server with Codex CLI (or 
 - SQLite runtime libraries (bundled through `rusqlite` when using the `bundled` feature).
 Optional utilities: `sqlite3` CLI for ad-hoc inspection and `watchexec`/`entr` when scripting ingestion outside the built-in watcher.
 
+Verify your toolchain before wiring the server into an agent:
+
+```bash
+rustup show active-toolchain
+rustc --version
+cargo --version
+```
+
+Run `rustup update` periodically so long-lived agents benefit from compiler and dependency fixes.
+
 ## 3. Build and Run
 
 Common commands from the repository root:
@@ -90,13 +100,13 @@ The Rust binary registers the full tool surface that previously lived in the Nod
 
 | Tool / Prompt | Notes |
 |---------------|-------|
-| `ingest_codebase` | Walks the workspace, respects `.gitignore`, stores metadata, embeddings, and graph edges, supports incremental `paths`, and optional auto-eviction. |
-| `semantic_search` | Embedding-powered chunk retrieval with language guesses, classification, context padding, and hit counters. |
+| `ingest_codebase` | Walks the workspace, respects `.gitignore`, stores metadata, embeddings, and auto-evicts least-used chunks when requested. |
+| `semantic_search` | Embedding-powered chunk retrieval with language guesses, context padding, and hit counters. |
 | `code_lookup` | Routes `mode="search"` queries to semantic search and `mode="bundle"` to context bundles. |
-| `context_bundle` | Returns file metadata, focus definitions, docstrings, TODO counts, graph neighbors, snippets, and quick links. |
-| `graph_neighbors` | Expands GraphRAG nodes (imports/calls) in either direction with optional depth constraints. |
+| `context_bundle` | Returns file metadata, focus definitions, nearby snippets, and quick links within a token budget. |
 | `index_status` | Summarizes index freshness, embedding models, ingestion history, and git parity. |
 | `repository_timeline` | Streams recent git commits with churn stats, directory highlights, optional diffs, and PR URLs. |
+| `repository_timeline_entry` | Recovers cached commit details and (when available) full diff text for a specific SHA. |
 | `indexing_guidance` / `indexing_guidance_tool` | Prompt and tool variants for ingest reminders. |
 | Remote proxies | Any remote declared in `INDEX_MCP_REMOTE_SERVERS` is namespaced and surfaced alongside local tools. |
 
@@ -107,7 +117,7 @@ The server banner reminds clients to re-run `ingest_codebase` after edits, check
 1. **Initial ingest** – `ingest_codebase { "root": "." }` (or rely on `--watch`). Honor `.gitignore` to avoid bloating the database.
 2. **Verify freshness** – `index_status` reports missing ingests, schema mismatches, or git drift.
 3. **Discover context** – `code_lookup` (search/bundle), `semantic_search`, or `context_bundle` supply snippets and structured metadata.
-4. **Explore structure** – `graph_neighbors` for GraphRAG hops, `repository_timeline` for recent commits and diff summaries.
+4. **Explore structure** – Use `context_bundle` for localised snippets and `repository_timeline`/`repository_timeline_entry` for commit history and cached diffs.
 5. **Budget management** – Set `INDEX_MCP_BUDGET_TOKENS` (or pass `budgetTokens`) so responses fit within downstream context limits.
 6. **Remote tooling** – Configure `INDEX_MCP_REMOTE_SERVERS` (JSON array) to mount remote MCP endpoints; the Rust proxy maintains SSE connections, retries with exponential backoff, and mirrors tool metadata under `<namespace>.*` names.
 7. **Re-ingest after changes** – Re-run `ingest_codebase` or let watch mode feed the database incremental updates.

@@ -19,6 +19,37 @@ The project previously shipped a Node/TypeScript runtime. That implementation ha
 - SQLite runtime libraries (bundled automatically through `rusqlite` with the `bundled` feature).
 - Optional utilities: `sqlite3` CLI for inspection, `watchexec`/`entr` for custom watch workflows.
 
+## Installing Rust and Cargo
+
+1. **Install `rustup` (recommended path)**
+   - macOS / Linux:
+     ```bash
+     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+     ```
+     macOS users should install the Xcode Command Line Tools first: `xcode-select --install`.
+   - Windows: download and run the [`rustup-init.exe`](https://win.rustup.rs/) installer, then follow the prompts (the default "stable" toolchain is fine).
+2. **Reload your shell** so `~/.cargo/bin` is on `PATH` (`source ~/.cargo/env` for the current session if needed).
+3. **Verify the toolchain**
+   ```bash
+   rustc --version
+   cargo --version
+   ```
+   Both commands should report versions ≥ `1.76`.
+4. **Keep the toolchain current**
+   ```bash
+   rustup update
+   rustup component add clippy rustfmt   # Lints and formatting
+   ```
+   Install nightly or additional targets (for example `wasm32-wasi`) with `rustup toolchain install` / `rustup target add` if your workflow requires them.
+
+## Cargo Workflow Cheatsheet
+
+- `cargo build` / `cargo build --release` – Compile the project (debug vs. optimised binaries).
+- `cargo check` – Type-check quickly without producing binaries.
+- `cargo run -p index-mcp-server -- <flags>` – Launch the MCP server with optional CLI flags.
+- `cargo test` – Run the Rust test suite (no tests yet, but keep the command handy for future additions).
+- `cargo fmt` / `cargo clippy` – Apply formatting and static analysis; recommended before committing changes.
+
 ## Quick Start
 
 Compile or run the server directly with Cargo:
