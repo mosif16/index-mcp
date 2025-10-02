@@ -88,19 +88,19 @@ struct SemanticSearchRequest {
 }
 
 /// Textual instructions shared with MCP clients.
-const SERVER_INSTRUCTIONS: &str = r#"Rust rewrite in progress. Follow this workflow so the index stays authoritative and queries stay lean:
-1. Run ingest_codebase {"root": "."} (or start watch mode) before any lookup. Honor .gitignore, skip files larger than 8 MiB, and set autoEvict/maxDatabaseSizeBytes when the SQLite file grows.
-2. Call index_status whenever freshness is unclear. Re-ingest immediately if it reports staleness.
-3. Prefer code_lookup for discovery: query="..." routes to semantic search; file="..." plus an optional symbol returns a bundle.
-4. Review repository_timeline (and repository_timeline_entry) before planning or applying code changes.
-5. Use semantic_search for follow-up refinement and context_bundle for targeted file context, keeping responses within INDEX_MCP_BUDGET_TOKENS or an explicit budgetTokens value.
-6. Re-run ingest_codebase after edits, or rely on watch mode so the database reflects the latest workspace state.
-7. Keep responses compact—set INDEX_MCP_BUDGET_TOKENS, trim limits, and reach for info or indexing_guidance when diagnostics or reminders are needed.
+const SERVER_INSTRUCTIONS: &str = r#"Rust rewrite is production-ready. Treat this server as the workspace source of truth and follow this proactive workflow:
+1. Prime the index at session start with ingest_codebase {"root": "."} or --watch. Honor .gitignore, skip files larger than 8 MiB, and tune autoEvict/maxDatabaseSizeBytes before the SQLite file balloons.
+2. Check index_status before planning or answering. If HEAD moved or isStale is true, ingest again before proceeding.
+3. Brief yourself with repository_timeline (and repository_timeline_entry for deep dives) so your plan reflects the latest commits.
+4. Use code_lookup in auto mode to assemble payloads: start with query="..." to explore, then request file/symbol bundles for snippets you will cite.
+5. Deliver compact payloads—prefer context_bundle with budgetTokens or INDEX_MCP_BUDGET_TOKENS, include citations, and avoid dumping whole files.
+6. When you need additional detail, follow up with semantic_search or focused context_bundle calls instead of broad re-ingests.
+7. After modifying files, re-run ingest_codebase or rely on watch mode, then confirm freshness with index_status/info so the next task sees the updated payload.
 
 Available tools: ingest_codebase, index_status, code_lookup (search/bundle), semantic_search, context_bundle, repository_timeline, repository_timeline_entry, indexing_guidance, indexing_guidance_tool, info."#;
 const INDEXING_GUIDANCE_PROMPT_TEXT: &str = r#"Workflow reminder:
-1. ingest_codebase {"root": "."} (or watch) after a checkout or edits—respect .gitignore, skip files >8 MiB, and tune autoEvict/maxDatabaseSizeBytes as needed.
-2. index_status whenever freshness is uncertain; rerun ingest_codebase if it reports stale data.
+1. Prime the index after a checkout, pull, or edit by running ingest_codebase {"root": "."} (or enabling watch mode); respect .gitignore, skip files >8 MiB, and configure autoEvict/maxDatabaseSizeBytes when needed.
+2. Call index_status before reasoning. If it reports staleness or a HEAD mismatch, ingest before continuing.
 3. code_lookup first (query="..." for search, file="..." + symbol for bundles), then semantic_search/context_bundle for refinements.
 4. repository_timeline and repository_timeline_entry before planning or applying changes.
 5. Keep answers tight: set INDEX_MCP_BUDGET_TOKENS or pass budgetTokens, trim limits, and prefer info/indexing_guidance_tool for diagnostics."#;
@@ -110,7 +110,6 @@ const INDEXING_GUIDANCE_PROMPT_TEXT: &str = r#"Workflow reminder:
 pub struct IndexMcpService {
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
-    remote_registry: RemoteProxyRegistry,
 }
 
 impl IndexMcpService {
@@ -145,7 +144,6 @@ impl IndexMcpService {
         Ok(Self {
             tool_router,
             prompt_router,
-            remote_registry,
         })
     }
 }

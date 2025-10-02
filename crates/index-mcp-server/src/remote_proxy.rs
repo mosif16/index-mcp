@@ -16,7 +16,8 @@ use rmcp::service::{
 use rmcp::transport::SseClientTransport;
 use serde::Deserialize;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tokio::time::{sleep, Duration};
+use tracing::{debug, info, warn};
 
 use rmcp::ErrorData as McpError;
 use rmcp::RoleClient;
@@ -114,14 +115,12 @@ impl RemoteProxyRegistry {
         descriptors
     }
 
-    pub fn proxies(&self) -> &[Arc<RemoteServerProxy>] {
-        &self.proxies
-    }
 }
 
 pub struct RemoteServerProxy {
     config: RemoteServerConfig,
     state: Mutex<Option<RemoteClientState>>,
+    retry_policy: RetryPolicy,
 }
 
 struct RemoteClientState {
@@ -131,9 +130,11 @@ struct RemoteClientState {
 
 impl RemoteServerProxy {
     fn new(config: RemoteServerConfig) -> Self {
+        let retry_policy = RetryPolicy::from_config(config.retry.as_ref());
         Self {
             config,
             state: Mutex::new(None),
+            retry_policy,
         }
     }
 
@@ -166,14 +167,21 @@ impl RemoteServerProxy {
     }
 
     async fn fetch_remote_tools(&self) -> Result<Vec<Tool>, RemoteProxyError> {
-        let peer = self.ensure_peer().await?;
-        match peer.list_all_tools().await {
-            Ok(tools) => Ok(tools.into_iter().map(sanitize_tool).collect()),
-            Err(error) => {
-                self.teardown().await;
-                Err(RemoteProxyError::Service(error))
-            }
-        }
+        self.retry_policy
+            .execute(|_attempt| {
+                let this = self;
+                async move {
+                    let peer = this.ensure_peer().await?;
+                    match peer.list_all_tools().await {
+                        Ok(tools) => Ok(tools.into_iter().map(sanitize_tool).collect()),
+                        Err(error) => {
+                            this.teardown().await;
+                            Err(RemoteProxyError::Service(error))
+                        }
+                    }
+                }
+            })
+            .await
     }
 
     pub async fn call_tool(
@@ -181,34 +189,52 @@ impl RemoteServerProxy {
         tool_name: &str,
         arguments: JsonObject,
     ) -> Result<CallToolResult, McpError> {
-        let peer = self.ensure_peer().await.map_err(|error| error.into_mcp())?;
+        let arguments = Arc::new(arguments);
 
-        let request_name: String = tool_name.to_string();
-
-        match peer
-            .call_tool(CallToolRequestParam {
-                name: request_name.into(),
-                arguments: Some(arguments),
+        self.retry_policy
+            .execute(|_attempt| {
+                let this = self;
+                let name = tool_name.to_string();
+                let arguments = Arc::clone(&arguments);
+                async move {
+                    let peer = this.ensure_peer().await?;
+                    match peer
+                        .call_tool(CallToolRequestParam {
+                            name: name.clone().into(),
+                            arguments: Some((*arguments).clone()),
+                        })
+                        .await
+                    {
+                        Ok(result) => Ok(result),
+                        Err(error) => {
+                            this.teardown().await;
+                            Err(RemoteProxyError::Service(error))
+                        }
+                    }
+                }
             })
             .await
-        {
-            Ok(result) => Ok(result),
-            Err(error) => {
-                self.teardown().await;
-                Err(RemoteProxyError::Service(error).into_mcp())
-            }
-        }
+            .map_err(|error| error.into_mcp())
     }
 
     async fn ensure_peer(&self) -> Result<Peer<RoleClient>, RemoteProxyError> {
-        let mut guard = self.state.lock().await;
-        if let Some(state) = guard.as_ref() {
-            return Ok(state.peer.clone());
+        {
+            let guard = self.state.lock().await;
+            if let Some(state) = guard.as_ref() {
+                return Ok(state.peer.clone());
+            }
         }
 
-        let new_state = self.initialize_client().await?;
+        let new_state = self
+            .retry_policy
+            .execute(|_attempt| async { self.initialize_client().await })
+            .await?;
+
         let peer = new_state.peer.clone();
+
+        let mut guard = self.state.lock().await;
         *guard = Some(new_state);
+
         Ok(peer)
     }
 
@@ -309,6 +335,88 @@ struct RemoteClientHandler {
     server_name: String,
 }
 
+#[derive(Clone, Debug)]
+struct RetryPolicy {
+    max_attempts: u32,
+    initial_delay: Duration,
+    max_delay: Duration,
+    backoff_multiplier: f64,
+}
+
+impl RetryPolicy {
+    fn from_config(config: Option<&RetryConfig>) -> Self {
+        const DEFAULT_ATTEMPTS: u32 = 3;
+        const DEFAULT_INITIAL_DELAY_MS: u64 = 500;
+        const DEFAULT_MAX_DELAY_MS: u64 = 10_000;
+        const DEFAULT_BACKOFF: f64 = 2.0;
+
+        let (max_attempts, initial_delay_ms, max_delay_ms, backoff_multiplier) = config
+            .map(|cfg| {
+                (
+                    cfg.max_attempts.unwrap_or(DEFAULT_ATTEMPTS).max(1),
+                    cfg.initial_delay_ms.unwrap_or(DEFAULT_INITIAL_DELAY_MS),
+                    cfg.max_delay_ms.unwrap_or(DEFAULT_MAX_DELAY_MS),
+                    cfg.backoff_multiplier.unwrap_or(DEFAULT_BACKOFF),
+                )
+            })
+            .unwrap_or((
+                DEFAULT_ATTEMPTS,
+                DEFAULT_INITIAL_DELAY_MS,
+                DEFAULT_MAX_DELAY_MS,
+                DEFAULT_BACKOFF,
+            ));
+
+        let initial_delay = Duration::from_millis(initial_delay_ms);
+        let max_delay = Duration::from_millis(max_delay_ms.max(initial_delay_ms));
+        let backoff_multiplier = if backoff_multiplier < 1.0 {
+            1.0
+        } else {
+            backoff_multiplier
+        };
+
+        Self {
+            max_attempts,
+            initial_delay,
+            max_delay,
+            backoff_multiplier,
+        }
+    }
+
+    async fn execute<F, Fut, T>(&self, mut operation: F) -> Result<T, RemoteProxyError>
+    where
+        F: FnMut(u32) -> Fut,
+        Fut: Future<Output = Result<T, RemoteProxyError>> + Send,
+    {
+        let mut attempt: u32 = 0;
+        let mut delay = self.initial_delay;
+
+        loop {
+            let result = operation(attempt).await;
+            match result {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    if !error.is_retryable() {
+                        return Err(error);
+                    }
+
+                    attempt += 1;
+                    if attempt >= self.max_attempts {
+                        debug!(attempt, error = ?error, "Retry attempts exhausted for remote operation");
+                        return Err(error);
+                    }
+
+                    let sleep_duration = delay.min(self.max_delay);
+                    if sleep_duration > Duration::ZERO {
+                        sleep(sleep_duration).await;
+                    }
+                    let next_delay = delay.mul_f64(self.backoff_multiplier);
+                    delay = next_delay.min(self.max_delay);
+                }
+            }
+        }
+    }
+}
+
 impl Service<RoleClient> for RemoteClientHandler {
     fn handle_request(
         &self,
@@ -328,16 +436,17 @@ impl Service<RoleClient> for RemoteClientHandler {
         notification: ServerNotification,
         _context: NotificationContext<RoleClient>,
     ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        let server = self.server_name.clone();
         async move {
             match notification {
                 ServerNotification::LoggingMessageNotification(log) => {
-                    info!(target: "remote", params = ?log.params, "Remote log message");
+                    info!(target: "remote", server = %server, params = ?log.params, "Remote log message");
                 }
                 ServerNotification::ProgressNotification(progress) => {
-                    info!(target: "remote", params = ?progress.params, "Remote progress update");
+                    info!(target: "remote", server = %server, params = ?progress.params, "Remote progress update");
                 }
                 other => {
-                    info!(target: "remote", ?other, "Remote notification");
+                    info!(target: "remote", server = %server, ?other, "Remote notification");
                 }
             }
             Ok(())
@@ -438,6 +547,20 @@ impl RemoteProxyError {
             RemoteProxyError::Auth(message) => {
                 McpError::invalid_params(format!("Remote authentication error: {message}"), None)
             }
+        }
+    }
+
+    fn is_retryable(&self) -> bool {
+        match self {
+            RemoteProxyError::Transport(_) => true,
+            RemoteProxyError::Service(error) => matches!(
+                error,
+                ServiceError::TransportSend(_)
+                    | ServiceError::TransportClosed
+                    | ServiceError::Timeout { .. }
+            ),
+            RemoteProxyError::ClientInit(_) => true,
+            RemoteProxyError::Config(_) | RemoteProxyError::Auth(_) => false,
         }
     }
 }

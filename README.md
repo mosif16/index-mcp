@@ -63,15 +63,17 @@ cargo run -p index-mcp-server -- --help      # Inspect runtime flags
 cargo run -p index-mcp-server --bin ingest_debug --release
 ```
 
-The repository includes a convenience launcher, `start.sh`, which wraps the same `cargo run` invocation while honouring environment overrides:
+The repository includes a convenience launcher, `start.sh`, which wraps the same `cargo run` invocation while honouring environment overrides and mode presets:
 
 ```bash
-./start.sh                                  # Uses release profile by default
-INDEX_MCP_CARGO_PROFILE=debug ./start.sh    # Opt into a custom cargo profile
-INDEX_MCP_ARGS="--watch" ./start.sh        # Forward additional CLI flags
+./start.sh                                  # Production mode (release profile)
+./start.sh production                       # Explicit production launch
+./start.sh dev                              # Development mode (debug + watcher defaults)
+INDEX_MCP_MODE=dev INDEX_MCP_ARGS="--watch-debounce=250" ./start.sh
+./start.sh production --watch-quiet         # Mode arg plus extra runtime flags
 ```
 
-`INDEX_MCP_ARGS` is tokenised by the shell before being appended after `--` so any runtime flag accepted by the server can be supplied (for example, `--watch-debounce=250`).
+`INDEX_MCP_MODE` or the first positional argument choose between `production` and `development` presets. Additional CLI flags can be provided via `INDEX_MCP_ARGS` or by appending them after the mode; both paths are tokenised before being passed downstream.
 
 ## Watch Mode
 
@@ -79,7 +81,8 @@ Enable watch mode either via Cargo directly or with the helper script:
 
 ```bash
 cargo run -p index-mcp-server --release -- --watch --watch-debounce=250
-INDEX_MCP_ARGS="--watch --watch-no-initial" ./start.sh
+./start.sh dev                             # Debug build with watcher defaults
+./start.sh production --watch --watch-no-initial
 ```
 
 Key flags:
@@ -109,6 +112,16 @@ To cap database size during ingest:
 ```
 
 Pass the payload above to the `ingest_codebase` tool (for example via the MCP client you are integrating with). The server evicts the least-used rows until the size target is met.
+
+## Recommended Agent Workflow
+
+- **Prime the index** at the start of every session: run `ingest_codebase { "root": "." }` or launch the server with `--watch`. Respect `.gitignore`, skip artifacts larger than 8 MiB, and configure `autoEvict`/`maxDatabaseSizeBytes` before the database grows out of control.
+- **Check freshness before reasoning** by calling `index_status`. If `isStale` is true or HEAD moved, re-run ingest before answering questions.
+- **Brief yourself on recent commits** with `repository_timeline` (and `repository_timeline_entry` when you need detailed diffs) so plans reflect the latest changes.
+- **Assemble payloads with `code_lookup`**: start with `query="..."` to scope results, then request `file="..."` plus optional `symbol` bundles for the snippets you intend to cite.
+- **Deliver targeted context** using `context_bundle` with `budgetTokens` (or `INDEX_MCP_BUDGET_TOKENS`), include citations, and avoid dumping entire files into responses.
+- **Refine without re-ingesting** by leaning on `semantic_search` or additional `context_bundle` calls for deeper dives.
+- **Close the loop after edits**: re-run ingest (or keep watch mode active) and confirm with `index_status`/`info` so downstream tasks consume fresh data.
 
 ## Remote MCP Proxying
 
@@ -143,5 +156,6 @@ Remote tools are surfaced under `<namespace>.<tool>` and benefit from the same s
 
 - `rust-migration.md` – status tracker for the Rust rewrite (formerly `docs/rust-migration.md`).
 - `rust-acceleration.md` – design notes and benchmarks for the native pipeline (formerly `docs/rust-acceleration.md`).
-- `agents.md` – guidance for wiring the server into MCP-compatible clients.
+- `agents_repo.md` – repository-specific guidance for wiring the server into MCP-compatible clients.
+- `agents_global.md` – Codex MCP best practices and global operating guidance.
 - `IMPLEMENTATION_SUMMARY.md` – historical context for the token-budget and hotness tracking features.
