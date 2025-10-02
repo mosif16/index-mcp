@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
-use once_cell::sync::Lazy;
+use once_cell::sync::{Lazy, OnceCell};
 use rmcp::schemars::{self, JsonSchema};
 use rusqlite::{params, Connection, OpenFlags, Transaction};
 use serde::{Deserialize, Serialize};
@@ -32,15 +32,19 @@ pub(crate) const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
     "**/vendor/**",
     "**/dist/**",
     "**/build/**",
+    "**/.fastembed_cache*/**",
 ];
 
-pub(crate) const DEFAULT_EMBEDDING_MODEL: &str = "Xenova/bge-small-en-v1.5";
+pub(crate) const DEFAULT_EMBEDDING_MODEL: &str = "Xenova/all-MiniLM-L6-v2";
 const DEFAULT_CHUNK_SIZE_TOKENS: usize = 256;
 const DEFAULT_CHUNK_OVERLAP_TOKENS: usize = 32;
 const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 32;
 const DEFAULT_MAX_DATABASE_SIZE_BYTES: u64 = 150 * 1024 * 1024; // 150 MB
 
-static EMBEDDER_CACHE: Lazy<Mutex<HashMap<String, Arc<Mutex<TextEmbedding>>>>> =
+type EmbedderHandle = Arc<Mutex<TextEmbedding>>;
+type EmbedderEntry = Arc<OnceCell<EmbedderHandle>>;
+
+static EMBEDDER_CACHE: Lazy<Mutex<HashMap<String, EmbedderEntry>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -86,6 +90,7 @@ pub struct EmbeddingParams {
 struct EmbeddingConfig {
     enabled: bool,
     model: String,
+    model_variant: EmbeddingModel,
     chunk_size_tokens: usize,
     chunk_overlap_tokens: usize,
     batch_size: Option<usize>,
@@ -316,6 +321,7 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
     let transaction = conn.transaction()?;
 
     let existing_files = load_existing_files(&transaction)?;
+    let existing_models = load_existing_embedding_models(&transaction)?;
     let existing_paths: HashSet<String> = existing_files.keys().cloned().collect();
     let relevant_existing_paths: HashSet<String> = if using_target_paths {
         existing_paths
@@ -349,6 +355,10 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
                     && metadata.size == size_bytes
             })
             .unwrap_or(false);
+        let model_matches = existing_models
+            .get(&path)
+            .map(|model| model == &embedding_config.model)
+            .unwrap_or(false);
 
         upsert_file(
             &transaction,
@@ -363,7 +373,7 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
         retained_paths.insert(path.clone());
         ingested_count += 1;
 
-        if is_unchanged {
+        if is_unchanged && model_matches {
             reused_count += 1;
             continue;
         }
@@ -511,33 +521,43 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
 
     if embedding_config.enabled && !chunk_locations.is_empty() {
         let embedder = get_or_create_embedder(&embedding_config)?;
-        let texts: Vec<String> = chunk_locations
-            .iter()
-            .map(|(path, index)| {
-                chunk_records_by_path
+        let mut guard = embedder.lock().map_err(|error| {
+            IngestError::Embedding(format!("failed to acquire embedder: {error}"))
+        })?;
+
+        let stream_batch_size = embedding_config
+            .batch_size
+            .unwrap_or(DEFAULT_EMBEDDING_BATCH_SIZE)
+            .max(1);
+
+        let mut batch_start = 0usize;
+        while batch_start < chunk_locations.len() {
+            let batch_end = (batch_start + stream_batch_size).min(chunk_locations.len());
+            let mut batch_texts = Vec::with_capacity(batch_end - batch_start);
+
+            for (path, index) in &chunk_locations[batch_start..batch_end] {
+                let content = chunk_records_by_path
                     .get(path)
                     .and_then(|records| records.get(*index))
                     .map(|record| record.content.clone())
-                    .unwrap_or_default()
-            })
-            .collect();
+                    .unwrap_or_default();
+                batch_texts.push(content);
+            }
 
-        let embeddings = {
-            let mut guard = embedder.lock().map_err(|error| {
-                IngestError::Embedding(format!("failed to acquire embedder: {error}"))
-            })?;
-            guard
-                .embed(texts, embedding_config.batch_size)
-                .map_err(|error| IngestError::Embedding(error.to_string()))?
-        };
+            let embeddings = guard
+                .embed(batch_texts, embedding_config.batch_size)
+                .map_err(|error| IngestError::Embedding(error.to_string()))?;
 
-        for (idx, embedding_vec) in embeddings.into_iter().enumerate() {
-            let (path, record_index) = &chunk_locations[idx];
-            if let Some(records) = chunk_records_by_path.get_mut(path) {
-                if let Some(record) = records.get_mut(*record_index) {
-                    record.embedding = Some(embedding_vec);
+            for (offset, embedding_vec) in embeddings.into_iter().enumerate() {
+                let (path, record_index) = &chunk_locations[batch_start + offset];
+                if let Some(records) = chunk_records_by_path.get_mut(path) {
+                    if let Some(record) = records.get_mut(*record_index) {
+                        record.embedding = Some(embedding_vec);
+                    }
                 }
             }
+
+            batch_start = batch_end;
         }
 
         let mut insert_stmt = transaction.prepare(
@@ -623,6 +643,10 @@ fn resolve_embedding_config(
         .model
         .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
 
+    let model_variant = EmbeddingModel::from_str(&model).map_err(|error| {
+        IngestError::Embedding(format!("Unknown embedding model '{model}': {error}"))
+    })?;
+
     let chunk_size_tokens = params
         .chunk_size_tokens
         .map(|value| value.max(1) as usize)
@@ -634,18 +658,41 @@ fn resolve_embedding_config(
         .unwrap_or(DEFAULT_CHUNK_OVERLAP_TOKENS)
         .min(chunk_size_tokens);
 
-    let batch_size = params
-        .batch_size
-        .map(|value| value.max(1) as usize)
-        .or(Some(DEFAULT_EMBEDDING_BATCH_SIZE));
+    let batch_size = match params.batch_size {
+        Some(value) => Some(value.max(1) as usize),
+        None => {
+            if is_quantized_model(&model_variant) {
+                None
+            } else {
+                Some(DEFAULT_EMBEDDING_BATCH_SIZE)
+            }
+        }
+    };
 
     Ok(EmbeddingConfig {
         enabled,
         model,
+        model_variant,
         chunk_size_tokens,
         chunk_overlap_tokens,
         batch_size,
     })
+}
+
+fn is_quantized_model(model: &EmbeddingModel) -> bool {
+    matches!(
+        model,
+        EmbeddingModel::AllMiniLML6V2Q
+            | EmbeddingModel::AllMiniLML12V2Q
+            | EmbeddingModel::BGEBaseENV15Q
+            | EmbeddingModel::BGELargeENV15Q
+            | EmbeddingModel::BGESmallENV15Q
+            | EmbeddingModel::NomicEmbedTextV15Q
+            | EmbeddingModel::ParaphraseMLMiniLML12V2Q
+            | EmbeddingModel::MxbaiEmbedLargeV1Q
+            | EmbeddingModel::GTEBaseENV15Q
+            | EmbeddingModel::GTELargeENV15Q
+    )
 }
 
 fn resolve_target_entries(root: &Path, paths: Option<Vec<String>>) -> Vec<TargetEntry> {
@@ -1116,6 +1163,26 @@ fn load_existing_files(
     Ok(map)
 }
 
+fn load_existing_embedding_models(
+    conn: &Transaction<'_>,
+) -> Result<HashMap<String, String>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT path, embedding_model FROM file_chunks WHERE embedding_model IS NOT NULL GROUP BY path, embedding_model",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    let mut map = HashMap::new();
+    for row in rows {
+        if let Ok((path, model)) = row {
+            map.insert(path, model);
+        }
+    }
+
+    Ok(map)
+}
+
 fn query_table_count(conn: &Connection, table: &str) -> Result<usize, rusqlite::Error> {
     let sql = format!("SELECT COUNT(*) FROM {table}");
     conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
@@ -1203,41 +1270,30 @@ fn upsert_meta(
     Ok(())
 }
 
-fn get_or_create_embedder(
-    config: &EmbeddingConfig,
-) -> Result<Arc<Mutex<TextEmbedding>>, IngestError> {
+fn get_or_create_embedder(config: &EmbeddingConfig) -> Result<EmbedderHandle, IngestError> {
     let model_name = config.model.trim().to_string();
 
-    if let Some(embedder) = EMBEDDER_CACHE
-        .lock()
-        .map_err(|error| {
+    let entry = {
+        let mut cache = EMBEDDER_CACHE.lock().map_err(|error| {
             IngestError::Embedding(format!("failed to access embedder cache: {error}"))
-        })?
-        .get(&model_name)
-        .cloned()
-    {
-        return Ok(embedder);
-    }
+        })?;
+        cache
+            .entry(model_name.clone())
+            .or_insert_with(|| Arc::new(OnceCell::new()))
+            .clone()
+    };
 
-    let embedder = Arc::new(Mutex::new(initialize_embedder(&model_name)?));
-
-    let mut cache = EMBEDDER_CACHE.lock().map_err(|error| {
-        IngestError::Embedding(format!("failed to access embedder cache: {error}"))
+    let model_variant = config.model_variant.clone();
+    let handle = entry.get_or_try_init(move || {
+        initialize_embedder(model_variant.clone())
+            .map(|embedder| Arc::new(Mutex::new(embedder)) as EmbedderHandle)
     })?;
 
-    if let Some(existing) = cache.get(&model_name) {
-        return Ok(existing.clone());
-    }
-
-    cache.insert(model_name, embedder.clone());
-    Ok(embedder)
+    Ok(handle.clone())
 }
 
-fn initialize_embedder(model_name: &str) -> Result<TextEmbedding, IngestError> {
-    let parsed = EmbeddingModel::from_str(model_name).map_err(|error| {
-        IngestError::Embedding(format!("Unknown embedding model '{model_name}': {error}"))
-    })?;
-    let options = TextInitOptions::new(parsed).with_show_download_progress(false);
+fn initialize_embedder(model: EmbeddingModel) -> Result<TextEmbedding, IngestError> {
+    let options = TextInitOptions::new(model).with_show_download_progress(false);
 
     TextEmbedding::try_new(options).map_err(|error| IngestError::Embedding(error.to_string()))
 }
@@ -1277,6 +1333,16 @@ fn get_current_commit_sha(root: &Path) -> Result<String, std::io::Error> {
 
 fn normalize_path(path: &str) -> String {
     path.replace("\\", "/")
+}
+
+pub fn warm_up_embedder(model: Option<String>) -> Result<(), IngestError> {
+    let params = EmbeddingParams {
+        model,
+        ..Default::default()
+    };
+    let config = resolve_embedding_config(Some(params))?;
+
+    get_or_create_embedder(&config).map(|_| ())
 }
 
 fn file_modified_to_ms(metadata: &fs::Metadata) -> i64 {

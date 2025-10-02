@@ -13,12 +13,13 @@ use crate::git_timeline::{
 use crate::index_status::{
     get_index_status, IndexStatusError, IndexStatusParams, IndexStatusResponse,
 };
-use crate::ingest::{ingest_codebase, IngestError, IngestParams, IngestResponse};
+use crate::ingest::{ingest_codebase, warm_up_embedder, IngestError, IngestParams, IngestResponse};
 use crate::remote_proxy::RemoteProxyRegistry;
 use crate::search::{
     semantic_search, summarize_semantic_search, SemanticSearchError, SemanticSearchParams,
     SemanticSearchResponse,
 };
+use tracing::warn;
 
 use rmcp::{
     handler::server::{
@@ -118,6 +119,14 @@ impl IndexMcpService {
                 });
             tool_router.add_route(route);
         }
+
+        tokio::spawn(async {
+            match tokio::task::spawn_blocking(|| warm_up_embedder(None)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(?error, "Embedder warm-up failed"),
+                Err(join_error) => warn!(?join_error, "Embedder warm-up task cancelled"),
+            }
+        });
 
         Ok(Self {
             tool_router,

@@ -19,7 +19,7 @@ use git_timeline::{
     RepositoryTimelineResponse,
 };
 use index_status::{get_index_status, IndexStatusError, IndexStatusParams, IndexStatusResponse};
-use ingest::{ingest_codebase, IngestError, IngestParams, IngestResponse};
+use ingest::{ingest_codebase, warm_up_embedder, IngestError, IngestParams, IngestResponse};
 use search::{
     semantic_search, summarize_semantic_search, SemanticSearchError, SemanticSearchParams,
     SemanticSearchResponse,
@@ -31,6 +31,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
+use tracing::warn;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -291,6 +292,14 @@ impl SectionExecution {
 async fn main() {
     let cli = Cli::parse();
     let config = RunConfig::from_cli(cli);
+    tokio::spawn(async {
+        match tokio::task::spawn_blocking(|| warm_up_embedder(None)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!(?error, "Embedder warm-up failed"),
+            Err(join_error) => warn!(?join_error, "Embedder warm-up task cancelled"),
+        }
+    });
+    tokio::task::yield_now().await;
     let exit_code = execute(config).await;
     if exit_code != 0 {
         process::exit(exit_code);

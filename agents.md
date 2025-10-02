@@ -29,6 +29,7 @@ Backward Compatibility
 Testing Checklist
 	•	Validate stdout purity.
 	•	Confirm cold-start latency stays within configured timeouts.
+	•	Track ingest harness RSS; the streaming batch pipeline should stay near 2 GB versus the former 13 GB baseline.
 	•	Exercise reconnection logic for SSE bridges.
 	•	Verify `config.toml` changes are picked up after agent restarts.
 
@@ -156,7 +157,7 @@ Tokens can be sourced from environment variables (for example `${DOCS_KEY}`) or 
 
 - **Missing toolchain:** `start.sh` aborts when `cargo` is absent. Install Rust via `rustup` and re-run the script.
 - **Slow cold start:** Use `INDEX_MCP_CARGO_PROFILE=debug` while iterating; switch back to release for production agents.
-- **Cold ingest latency:** The first full scan spins up the embedder model; subsequent runs reuse the global cache introduced in the Rust runtime and should complete in milliseconds when files are unchanged.
+- **Cold ingest latency:** Startup now warms the quantized `Xenova/all-MiniLM-L6-v2` embedder in the background, trimming the first `ingest_codebase` on clean workspaces to ~24s; subsequent runs reuse the cache and finish in milliseconds when files are unchanged.
 - **Embedding download issues:** The server uses `fastembed`; failures leave the cache empty. Re-run once connectivity returns or disable embeddings with `{ "embedding": { "enabled": false } }`.
 - **SQLite locks:** The Rust ingestor uses transactions with `PRAGMA foreign_keys=ON`. If another process holds the DB, re-run after releasing the lock or configure a different database filename.
 - **Watcher noise:** Add `--watch-quiet` or tighten `--watch-debounce`. The watcher respects include/exclude globs plus `.gitignore` entries.

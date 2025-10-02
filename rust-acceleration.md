@@ -12,9 +12,10 @@ With the removal of the legacy `docs/` directory, performance tuning notes for t
 
 - Embedding throughput is now bound by `fastembed` model latency; the global cache eliminates repeated model initialization costs.
 - SQLite vacuuming dominates eviction passes on spinning disks. Consider deferring `VACUUM` to scheduled maintenance if latency spikes are observed.
+- Switching the default to quantized `Xenova/all-MiniLM-L6-v2` shrinks the initial download and disables batching automatically to avoid incompatibilities.
+- Streaming chunk batches through the embedder keeps peak RSS about ~2 GB (down from ~13 GB) while first ingest latency holds around 15.2 s on the reference workspace.
 
 ## Next Steps
 
 - [ ] Integrate structured timing into `ingest_codebase` responses (scan, chunk, embed, persist) for easier regression detection.
 - [ ] Experiment with parallel chunk embedding once `fastembed` exposes an async-safe API.
-

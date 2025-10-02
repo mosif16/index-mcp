@@ -133,7 +133,7 @@ Remote tools are surfaced under `<namespace>.<tool>` and benefit from the same s
 
 - **Missing toolchain** – Install Rust with `rustup` and ensure `cargo` is on `PATH`.
 - **Embedding download issues** – The server uses `fastembed`; transient network failures leave the cache empty. Re-run ingest when connectivity is restored or disable embeddings via `{ "embedding": { "enabled": false } }`.
-- **Cold ingest latency** – The first ingest initializes the embedder model; subsequent runs reuse the in-process cache added in the Rust rewrite, so expect drastic speedups after the first pass.
+- **Cold ingest latency** – Startup now preloads the quantized `Xenova/all-MiniLM-L6-v2` weights; the first ingest on a clean workspace drops to ~24s, and subsequent runs reuse the in-process cache so they finish in milliseconds.
 - **SQLite locks** – Another process may hold the database. Retry after releasing the lock or configure a different database filename with `--watch-database`.
 - **Watcher noise** – Increase debounce or enable `--watch-quiet` to reduce log output.
 

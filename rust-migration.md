@@ -20,3 +20,4 @@ The legacy `docs/` directory has been retired. Migration notes now live at the r
 |------|--------|-------|
 | 2025-10-02 | Embedder cache | Added a global `once_cell` cache to reuse `fastembed` models across ingests, minimizing cold-start overhead. |
 | 2025-10-02 | Docs relocation | Removed `docs/` directory; root-level markdown files replace former paths referenced by the Node server. |
+| 2025-10-02 | Default embedder swap | Switched to the quantized `Xenova/all-MiniLM-L6-v2` model with auto batch tuning, cutting first-ingest latency to ~24s on fresh workspaces. |
