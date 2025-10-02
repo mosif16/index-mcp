@@ -11,9 +11,7 @@ mod ingest;
 #[path = "../search.rs"]
 mod search;
 
-use bundle::{
-    context_bundle, ContextBundleError, ContextBundleParams, ContextBundleResponse,
-};
+use bundle::{context_bundle, ContextBundleError, ContextBundleParams, ContextBundleResponse};
 use clap::{builder::BoolishValueParser, Parser, ValueEnum, ValueHint};
 use git_timeline::{
     repository_timeline, repository_timeline_entry_detail, RepositoryTimelineEntryLookupParams,
@@ -690,7 +688,7 @@ fn resolve_bundle_target(config: &RunConfig, state: &RunState) -> Option<String>
         }
     }
 
-    candidates.push("docs/rust-migration.md".to_string());
+    candidates.push("rust-migration.md".to_string());
     candidates.push("README.md".to_string());
 
     let mut seen = HashSet::new();
@@ -724,10 +722,16 @@ fn normalize_candidate(root: &Path, candidate: &str) -> Option<String> {
 }
 
 fn summarize_ingest(response: &IngestResponse) -> String {
-    format!(
+    let mut summary = format!(
         "ingest_codebase: {} file(s), {} embedded chunk(s), db={}",
         response.ingested_file_count, response.embedded_chunk_count, response.database_path
-    )
+    );
+
+    if let Some(reused) = response.reused_file_count {
+        summary.push_str(&format!(", reused {} cached file(s)", reused));
+    }
+
+    summary
 }
 
 fn summarize_code_lookup_search(response: &SemanticSearchResponse) -> String {

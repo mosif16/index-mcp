@@ -419,6 +419,13 @@ fn summarize_ingest(payload: &IngestResponse) -> String {
         payload.duration_ms as f64 / 1000.0
     );
 
+    if let Some(reused) = payload.reused_file_count {
+        summary.push_str(&format!(
+            " Reused cached embeddings for {} unchanged file(s).",
+            reused
+        ));
+    }
+
     if !payload.skipped.is_empty() {
         summary.push_str(&format!(" Skipped {} file(s).", payload.skipped.len()));
     }

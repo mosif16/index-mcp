@@ -1,4 +1,4 @@
-Keep the rust-migration.md updated
+Keep the rust-migration.md updated. The legacy `docs/` directory was removed; shared design notes now live alongside the sources at the repository root.
 
 # Codex MCP Best Practices
 
@@ -156,6 +156,7 @@ Tokens can be sourced from environment variables (for example `${DOCS_KEY}`) or 
 
 - **Missing toolchain:** `start.sh` aborts when `cargo` is absent. Install Rust via `rustup` and re-run the script.
 - **Slow cold start:** Use `INDEX_MCP_CARGO_PROFILE=debug` while iterating; switch back to release for production agents.
+- **Cold ingest latency:** The first full scan spins up the embedder model; subsequent runs reuse the global cache introduced in the Rust runtime and should complete in milliseconds when files are unchanged.
 - **Embedding download issues:** The server uses `fastembed`; failures leave the cache empty. Re-run once connectivity returns or disable embeddings with `{ "embedding": { "enabled": false } }`.
 - **SQLite locks:** The Rust ingestor uses transactions with `PRAGMA foreign_keys=ON`. If another process holds the DB, re-run after releasing the lock or configure a different database filename.
 - **Watcher noise:** Add `--watch-quiet` or tighten `--watch-debounce`. The watcher respects include/exclude globs plus `.gitignore` entries.
@@ -163,9 +164,9 @@ Tokens can be sourced from environment variables (for example `${DOCS_KEY}`) or 
 
 ## 9. Additional Resources
 
-- `README.md` – High-level features and CLI examples.
-- `docs/rust-migration.md` – Detailed migration status and parity checklist.
-- `docs/rust-acceleration.md` – Design notes for native ingestion.
+- `README.md` – High-level features and CLI examples (see "Docs relocation" for context on the removed `docs/` folder).
+- `rust-migration.md` – Detailed migration status and parity checklist (relocated from `docs/`).
+- `rust-acceleration.md` – Design notes for native ingestion (relocated from `docs/`).
 - `start.sh` – Runtime launcher with environment variable overrides.
 
 Keep this guide in sync with feature changes; update it whenever new tools ship or runtime defaults change.

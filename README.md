@@ -133,12 +133,15 @@ Remote tools are surfaced under `<namespace>.<tool>` and benefit from the same s
 
 - **Missing toolchain** – Install Rust with `rustup` and ensure `cargo` is on `PATH`.
 - **Embedding download issues** – The server uses `fastembed`; transient network failures leave the cache empty. Re-run ingest when connectivity is restored or disable embeddings via `{ "embedding": { "enabled": false } }`.
+- **Cold ingest latency** – The first ingest initializes the embedder model; subsequent runs reuse the in-process cache added in the Rust rewrite, so expect drastic speedups after the first pass.
 - **SQLite locks** – Another process may hold the database. Retry after releasing the lock or configure a different database filename with `--watch-database`.
 - **Watcher noise** – Increase debounce or enable `--watch-quiet` to reduce log output.
 
 ## Further Reading
 
-- `docs/rust-migration.md` – status tracker for the Rust rewrite.
-- `docs/rust-acceleration.md` – design notes and benchmarks for the native pipeline.
+> **Docs relocation:** The historical `docs/` directory has been removed. Long-form guides now live at the repository root to simplify distribution across downstream consumers.
+
+- `rust-migration.md` – status tracker for the Rust rewrite (formerly `docs/rust-migration.md`).
+- `rust-acceleration.md` – design notes and benchmarks for the native pipeline (formerly `docs/rust-acceleration.md`).
 - `agents.md` – guidance for wiring the server into MCP-compatible clients.
 - `IMPLEMENTATION_SUMMARY.md` – historical context for the token-budget and hotness tracking features.

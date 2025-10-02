@@ -2,11 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
+use once_cell::sync::Lazy;
 use rmcp::schemars::{self, JsonSchema};
 use rusqlite::{params, Connection, OpenFlags, Transaction};
 use serde::{Deserialize, Serialize};
@@ -37,6 +39,9 @@ const DEFAULT_CHUNK_SIZE_TOKENS: usize = 256;
 const DEFAULT_CHUNK_OVERLAP_TOKENS: usize = 32;
 const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 32;
 const DEFAULT_MAX_DATABASE_SIZE_BYTES: u64 = 150 * 1024 * 1024; // 150 MB
+
+static EMBEDDER_CACHE: Lazy<Mutex<HashMap<String, Arc<Mutex<TextEmbedding>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -113,6 +118,8 @@ pub struct IngestResponse {
     pub graph_edge_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evicted: Option<EvictionReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reused_file_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -169,6 +176,13 @@ struct TargetEntry {
     absolute: PathBuf,
     exists: bool,
     is_dir: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ExistingFileMetadata {
+    hash: String,
+    modified: i64,
+    size: i64,
 }
 
 #[derive(Debug, Error)]
@@ -301,7 +315,8 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
 
     let transaction = conn.transaction()?;
 
-    let existing_paths = load_existing_paths(&transaction)?;
+    let existing_files = load_existing_files(&transaction)?;
+    let existing_paths: HashSet<String> = existing_files.keys().cloned().collect();
     let relevant_existing_paths: HashSet<String> = if using_target_paths {
         existing_paths
             .iter()
@@ -319,12 +334,21 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
     let mut chunk_locations: Vec<(String, usize)> = Vec::new();
 
     let mut ingested_count = 0usize;
+    let mut reused_count = 0usize;
 
     for file in &scanned_files {
         let path = file.path.clone();
         let size_bytes = file.size as i64;
         let modified = file.modified_ms;
         let db_content = file.stored_content.clone();
+        let existing = existing_files.get(&path);
+        let is_unchanged = existing
+            .map(|metadata| {
+                metadata.hash == file.hash
+                    && metadata.modified == modified
+                    && metadata.size == size_bytes
+            })
+            .unwrap_or(false);
 
         upsert_file(
             &transaction,
@@ -337,8 +361,14 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
         )?;
 
         retained_paths.insert(path.clone());
-        paths_to_clear.insert(path.clone());
         ingested_count += 1;
+
+        if is_unchanged {
+            reused_count += 1;
+            continue;
+        }
+
+        paths_to_clear.insert(path.clone());
 
         if let Some(text) = &file.text_content {
             if embedding_config.enabled {
@@ -480,7 +510,7 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
     let mut embedding_model_output: Option<String> = None;
 
     if embedding_config.enabled && !chunk_locations.is_empty() {
-        let mut embedder = create_embedder(&embedding_config)?;
+        let embedder = get_or_create_embedder(&embedding_config)?;
         let texts: Vec<String> = chunk_locations
             .iter()
             .map(|(path, index)| {
@@ -492,9 +522,14 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
             })
             .collect();
 
-        let embeddings = embedder
-            .embed(texts, embedding_config.batch_size)
-            .map_err(|error| IngestError::Embedding(error.to_string()))?;
+        let embeddings = {
+            let mut guard = embedder.lock().map_err(|error| {
+                IngestError::Embedding(format!("failed to acquire embedder: {error}"))
+            })?;
+            guard
+                .embed(texts, embedding_config.batch_size)
+                .map_err(|error| IngestError::Embedding(error.to_string()))?
+        };
 
         for (idx, embedding_vec) in embeddings.into_iter().enumerate() {
             let (path, record_index) = &chunk_locations[idx];
@@ -570,6 +605,11 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
         graph_node_count,
         graph_edge_count,
         evicted: eviction_report,
+        reused_file_count: if reused_count > 0 {
+            Some(reused_count)
+        } else {
+            None
+        },
     })
 }
 
@@ -1052,16 +1092,28 @@ fn ensure_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     )
 }
 
-fn load_existing_paths(conn: &Transaction<'_>) -> Result<HashSet<String>, rusqlite::Error> {
-    let mut stmt = conn.prepare("SELECT path FROM files")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    let mut set = HashSet::new();
+fn load_existing_files(
+    conn: &Transaction<'_>,
+) -> Result<HashMap<String, ExistingFileMetadata>, rusqlite::Error> {
+    let mut stmt = conn.prepare("SELECT path, hash, modified, size FROM files")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            ExistingFileMetadata {
+                hash: row.get::<_, String>(1)?,
+                modified: row.get::<_, i64>(2)?,
+                size: row.get::<_, i64>(3)?,
+            },
+        ))
+    })?;
+
+    let mut map = HashMap::new();
     for row in rows {
-        if let Ok(path) = row {
-            set.insert(path);
+        if let Ok((path, metadata)) = row {
+            map.insert(path, metadata);
         }
     }
-    Ok(set)
+    Ok(map)
 }
 
 fn query_table_count(conn: &Connection, table: &str) -> Result<usize, rusqlite::Error> {
@@ -1151,8 +1203,37 @@ fn upsert_meta(
     Ok(())
 }
 
-fn create_embedder(config: &EmbeddingConfig) -> Result<TextEmbedding, IngestError> {
-    let model_name = config.model.trim();
+fn get_or_create_embedder(
+    config: &EmbeddingConfig,
+) -> Result<Arc<Mutex<TextEmbedding>>, IngestError> {
+    let model_name = config.model.trim().to_string();
+
+    if let Some(embedder) = EMBEDDER_CACHE
+        .lock()
+        .map_err(|error| {
+            IngestError::Embedding(format!("failed to access embedder cache: {error}"))
+        })?
+        .get(&model_name)
+        .cloned()
+    {
+        return Ok(embedder);
+    }
+
+    let embedder = Arc::new(Mutex::new(initialize_embedder(&model_name)?));
+
+    let mut cache = EMBEDDER_CACHE.lock().map_err(|error| {
+        IngestError::Embedding(format!("failed to access embedder cache: {error}"))
+    })?;
+
+    if let Some(existing) = cache.get(&model_name) {
+        return Ok(existing.clone());
+    }
+
+    cache.insert(model_name, embedder.clone());
+    Ok(embedder)
+}
+
+fn initialize_embedder(model_name: &str) -> Result<TextEmbedding, IngestError> {
     let parsed = EmbeddingModel::from_str(model_name).map_err(|error| {
         IngestError::Embedding(format!("Unknown embedding model '{model_name}': {error}"))
     })?;
