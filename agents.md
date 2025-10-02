@@ -13,36 +13,40 @@ The previous `agents.md` contents now live in two focused guides:
 
 Update both documents together when workflows change so global expectations and repo details stay aligned.
 
-## Strict Rules — **NORMATIVE & ABSOLUTELY MANDATORY**
+## Best Practices — Recommended Workflow
 
-**Enforcement:** This document is **BINDING AND NON-NEGOTIABLE**. Agents **MUST** comply **WITHOUT EXCEPTION**. Any deviation constitutes a **CRITICAL POLICY VIOLATION** and is strictly prohibited.
+**Purpose:** This document provides guidance on effectively using index-mcp tools to work efficiently with your codebase. These recommendations help you get the most value from the available tooling.
 
-### Tools & Prompts (authoritative definitions — **USE REQUIRED**)
+### Available Tools & Their Uses
 
-| Tool / Prompt | Notes |
+| Tool / Prompt | Purpose & When to Use |
 |---------------|-------|
-| `ingest_codebase` | Walks the workspace, respects `.gitignore`, stores metadata and embeddings, and can auto‑evict least‑used chunks when requested. **MANDATORY at session start.** |
-| `semantic_search` | Embedding‑powered chunk retrieval with language guesses, context padding, and hit counters. **REQUIRED for all semantic queries.** |
-| `code_lookup` | Router: `mode="search"` → semantic search, `mode="bundle"` → context bundles. **PRIMARY TOOL for all code searches and discovery. NON-NEGOTIABLE.** |
-| `context_bundle` | Returns file metadata, focus definitions, nearby snippets, and quick links within a token budget. It memoizes responses by file hash/ranges and will downgrade to excerpts or summaries while warning when you hit the budget; raise `budgetTokens` or narrow ranges when prompted. **MUST be used for context assembly.** |
-| `index_status` | Summarizes index freshness, embedding models, ingestion history, and git parity. **REQUIRED before ANY reasoning or planning.** |
-| `repository_timeline` | Streams recent git commits with churn stats, directory highlights, optional diffs, and PR URLs. **MANDATORY for history awareness.** |
+| `ingest_codebase` | Walks the workspace, respects `.gitignore`, stores metadata and embeddings, and can auto‑evict least‑used chunks when requested. Run at session start or when the codebase changes significantly. |
+| `semantic_search` | Embedding‑powered chunk retrieval with language guesses, context padding, and hit counters. Ideal for finding code by concept or behavior. |
+| `code_lookup` | Router: `mode="search"` → semantic search, `mode="bundle"` → context bundles. Your primary tool for discovering and retrieving code efficiently. |
+| `context_bundle` | Returns file metadata, focus definitions, nearby snippets, and quick links within a token budget. It memoizes responses by file hash/ranges and will downgrade to excerpts or summaries while warning when you hit the budget; raise `budgetTokens` or narrow ranges when prompted. Great for assembling focused context. |
+| `index_status` | Summarizes index freshness, embedding models, ingestion history, and git parity. Check this to understand the current state of your index. |
+| `repository_timeline` | Streams recent git commits with churn stats, directory highlights, optional diffs, and PR URLs. Useful for understanding recent changes and project history. |
 | `repository_timeline_entry` | Recovers cached commit details and (when available) full diff text for a specific SHA. |
 | `indexing_guidance` / `indexing_guidance_tool` | Prompt and tool variants for ingest reminders. |
 | Remote proxies | Any remote declared in `INDEX_MCP_REMOTE_SERVERS` is namespaced and surfaced alongside local tools. |
 
-**Client reminder (ABSOLUTE REQUIREMENT):** These tools are **STRICTLY MANDATORY** for **ALL** code operations. **ZERO EXCEPTIONS.** Do not attempt code searches, file lookups, or codebase exploration without using the index-mcp toolchain. **VIOLATION OF THIS RULE IS PROHIBITED UNDER ALL CIRCUMSTANCES.**
+**Recommendation:** These tools provide powerful capabilities for code search, navigation, and understanding. Use them when they make your workflow more efficient and accurate.
 
-### Workflow (follow in order — **ABSOLUTE COMPLIANCE REQUIRED**)
+### Suggested Workflow
 
-1. **Prime the index** — **MUST** run `ingest_codebase { "root": "." }` at session start (or enable `--watch`). **NON-NEGOTIABLE.** Honor `.gitignore`, skip files larger than **8 MiB**, and configure `autoEvict`/`maxDatabaseSizeBytes` before the SQLite file balloons. **FAILURE TO PRIME IS A CRITICAL VIOLATION.**
-2. **Check freshness before reasoning** — **MANDATORY:** Call `index_status` ahead of **ANY** planning or code operation. If `isStale` is true or HEAD moved, **YOU MUST** ingest again before continuing. **NO EXCEPTIONS.**
-3. **Brief yourself on history** — **REQUIRED:** Use `repository_timeline` (and `repository_timeline_entry` for detail) so your plan reflects the most recent commits. **SKIPPING THIS STEP IS PROHIBITED.**
-4. **Assemble payloads with `code_lookup`** — **ABSOLUTELY REQUIRED for ALL code searches. ZERO ALTERNATIVES PERMITTED.** Start with `query="..."` to narrow scope, then request `file="..."` plus optional `symbol` bundles for the snippets you intend to cite. This is your **ONLY PERMITTED** primary discovery mechanism.
-5. **Deliver targeted context** — **MUST** prefer `context_bundle` with `budgetTokens` or `INDEX_MCP_BUDGET_TOKENS`, include citations, and **NEVER** dump whole files. **MANDATORY COMPLIANCE.**
-6. **Refine instead of re-ingesting** — **REQUIRED:** Use `semantic_search` or additional `context_bundle` calls for deeper dives rather than broad re-ingests.
-7. **Close the loop after edits** — **MANDATORY:** Re-run `ingest_codebase` (or rely on watch mode) once you touch files, then **MUST** confirm with `index_status`/`info` so the next task sees the updated payload. **NON-NEGOTIABLE.**
+1. **Prime the index** — Run `ingest_codebase { "root": "." }` at session start (or enable `--watch`) to ensure you have fresh data. Honor `.gitignore`, skip files larger than **8 MiB**, and configure `autoEvict`/`maxDatabaseSizeBytes` to manage database size.
 
-**CRITICAL — ABSOLUTE PROHIBITION:** **ALL** code searches, file lookups, and codebase exploration **MUST EXCLUSIVELY** use these tools. Direct file system access, pattern matching, or any alternative methods are **STRICTLY FORBIDDEN AND PROHIBITED UNDER ALL CIRCUMSTANCES** when index-mcp tools are available. **THIS IS AN INVIOLABLE REQUIREMENT.**
+2. **Check freshness before major operations** — Call `index_status` before planning or significant code operations. If `isStale` is true or HEAD moved, consider re-ingesting to work with current data.
 
-**FINAL WARNING:** Compliance with these rules is **NOT OPTIONAL**. Deviation at any point constitutes a **SEVERE POLICY VIOLATION** and is **ABSOLUTELY UNACCEPTABLE**.
+3. **Understand recent history** — Use `repository_timeline` (and `repository_timeline_entry` for detail) to see recent commits and changes that might inform your approach.
+
+4. **Discover code with `code_lookup`** — Start with `query="..."` to narrow scope semantically, then request `file="..."` plus optional `symbol` bundles for the specific snippets you need. This is typically the most efficient discovery mechanism.
+
+5. **Assemble focused context** — Use `context_bundle` with `budgetTokens` or `INDEX_MCP_BUDGET_TOKENS` to get relevant snippets with proper citations rather than retrieving entire files unnecessarily.
+
+6. **Iterate efficiently** — Use `semantic_search` or additional `context_bundle` calls for deeper exploration rather than broad re-ingests when refining your understanding.
+
+7. **Keep the index current** — After editing files, re-run `ingest_codebase` (or rely on watch mode) and confirm with `index_status` so subsequent operations work with updated information.
+
+**Smart Tool Usage:** When index-mcp tools are available, they typically provide the most efficient and accurate way to search, navigate, and understand codebases. Use them intelligently as your primary approach, but apply judgment about when direct file access or other methods might be more appropriate for specific tasks.
