@@ -24,7 +24,7 @@ Update both documents together when workflows change so global expectations and 
 | `ingest_codebase` | Walks the workspace, respects `.gitignore`, stores metadata and embeddings, and can auto‑evict least‑used chunks when requested. **MANDATORY at session start.** |
 | `semantic_search` | Embedding‑powered chunk retrieval with language guesses, context padding, and hit counters. **REQUIRED for all semantic queries.** |
 | `code_lookup` | Router: `mode="search"` → semantic search, `mode="bundle"` → context bundles. **PRIMARY TOOL for all code searches and discovery. NON-NEGOTIABLE.** |
-| `context_bundle` | Returns file metadata, focus definitions, nearby snippets, and quick links within a token budget. **MUST be used for context assembly.** |
+| `context_bundle` | Returns file metadata, focus definitions, nearby snippets, and quick links within a token budget. It memoizes responses by file hash/ranges and will downgrade to excerpts or summaries while warning when you hit the budget; raise `budgetTokens` or narrow ranges when prompted. **MUST be used for context assembly.** |
 | `index_status` | Summarizes index freshness, embedding models, ingestion history, and git parity. **REQUIRED before ANY reasoning or planning.** |
 | `repository_timeline` | Streams recent git commits with churn stats, directory highlights, optional diffs, and PR URLs. **MANDATORY for history awareness.** |
 | `repository_timeline_entry` | Recovers cached commit details and (when available) full diff text for a specific SHA. |

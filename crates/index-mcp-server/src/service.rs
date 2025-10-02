@@ -1065,7 +1065,9 @@ mod tests {
 
         let summary = summarize_bundle(&bundle);
 
-        assert!(summary.contains("Context bundle prepared for src/lib.rs with 1 definition(s) and 1 snippet(s)."));
+        assert!(summary.contains(
+            "Context bundle prepared for src/lib.rs with 1 definition(s) and 1 snippet(s)."
+        ));
         assert!(summary.contains("Primary definition function foo."));
         assert!(summary.contains("Snippets: chunk line 1 (~3 token(s))."));
         assert!(summary.contains("First quick link: file src/lib.rs."));

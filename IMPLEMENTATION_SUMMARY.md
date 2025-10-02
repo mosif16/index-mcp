@@ -20,7 +20,7 @@ This document describes the Rust implementation that now powers the `index-mcp` 
 ## Semantic Lookup & Bundling
 
 - `semantic_search` opens the SQLite database read-only, resolves the desired embedding model, streams chunk embeddings, and maintains a top-k heap. Returned chunks carry surrounding context and trigger `UPDATE file_chunks SET hits = hits + 1` so usage influences eviction ([search.rs:1-231]).
-- `context_bundle` assembles file metadata, symbol definitions, graph neighbors, and related snippets. It respects explicit `maxSnippets`/`maxNeighbors` and trims snippets to the configured token budget (default 3 000 tokens or `INDEX_MCP_BUDGET_TOKENS`), appending truncation warnings when necessary ([bundle.rs:1-203,585-643]).
+- `context_bundle` assembles file metadata, symbol definitions, graph neighbors, and related snippets. It now memoizes responses by file hash, selector, ranges, and budget so repeat queries avoid duplicate work, and its multi-tier trimming falls back from full text to focused excerpts and summaries while surfacing explicit token-usage guidance (default 3 000 tokens or `INDEX_MCP_BUDGET_TOKENS`) ([bundle.rs:1-314,586-899]).
 - `code_lookup` inside `service.rs` routes `mode="search"` requests to semantic search and `mode="bundle"` to contextual bundles, mirroring the legacy “auto” router ([service.rs:293-341]).
 
 ## Freshness & History Tracking
