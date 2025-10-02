@@ -1,7 +1,6 @@
 mod bundle;
 mod git_timeline;
 mod graph;
-mod graph_neighbors;
 mod index_status;
 mod ingest;
 mod remote_proxy;

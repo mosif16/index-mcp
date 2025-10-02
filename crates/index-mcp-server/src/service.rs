@@ -10,10 +10,6 @@ use crate::git_timeline::{
     RepositoryTimelineEntryLookupResponse, RepositoryTimelineError, RepositoryTimelineParams,
     RepositoryTimelineResponse,
 };
-use crate::graph_neighbors::{
-    graph_neighbors, GraphNeighborDirection, GraphNeighborsError, GraphNeighborsParams,
-    GraphNeighborsResponse,
-};
 use crate::index_status::{
     get_index_status, IndexStatusError, IndexStatusParams, IndexStatusResponse,
 };
@@ -74,8 +70,6 @@ struct CodeLookupResponse {
     search_result: Option<SemanticSearchResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bundle_result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    graph_result: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -93,8 +87,8 @@ struct SemanticSearchRequest {
 }
 
 /// Textual instructions shared with MCP clients.
-const SERVER_INSTRUCTIONS: &str = "Rust rewrite in progress. Rust server currently supports ingest_codebase, semantic_search, code_lookup (search mode), index_status, graph_neighbors, repository_timeline, and repository_timeline_entry; additional tooling is being ported.";
-const INDEXING_GUIDANCE_PROMPT_TEXT: &str = "Tools: code_lookup (routes to semantic search, context bundles, or graph neighbors), ingest_codebase (refresh the SQLite index; enable autoEvict/maxDatabaseSizeBytes to prune unused chunks), index_status (check freshness), semantic_search (direct embedding-powered retrieval that updates hotness), context_bundle (structured bundle trimmed to budgetTokens or INDEX_MCP_BUDGET_TOKENS), graph_neighbors (relationship explorer), indexing_guidance_tool (tool-form reminders), indexing_guidance (prompt version), repository_timeline (summarize recent git commits), repository_timeline_entry (recover cached commit details), and info (runtime diagnostics). Workflow: run ingest_codebase on a new checkout or after edits while respecting .gitignore, call index_status when freshness is uncertain, then reach for code_lookup—use query=\"...\" for discovery, file=\"...\" plus optional symbol for file context, and mode=\"graph\" for relationship exploration. If ingest_codebase hits a \"UNIQUE constraint failed: code_graph_nodes...\" error, rerun it with graph.enabled=false until the duplicate-node fix lands. Invoke the specialist tools directly when you need their richer metadata, and tune budgetTokens to keep downstream LLM context under control.";
+const SERVER_INSTRUCTIONS: &str = "Rust rewrite in progress. Rust server currently supports ingest_codebase, semantic_search, code_lookup (search or bundle modes), context_bundle (requires a file path and optional symbol), index_status, repository_timeline, and repository_timeline_entry; graph_neighbors is not available yet in the Rust runtime.";
+const INDEXING_GUIDANCE_PROMPT_TEXT: &str = "Tools: code_lookup (routes to semantic search or context bundles), ingest_codebase (refresh the SQLite index; enable autoEvict/maxDatabaseSizeBytes to prune unused chunks), index_status (check freshness), semantic_search (direct embedding-powered retrieval that updates hotness), context_bundle (requires a file path and returns a structured bundle trimmed to budgetTokens or INDEX_MCP_BUDGET_TOKENS), indexing_guidance_tool (tool-form reminders), indexing_guidance (prompt version), repository_timeline (summarize recent git commits), repository_timeline_entry (recover cached commit details), and info (runtime diagnostics). Workflow: run ingest_codebase on a new checkout or after edits while respecting .gitignore, call index_status when freshness is uncertain, then reach for code_lookup—use query=\"...\" for discovery and file=\"...\" plus optional symbol for file context. If ingest_codebase hits a \"UNIQUE constraint failed: code_graph_nodes...\" error, rerun it with graph.enabled=false until the duplicate-node fix lands. Invoke the specialist tools directly when you need their richer metadata, and tune budgetTokens to keep downstream LLM context under control.";
 
 /// Primary server state for the Rust MCP implementation.
 #[derive(Clone)]
@@ -289,23 +283,6 @@ impl IndexMcpService {
                 None,
             )),
         }
-    }
-
-    #[tool(
-        name = "graph_neighbors",
-        description = "Explore structural relationships captured during ingestion to support GraphRAG workflows."
-    )]
-    async fn graph_neighbors_tool(
-        &self,
-        Parameters(params): Parameters<GraphNeighborsParams>,
-        _ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let direction = params.direction.unwrap_or_default();
-        let response = graph_neighbors(params)
-            .await
-            .map_err(convert_graph_neighbors_error)?;
-
-        build_graph_neighbors_result(response, direction)
     }
 
     #[tool(
@@ -583,7 +560,6 @@ fn build_code_lookup_result(
         summary: summary.clone(),
         search_result: Some(search_result),
         bundle_result: None,
-        graph_result: None,
     };
 
     let value: Value = serde_json::to_value(&payload).map_err(|error| {
@@ -626,7 +602,6 @@ fn build_code_lookup_bundle_response(
                 None,
             )
         })?),
-        graph_result: None,
     };
 
     let value: Value = serde_json::to_value(&payload).map_err(|error| {
@@ -660,31 +635,6 @@ fn convert_context_bundle_error(error: ContextBundleError) -> McpError {
             McpError::internal_error(format!("Failed to access '{path}': {source}"), None)
         }
         ContextBundleError::Join(source) => {
-            McpError::internal_error(format!("Background task failed: {source}"), None)
-        }
-    }
-}
-
-fn convert_graph_neighbors_error(error: GraphNeighborsError) -> McpError {
-    match error {
-        GraphNeighborsError::InvalidRoot { path, source } => {
-            McpError::invalid_params(format!("Unable to resolve root '{path}': {source}"), None)
-        }
-        GraphNeighborsError::DatabaseIo { path, source } => McpError::invalid_params(
-            format!("Unable to access database '{path}': {source}"),
-            None,
-        ),
-        GraphNeighborsError::Sqlite(source) => {
-            McpError::internal_error(format!("SQLite error: {source}"), None)
-        }
-        GraphNeighborsError::NodeNotFound { descriptor } => {
-            McpError::invalid_params(format!("No graph node found matching {descriptor}"), None)
-        }
-        GraphNeighborsError::NodeAmbiguous { descriptor } => McpError::invalid_params(
-            format!("Multiple graph nodes matched {descriptor}; please specify an id."),
-            None,
-        ),
-        GraphNeighborsError::Join(source) => {
             McpError::internal_error(format!("Background task failed: {source}"), None)
         }
     }
@@ -731,49 +681,6 @@ fn build_context_bundle_result(
     let value: Value = serde_json::to_value(&response).map_err(|error| {
         McpError::internal_error(
             format!("Failed to serialize context bundle result: {error}"),
-            None,
-        )
-    })?;
-
-    let json_content = Content::json(value.clone()).map_err(|error| {
-        McpError::internal_error(format!("Failed to encode JSON content: {error}"), None)
-    })?;
-
-    Ok(CallToolResult {
-        content: vec![Content::text(summary), json_content],
-        structured_content: Some(value),
-        is_error: Some(false),
-        meta: None,
-    })
-}
-
-fn build_graph_neighbors_result(
-    response: GraphNeighborsResponse,
-    direction: GraphNeighborDirection,
-) -> Result<CallToolResult, McpError> {
-    let direction_descriptor = match direction {
-        GraphNeighborDirection::Incoming => "incoming",
-        GraphNeighborDirection::Outgoing => "outgoing",
-        GraphNeighborDirection::Both => "incoming/outgoing",
-    };
-
-    let summary = if response.neighbors.is_empty() {
-        format!(
-            "Graph query found no {} neighbors for node '{}'.",
-            direction_descriptor, response.node.name
-        )
-    } else {
-        format!(
-            "Graph query found {} neighbor(s) ({}) for node '{}'.",
-            response.neighbors.len(),
-            direction_descriptor,
-            response.node.name
-        )
-    };
-
-    let value: Value = serde_json::to_value(&response).map_err(|error| {
-        McpError::internal_error(
-            format!("Failed to serialize graph neighbors result: {error}"),
             None,
         )
     })?;

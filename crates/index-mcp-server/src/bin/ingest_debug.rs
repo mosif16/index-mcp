@@ -4,8 +4,6 @@ mod bundle;
 mod git_timeline;
 #[path = "../graph.rs"]
 mod graph;
-#[path = "../graph_neighbors.rs"]
-mod graph_neighbors;
 #[path = "../index_status.rs"]
 mod index_status;
 #[path = "../ingest.rs"]
@@ -14,18 +12,13 @@ mod ingest;
 mod search;
 
 use bundle::{
-    context_bundle, BundleDefinition, ContextBundleError, ContextBundleParams,
-    ContextBundleResponse,
+    context_bundle, ContextBundleError, ContextBundleParams, ContextBundleResponse,
 };
 use clap::{builder::BoolishValueParser, Parser, ValueEnum, ValueHint};
 use git_timeline::{
     repository_timeline, repository_timeline_entry_detail, RepositoryTimelineEntryLookupParams,
     RepositoryTimelineEntryLookupResponse, RepositoryTimelineError, RepositoryTimelineParams,
     RepositoryTimelineResponse,
-};
-use graph_neighbors::{
-    graph_neighbors, GraphNeighborDirection, GraphNeighborsError, GraphNeighborsParams,
-    GraphNeighborsResponse, GraphNodeSelector,
 };
 use index_status::{get_index_status, IndexStatusError, IndexStatusParams, IndexStatusResponse};
 use ingest::{ingest_codebase, IngestError, IngestParams, IngestResponse};
@@ -127,7 +120,6 @@ enum Section {
     CodeLookupSearch,
     ContextBundle,
     CodeLookupBundle,
-    GraphNeighbors,
     IndexStatus,
     RepositoryTimeline,
 }
@@ -140,7 +132,6 @@ impl Section {
             Self::CodeLookupSearch,
             Self::ContextBundle,
             Self::CodeLookupBundle,
-            Self::GraphNeighbors,
             Self::IndexStatus,
             Self::RepositoryTimeline,
         ]
@@ -153,7 +144,6 @@ impl Section {
             Self::CodeLookupSearch => "code_lookup_search",
             Self::ContextBundle => "context_bundle",
             Self::CodeLookupBundle => "code_lookup_bundle",
-            Self::GraphNeighbors => "graph_neighbors",
             Self::IndexStatus => "index_status",
             Self::RepositoryTimeline => "repository_timeline",
         }
@@ -368,7 +358,6 @@ async fn execute_section(
         Section::CodeLookupSearch => code_lookup_search_section(state),
         Section::ContextBundle => context_bundle_section(config, state).await,
         Section::CodeLookupBundle => code_lookup_bundle_section(state),
-        Section::GraphNeighbors => graph_neighbors_section(config, state).await,
         Section::IndexStatus => index_status_section(config).await,
         Section::RepositoryTimeline => repository_timeline_section(config, state).await,
     }
@@ -386,7 +375,6 @@ fn section_header(section: Section, config: &RunConfig) -> String {
             None => "context_bundle".to_string(),
         },
         Section::CodeLookupBundle => "code_lookup (bundle mode approximation)".to_string(),
-        Section::GraphNeighbors => "graph_neighbors".to_string(),
         Section::IndexStatus => "index_status".to_string(),
         Section::RepositoryTimeline => "repository_timeline".to_string(),
     }
@@ -543,43 +531,6 @@ fn code_lookup_bundle_section(state: &RunState) -> SectionExecution {
     }
 }
 
-async fn graph_neighbors_section(config: &RunConfig, state: &RunState) -> SectionExecution {
-    let Some(bundle) = state.bundle.as_ref() else {
-        return SectionExecution::Skipped {
-            reason: Some("context_bundle missing; unable to infer graph node".to_string()),
-        };
-    };
-
-    let Some(definition) = bundle
-        .focus_definition
-        .as_ref()
-        .or_else(|| bundle.definitions.first())
-    else {
-        return SectionExecution::Skipped {
-            reason: Some("no definition found in bundle response".to_string()),
-        };
-    };
-
-    match run_graph_neighbors(config, definition).await {
-        Ok(response) => {
-            if config.verbose {
-                dump_json("graph_neighbors response", &response);
-            }
-            let message = format!(
-                "graph_neighbors: found {} neighbor(s) for node {}",
-                response.neighbors.len(),
-                response.node.name
-            );
-            SectionExecution::Success {
-                message: Some(message),
-            }
-        }
-        Err(error) => SectionExecution::Failed {
-            error: error.to_string(),
-        },
-    }
-}
-
 async fn index_status_section(config: &RunConfig) -> SectionExecution {
     match run_index_status(config).await {
         Ok(response) => {
@@ -682,26 +633,6 @@ async fn run_context_bundle(
     };
 
     context_bundle(params).await
-}
-
-async fn run_graph_neighbors(
-    config: &RunConfig,
-    definition: &BundleDefinition,
-) -> Result<GraphNeighborsResponse, GraphNeighborsError> {
-    let params = GraphNeighborsParams {
-        root: Some(config.root.to_string_lossy().to_string()),
-        database_name: config.database.clone(),
-        node: GraphNodeSelector {
-            id: Some(definition.id.clone()),
-            path: None,
-            kind: None,
-            name: definition.name.clone(),
-        },
-        direction: Some(GraphNeighborDirection::Both),
-        limit: Some(config.max_neighbors),
-    };
-
-    graph_neighbors(params).await
 }
 
 async fn run_index_status(config: &RunConfig) -> Result<IndexStatusResponse, IndexStatusError> {
