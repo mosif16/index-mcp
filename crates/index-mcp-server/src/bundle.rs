@@ -58,14 +58,17 @@ impl BundleCache {
     }
 
     fn get(&mut self, key: &BundleCacheKey) -> Option<ContextBundleResponse> {
-        if let Some(response) = self.entries.get(key).cloned() {
+        if let Some(mut response) = self.entries.get(key).cloned() {
             self.promote(key);
+            response.usage.cache_hit = true;
             return Some(response);
         }
         None
     }
 
     fn put(&mut self, key: BundleCacheKey, value: ContextBundleResponse) {
+        let mut value = value;
+        value.usage.cache_hit = false;
         if self.entries.contains_key(&key) {
             self.entries.insert(key.clone(), value);
             self.promote(&key);
@@ -140,6 +143,7 @@ pub struct ContextBundleResponse {
     pub latest_ingestion: Option<BundleIngestionSummary>,
     pub warnings: Vec<String>,
     pub quick_links: Vec<ContextBundleQuickLink>,
+    pub usage: BundleUsageStats,
 }
 
 #[derive(Debug, Serialize, JsonSchema, Clone)]
@@ -150,8 +154,24 @@ pub struct BundleFileMetadata {
     pub modified: i64,
     pub hash: String,
     pub last_indexed_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brief: Option<String>,
     #[serde(skip_serializing)]
     pub content: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleUsageStats {
+    pub definitions_tokens: usize,
+    pub snippet_tokens: usize,
+    pub used_tokens: usize,
+    pub budget_tokens: usize,
+    pub remaining_tokens: usize,
+    pub omitted_snippets: usize,
+    pub excerpt_snippets: usize,
+    pub summary_snippets: usize,
+    pub cache_hit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -200,6 +220,8 @@ pub struct BundleSnippet {
     pub byte_end: Option<i64>,
     pub line_start: Option<i64>,
     pub line_end: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_count: Option<i64>,
 }
 
 #[derive(Debug, Serialize, JsonSchema, Clone)]
@@ -371,19 +393,28 @@ fn build_bundle(params: ContextBundleParams) -> Result<ContextBundleResponse, Co
         content_ref,
         line_offsets.as_deref(),
     );
-    let (trimmed_snippets, mut trimming_warnings) =
+    let (trimmed_snippets, usage_stats, mut trimming_warnings) =
         trim_snippets_to_budget(snippets, &definitions, budget_tokens);
 
     let ingestion = load_latest_ingestion(&conn)?;
     let mut warnings = gather_warnings(&definitions, content_ref);
     warnings.append(&mut snippet_warnings);
     warnings.append(&mut trimming_warnings);
+    if symbol_fingerprint.is_none() && requested_ranges.is_empty() && focus_line.is_none() {
+        warnings.push(
+            "No symbol, ranges, or focusLine provided; prefer targeting definitions to minimize context.".to_string(),
+        );
+    }
     let quick_links = build_quick_links(
         &target_file,
         &definitions,
         &related,
         focus_definition.as_ref(),
     );
+
+    let brief = file_content
+        .as_deref()
+        .and_then(|content| build_file_brief(content));
 
     let response = ContextBundleResponse {
         database_path: db_path_string,
@@ -393,6 +424,7 @@ fn build_bundle(params: ContextBundleParams) -> Result<ContextBundleResponse, Co
             modified: file_record.modified,
             hash: file_record.hash,
             last_indexed_at: file_record.last_indexed_at,
+            brief,
             content: file_record.content.take(),
         },
         definitions,
@@ -402,6 +434,7 @@ fn build_bundle(params: ContextBundleParams) -> Result<ContextBundleResponse, Co
         latest_ingestion: ingestion,
         warnings,
         quick_links,
+        usage: usage_stats,
     };
 
     if let Ok(mut cache) = CONTEXT_BUNDLE_CACHE.lock() {
@@ -438,6 +471,7 @@ fn load_file_metadata(
             modified: row.get(2)?,
             hash: row.get(3)?,
             last_indexed_at: row.get(4)?,
+            brief: None,
             content: row.get(5)?,
         })
     });
@@ -703,7 +737,11 @@ fn load_neighbor_node(conn: &Connection, node_id: &str) -> Option<NeighborNode> 
 
 fn load_snippets(conn: &Connection, path: &str, max_snippets: usize) -> Vec<BundleSnippet> {
     let mut stmt = match conn.prepare(
-        "SELECT chunk_index, content, byte_start, byte_end, line_start, line_end FROM file_chunks WHERE path = ?1 ORDER BY chunk_index ASC LIMIT ?2",
+        "SELECT chunk_index, content, byte_start, byte_end, line_start, line_end, hits \
+         FROM file_chunks \
+         WHERE path = ?1 \
+         ORDER BY hits ASC, chunk_index ASC \
+         LIMIT ?2",
     ) {
         Ok(stmt) => stmt,
         Err(_) => return Vec::new(),
@@ -718,6 +756,7 @@ fn load_snippets(conn: &Connection, path: &str, max_snippets: usize) -> Vec<Bund
             byte_end: row.get(3)?,
             line_start: row.get(4)?,
             line_end: row.get(5)?,
+            served_count: Some(row.get::<_, i64>(6)?),
         })
     })
     .map(|rows| rows.flatten().collect())
@@ -769,6 +808,7 @@ fn collect_snippets(
                     if let Some(line) = focus_line {
                         score += proximity_bonus(&snippet, line);
                     }
+                    score -= snippet_usage_penalty(snippet.served_count);
                     push_candidate(snippet, score);
                 } else {
                     warnings.push(format!(
@@ -787,7 +827,8 @@ fn collect_snippets(
         if let (Some(content), Some(offsets)) = (file_content, line_offsets) {
             if let Some(snippet) = build_focus_snippet(content, offsets, line) {
                 let score = 110.0 + snippet_semantic_weight(&snippet.content);
-                push_candidate(snippet, score);
+                let adjusted = score - snippet_usage_penalty(snippet.served_count);
+                push_candidate(snippet, adjusted);
             }
         } else {
             warnings.push("focusLine ignored because file content is unavailable.".to_string());
@@ -802,7 +843,8 @@ fn collect_snippets(
         if let Some(line) = focus_line {
             score += proximity_bonus(&snippet, line);
         }
-        push_candidate(snippet, score);
+        let adjusted = score - snippet_usage_penalty(snippet.served_count);
+        push_candidate(snippet, adjusted);
     }
 
     if candidates.is_empty() {
@@ -883,6 +925,12 @@ fn snippet_semantic_weight(content: &str) -> f32 {
     }
 
     score
+}
+
+fn snippet_usage_penalty(served: Option<i64>) -> f32 {
+    served
+        .map(|count| (count.max(0) as f32 + 1.0).ln() * 6.0)
+        .unwrap_or(0.0)
 }
 
 fn proximity_bonus(snippet: &BundleSnippet, focus_line: u32) -> f32 {
@@ -970,6 +1018,7 @@ fn build_range_snippet(
         byte_end: Some(end_byte as i64),
         line_start: Some(start as i64),
         line_end: Some(end as i64),
+        served_count: None,
     })
 }
 
@@ -1023,11 +1072,7 @@ fn trim_snippets_to_budget(
     snippets: Vec<BundleSnippet>,
     definitions: &[BundleDefinition],
     budget_tokens: usize,
-) -> (Vec<BundleSnippet>, Vec<String>) {
-    if snippets.is_empty() {
-        return (snippets, Vec::new());
-    }
-
+) -> (Vec<BundleSnippet>, BundleUsageStats, Vec<String>) {
     #[derive(Copy, Clone, Eq, PartialEq)]
     enum Stage {
         Omitted,
@@ -1043,6 +1088,7 @@ fn trim_snippets_to_budget(
         byte_end: Option<i64>,
         line_start: Option<i64>,
         line_end: Option<i64>,
+        served_count: Option<i64>,
         summary_content: String,
         summary_tokens: usize,
         excerpt_content: Option<String>,
@@ -1069,6 +1115,7 @@ fn trim_snippets_to_budget(
                 byte_end: snippet.byte_end,
                 line_start: snippet.line_start,
                 line_end: snippet.line_end,
+                served_count: snippet.served_count,
                 summary_content,
                 summary_tokens,
                 excerpt_content,
@@ -1106,6 +1153,7 @@ fn trim_snippets_to_budget(
                 byte_end,
                 line_start,
                 line_end,
+                served_count,
                 summary_content,
                 excerpt_content,
                 full_content,
@@ -1128,6 +1176,7 @@ fn trim_snippets_to_budget(
                 byte_end,
                 line_start,
                 line_end,
+                served_count,
             })
         }
     }
@@ -1135,12 +1184,24 @@ fn trim_snippets_to_budget(
     let definitions_cost = definition_token_cost(definitions);
     let mut used_tokens = definitions_cost;
     let mut warnings = Vec::new();
+    let mut usage = BundleUsageStats {
+        definitions_tokens: definitions_cost,
+        budget_tokens,
+        ..BundleUsageStats::default()
+    };
 
     if definitions_cost > budget_tokens {
         warnings.push(format!(
             "Definition metadata consumes {} tokens which already exceeds the {} token budget; snippet content may be omitted.",
             definitions_cost, budget_tokens
         ));
+    }
+
+    if snippets.is_empty() {
+        usage.snippet_tokens = 0;
+        usage.used_tokens = used_tokens;
+        usage.remaining_tokens = budget_tokens.saturating_sub(used_tokens);
+        return (Vec::new(), usage, Vec::new());
     }
 
     let mut entries: Vec<SnippetEntry> = snippets.into_iter().map(SnippetEntry::new).collect();
@@ -1197,6 +1258,10 @@ fn trim_snippets_to_budget(
         }
     }
 
+    usage.summary_snippets = summary_count;
+    usage.excerpt_snippets = excerpt_count;
+    usage.omitted_snippets = omitted_count;
+
     if omitted_count > 0 {
         warnings.push(format!(
             "{} snippet(s) omitted due to the {} token budget; request additional budgetTokens for more detail.",
@@ -1218,6 +1283,9 @@ fn trim_snippets_to_budget(
 
     if budget_tokens > 0 {
         let snippet_tokens_used = used_tokens.saturating_sub(definitions_cost);
+        usage.snippet_tokens = snippet_tokens_used;
+        usage.used_tokens = used_tokens;
+        usage.remaining_tokens = budget_tokens.saturating_sub(used_tokens);
         warnings.push(format!(
             "Token usage: definitions {} + snippets {} = {} of {} ({} unused).",
             definitions_cost,
@@ -1226,9 +1294,11 @@ fn trim_snippets_to_budget(
             budget_tokens,
             budget_tokens.saturating_sub(used_tokens)
         ));
+    } else {
+        usage.used_tokens = used_tokens;
     }
 
-    (selected, warnings)
+    (selected, usage, warnings)
 }
 
 fn definition_token_cost(definitions: &[BundleDefinition]) -> usize {
@@ -1243,6 +1313,15 @@ fn definition_token_cost(definitions: &[BundleDefinition]) -> usize {
         }
     }
     total
+}
+
+fn build_file_brief(content: &str) -> Option<String> {
+    let snippet = content
+        .lines()
+        .map(|line| line.trim())
+        .find(|line| !line.is_empty())?;
+    let brief = truncate_to_char_limit(snippet, SUMMARY_CHAR_LIMIT);
+    Some(brief)
 }
 
 fn build_summary_content(content: &str) -> String {
@@ -1317,6 +1396,7 @@ mod tests {
             byte_end: Some(content.len() as i64),
             line_start: Some(1),
             line_end: Some(content.lines().count() as i64),
+            served_count: None,
         }
     }
 
@@ -1325,7 +1405,7 @@ mod tests {
         let long_content = "fn example() {\n    println!(\"hello world\");\n}\n".repeat(40);
         let snippets = vec![build_snippet(&long_content)];
 
-        let (result, warnings) =
+        let (result, usage, warnings) =
             trim_snippets_to_budget(snippets, &[], /* budget_tokens */ 60);
 
         assert_eq!(result.len(), 1);
@@ -1335,6 +1415,8 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|warning| warning.contains("Token usage")));
+        assert_eq!(usage.summary_snippets, 1);
+        assert!(usage.snippet_tokens > 0);
     }
 
     #[test]
@@ -1345,7 +1427,7 @@ mod tests {
             .join("\n");
         let snippets = vec![build_snippet(&long_content)];
 
-        let (result, warnings) =
+        let (result, usage, warnings) =
             trim_snippets_to_budget(snippets, &[], /* budget_tokens */ 360);
 
         assert_eq!(result.len(), 1);
@@ -1357,6 +1439,8 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|warning| warning.contains("focused excerpts")));
+        assert_eq!(usage.excerpt_snippets, 1);
+        assert!(usage.snippet_tokens > 0);
     }
 }
 

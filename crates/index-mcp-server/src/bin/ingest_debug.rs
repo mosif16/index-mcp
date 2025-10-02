@@ -769,14 +769,31 @@ fn summarize_context_bundle(response: &ContextBundleResponse) -> String {
     }
 
     lines.push(format!("file: {}", response.file.path));
+    if let Some(brief) = &response.file.brief {
+        lines.push(format!("brief: {}", brief));
+    }
+    lines.push(format!(
+        "tokens: {} used of {} ({} unused), summaries={}, excerpts={}",
+        response.usage.used_tokens,
+        response.usage.budget_tokens,
+        response.usage.remaining_tokens,
+        response.usage.summary_snippets,
+        response.usage.excerpt_snippets
+    ));
+    if response.usage.cache_hit {
+        lines.push("cache-hit: true".to_string());
+    }
     lines.join("\n")
 }
 
 fn summarize_code_lookup_bundle(response: &ContextBundleResponse) -> String {
     format!(
-        "code_lookup (bundle): reused bundle for {}, {} definition(s)",
+        "code_lookup (bundle): reused bundle for {}, {} definition(s), cache_hit={}, tokens {} used/{}",
         response.file.path,
-        response.definitions.len()
+        response.definitions.len(),
+        response.usage.cache_hit,
+        response.usage.used_tokens,
+        response.usage.budget_tokens
     )
 }
 

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::sync::{Arc, RwLock};
 
 use crate::bundle::{
     context_bundle, ContextBundleError, ContextBundleParams, ContextBundleResponse, QuickLinkType,
@@ -28,13 +29,210 @@ use rmcp::{
     },
     model::{
         CallToolResult, Content, GetPromptRequestParam, GetPromptResult, Implementation,
-        ListPromptsResult, PaginatedRequestParam, PromptMessage, PromptMessageRole,
+        ListPromptsResult, Meta, PaginatedRequestParam, PromptMessage, PromptMessageRole,
         ProtocolVersion, ServerCapabilities, ServerInfo,
     },
     schemars::JsonSchema,
     service::RequestContext,
     tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler,
 };
+
+const DEFAULT_BUNDLE_BUDGET: usize = 2_000;
+const MIN_BUNDLE_BUDGET: usize = 600;
+const DEFAULT_SNIPPET_LIMIT_HINT: u32 = 2;
+const DEFAULT_SEARCH_LIMIT_HINT: u32 = 6;
+
+#[derive(Debug, Clone, Default)]
+struct EnvironmentSnapshot {
+    cwd: Option<String>,
+    bundle_budget_override: Option<usize>,
+    remaining_context_tokens: Option<usize>,
+}
+
+impl EnvironmentSnapshot {
+    fn bundle_budget(&self) -> usize {
+        let mut budget = self.bundle_budget_override.unwrap_or(DEFAULT_BUNDLE_BUDGET);
+        if let Some(remaining) = self.remaining_context_tokens {
+            // keep at least 40% buffer of the reported remaining window
+            let safety = (remaining as f64 * 0.6).floor() as usize;
+            if safety > 0 {
+                budget = budget.min(safety.max(MIN_BUNDLE_BUDGET));
+            }
+        }
+        budget.max(MIN_BUNDLE_BUDGET)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct EnvironmentState {
+    inner: Arc<RwLock<EnvironmentSnapshot>>,
+}
+
+impl EnvironmentState {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(EnvironmentSnapshot::default())),
+        }
+    }
+
+    fn snapshot(&self) -> EnvironmentSnapshot {
+        self.inner
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    fn update_from_meta(&self, meta: &Meta) {
+        let Some(value) = Self::meta_to_value(meta) else {
+            return;
+        };
+        let env_value = Self::extract_environment_value(&value);
+        if env_value.is_none() && !Self::contains_environment_keys(&value) {
+            return;
+        }
+
+        let mut next = self.snapshot();
+        let source = env_value.unwrap_or(&value);
+
+        if let Some(cwd) = source.get("cwd").and_then(|v| v.as_str()) {
+            next.cwd = Some(cwd.trim().to_string());
+        }
+
+        if let Some(budget) = source
+            .get("bundleBudgetTokens")
+            .or_else(|| source.get("budgetTokens"))
+            .and_then(|v| v.as_u64())
+        {
+            next.bundle_budget_override = Some(budget as usize);
+        }
+
+        if let Some(usage) = source.get("tokenUsage") {
+            if let Some(remaining) = usage.get("remainingContextTokens").and_then(|v| v.as_u64()) {
+                next.remaining_context_tokens = Some(remaining as usize);
+            }
+        }
+
+        if let Some(remaining) = source
+            .get("remainingContextTokens")
+            .and_then(|v| v.as_u64())
+        {
+            next.remaining_context_tokens = Some(remaining as usize);
+        }
+
+        if let Ok(mut guard) = self.inner.write() {
+            *guard = next;
+        }
+    }
+
+    fn apply_ingest_defaults(&self, params: &mut IngestParams) {
+        if params.root.is_none() {
+            if let Some(cwd) = self.snapshot().cwd {
+                params.root = Some(cwd);
+            }
+        }
+    }
+
+    fn apply_semantic_defaults(&self, params: &mut SemanticSearchRequest) {
+        if params.root.is_none() {
+            if let Some(cwd) = self.snapshot().cwd {
+                params.root = Some(cwd);
+            }
+        }
+        if params.limit.is_none() {
+            params.limit = Some(DEFAULT_SEARCH_LIMIT_HINT);
+        }
+    }
+
+    fn apply_bundle_defaults(&self, params: &mut ContextBundleParams) {
+        let snapshot = self.snapshot();
+        if params.root.is_none() {
+            if let Some(cwd) = snapshot.cwd.clone() {
+                params.root = Some(cwd);
+            }
+        }
+        if params.max_snippets.is_none() {
+            params.max_snippets = Some(DEFAULT_SNIPPET_LIMIT_HINT);
+        }
+        if params.budget_tokens.is_none() {
+            params.budget_tokens = Some(snapshot.bundle_budget() as u32);
+        }
+        if params.max_neighbors.is_none() {
+            params.max_neighbors = Some(6);
+        }
+    }
+
+    fn apply_code_lookup_defaults(&self, params: &mut CodeLookupParams) {
+        if params.root.is_none() {
+            if let Some(cwd) = self.snapshot().cwd {
+                params.root = Some(cwd);
+            }
+        }
+        if params.mode.is_none() {
+            params.mode = Some("search".to_string());
+        }
+    }
+
+    fn build_bundle_meta(&self, usage: &crate::bundle::BundleUsageStats, cache_hit: bool) -> Meta {
+        let snapshot = self.snapshot();
+        let mut meta = Meta::new();
+        meta.insert(
+            "bundleUsage".to_string(),
+            serde_json::to_value(usage).unwrap_or_else(|_| json!({})),
+        );
+        meta.insert("cacheHit".to_string(), json!(cache_hit));
+        if let Some(remaining) = snapshot.remaining_context_tokens {
+            meta.insert("remainingContextTokens".to_string(), json!(remaining));
+        }
+        meta.insert(
+            "effectiveBundleBudget".to_string(),
+            json!(snapshot.bundle_budget()),
+        );
+        meta
+    }
+
+    fn build_search_meta(&self, response: &SemanticSearchResponse) -> Meta {
+        let snapshot = self.snapshot();
+        let mut meta = Meta::new();
+        meta.insert(
+            "semanticSearch".to_string(),
+            json!({
+                "evaluatedChunks": response.evaluated_chunks,
+                "resultCount": response.results.len(),
+            }),
+        );
+        if let Some(remaining) = snapshot.remaining_context_tokens {
+            meta.insert("remainingContextTokens".to_string(), json!(remaining));
+        }
+        meta
+    }
+
+    fn meta_to_value(meta: &Meta) -> Option<Value> {
+        let mut map = serde_json::Map::new();
+        for (key, value) in meta.iter() {
+            map.insert(key.clone(), value.clone());
+        }
+        if map.is_empty() {
+            None
+        } else {
+            Some(Value::Object(map))
+        }
+    }
+
+    fn extract_environment_value<'a>(value: &'a Value) -> Option<&'a Value> {
+        value
+            .get("environment")
+            .or_else(|| value.get("environmentContext"))
+            .or_else(|| value.get("environment_context"))
+    }
+
+    fn contains_environment_keys(value: &Value) -> bool {
+        value.get("cwd").is_some()
+            || value.get("bundleBudgetTokens").is_some()
+            || value.get("budgetTokens").is_some()
+            || value.get("tokenUsage").is_some()
+            || value.get("remainingContextTokens").is_some()
+    }
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -111,6 +309,7 @@ const INDEXING_GUIDANCE_PROMPT_TEXT: &str = r#"Workflow reminder:
 pub struct IndexMcpService {
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
+    environment: EnvironmentState,
 }
 
 impl IndexMcpService {
@@ -145,6 +344,7 @@ impl IndexMcpService {
         Ok(Self {
             tool_router,
             prompt_router,
+            environment: EnvironmentState::new(),
         })
     }
 }
@@ -176,9 +376,12 @@ impl IndexMcpService {
     )]
     async fn ingest_codebase(
         &self,
-        Parameters(params): Parameters<IngestParams>,
-        _ctx: RequestContext<RoleServer>,
+        Parameters(mut params): Parameters<IngestParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        self.environment.update_from_meta(&ctx.meta);
+        self.environment.apply_ingest_defaults(&mut params);
+
         let response = ingest_codebase(params)
             .await
             .map_err(convert_ingest_error)?;
@@ -192,9 +395,11 @@ impl IndexMcpService {
     )]
     async fn semantic_search_tool(
         &self,
-        Parameters(params): Parameters<SemanticSearchRequest>,
-        _ctx: RequestContext<RoleServer>,
+        Parameters(mut params): Parameters<SemanticSearchRequest>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        self.environment.update_from_meta(&ctx.meta);
+        self.environment.apply_semantic_defaults(&mut params);
         let search_params = SemanticSearchParams {
             root: params.root,
             query: params.query,
@@ -207,7 +412,8 @@ impl IndexMcpService {
             .await
             .map_err(convert_semantic_search_error)?;
 
-        build_semantic_search_result(response)
+        let meta = self.environment.build_search_meta(&response);
+        build_semantic_search_result(response, meta)
     }
 
     #[tool(
@@ -216,14 +422,20 @@ impl IndexMcpService {
     )]
     async fn context_bundle_tool(
         &self,
-        Parameters(params): Parameters<ContextBundleParams>,
-        _ctx: RequestContext<RoleServer>,
+        Parameters(mut params): Parameters<ContextBundleParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        self.environment.update_from_meta(&ctx.meta);
+        self.environment.apply_bundle_defaults(&mut params);
         let response = context_bundle(params)
             .await
             .map_err(convert_context_bundle_error)?;
 
-        build_context_bundle_result(response)
+        let meta = self
+            .environment
+            .build_bundle_meta(&response.usage, response.usage.cache_hit);
+
+        build_context_bundle_result(response, Some(meta))
     }
 
     #[tool(
@@ -232,9 +444,11 @@ impl IndexMcpService {
     )]
     async fn code_lookup(
         &self,
-        Parameters(params): Parameters<CodeLookupParams>,
-        _ctx: RequestContext<RoleServer>,
+        Parameters(mut params): Parameters<CodeLookupParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        self.environment.update_from_meta(&ctx.meta);
+        self.environment.apply_code_lookup_defaults(&mut params);
         let CodeLookupParams {
             root,
             database_name,
@@ -276,15 +490,15 @@ impl IndexMcpService {
                 let response = semantic_search(search_params)
                     .await
                     .map_err(convert_semantic_search_error)?;
-
-                build_code_lookup_result(resolved_mode, response)
+                let meta = self.environment.build_search_meta(&response);
+                build_code_lookup_result(resolved_mode, response, Some(meta))
             }
             "bundle" => {
                 let file = file.or(query).ok_or_else(|| {
                     McpError::invalid_params("code_lookup bundle mode requires a file path.", None)
                 })?;
 
-                let bundle_params = ContextBundleParams {
+                let mut bundle_params = ContextBundleParams {
                     root,
                     database_name,
                     file,
@@ -295,12 +509,16 @@ impl IndexMcpService {
                     ranges: None,
                     focus_line: None,
                 };
+                self.environment.apply_bundle_defaults(&mut bundle_params);
 
                 let response = context_bundle(bundle_params)
                     .await
                     .map_err(convert_context_bundle_error)?;
+                let meta = self
+                    .environment
+                    .build_bundle_meta(&response.usage, response.usage.cache_hit);
 
-                build_code_lookup_bundle_response(resolved_mode, response)
+                build_code_lookup_bundle_response(resolved_mode, response, Some(meta))
             }
             _ => Err(McpError::invalid_params(
                 "Unsupported code_lookup mode. Supported modes: search, bundle.",
@@ -584,6 +802,7 @@ fn convert_semantic_search_error(error: SemanticSearchError) -> McpError {
 
 fn build_semantic_search_result(
     response: SemanticSearchResponse,
+    meta: Meta,
 ) -> Result<CallToolResult, McpError> {
     let summary = summarize_semantic_search(&response);
     let value: Value = serde_json::to_value(&response).map_err(|error| {
@@ -597,13 +816,14 @@ fn build_semantic_search_result(
         content: vec![Content::text(summary)],
         structured_content: Some(value),
         is_error: Some(false),
-        meta: None,
+        meta: Some(meta),
     })
 }
 
 fn build_code_lookup_result(
     mode: String,
     search_result: SemanticSearchResponse,
+    meta: Option<Meta>,
 ) -> Result<CallToolResult, McpError> {
     let summary = summarize_semantic_search(&search_result);
     let payload = CodeLookupResponse {
@@ -624,13 +844,14 @@ fn build_code_lookup_result(
         content: vec![Content::text(summary)],
         structured_content: Some(value),
         is_error: Some(false),
-        meta: None,
+        meta,
     })
 }
 
 fn build_code_lookup_bundle_response(
     mode: String,
     bundle: ContextBundleResponse,
+    meta: Option<Meta>,
 ) -> Result<CallToolResult, McpError> {
     let summary = summarize_bundle(&bundle);
 
@@ -657,7 +878,7 @@ fn build_code_lookup_bundle_response(
         content: vec![Content::text(summary)],
         structured_content: Some(value),
         is_error: Some(false),
-        meta: None,
+        meta,
     })
 }
 
@@ -692,6 +913,14 @@ fn summarize_bundle(bundle: &ContextBundleResponse) -> String {
             QuickLinkType::RelatedSymbol => format!("symbol {}", link.label),
         };
         parts.push(format!("First quick link: {}.", label));
+    }
+
+    parts.push(format!(
+        "Token usage {} of {} ({} unused).",
+        bundle.usage.used_tokens, bundle.usage.budget_tokens, bundle.usage.remaining_tokens
+    ));
+    if bundle.usage.cache_hit {
+        parts.push("Served from cache.".to_string());
     }
 
     if !bundle.warnings.is_empty() {
@@ -829,6 +1058,7 @@ fn convert_repository_timeline_error(error: RepositoryTimelineError) -> McpError
 
 fn build_context_bundle_result(
     response: ContextBundleResponse,
+    meta: Option<Meta>,
 ) -> Result<CallToolResult, McpError> {
     let summary = summarize_bundle(&response);
 
@@ -843,7 +1073,7 @@ fn build_context_bundle_result(
         content: vec![Content::text(summary)],
         structured_content: Some(value),
         is_error: Some(false),
-        meta: None,
+        meta,
     })
 }
 
@@ -1026,6 +1256,7 @@ mod tests {
                 modified: 1_710_000_000,
                 hash: "abc123".into(),
                 last_indexed_at: 1_710_000_123,
+                brief: None,
                 content: None,
             },
             definitions: vec![BundleDefinition {
@@ -1050,6 +1281,7 @@ mod tests {
                 byte_end: Some(12),
                 line_start: Some(1),
                 line_end: Some(1),
+                served_count: None,
             }],
             latest_ingestion: None,
             warnings: vec!["No graph metadata".into()],
@@ -1061,6 +1293,17 @@ mod tests {
                 symbol_id: None,
                 symbol_kind: None,
             }],
+            usage: crate::bundle::BundleUsageStats {
+                definitions_tokens: 10,
+                snippet_tokens: 12,
+                used_tokens: 22,
+                budget_tokens: 3_000,
+                remaining_tokens: 2_978,
+                omitted_snippets: 0,
+                excerpt_snippets: 0,
+                summary_snippets: 0,
+                cache_hit: false,
+            },
         };
 
         let summary = summarize_bundle(&bundle);
