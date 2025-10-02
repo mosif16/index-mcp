@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "crates/index_mcp_native",
     "crates/index-mcp-server",
 ]
 resolver = "2"

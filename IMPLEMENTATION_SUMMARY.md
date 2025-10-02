@@ -1,6 +1,6 @@
 # Implementation Summary: Stop Blowing Context (Simple Mode)
 
-This document summarizes the changes made to implement the "Stop Blowing Context" feature as specified in the requirements.
+This document summarizes the changes made to implement the "Stop Blowing Context" feature as specified in the requirements. The feature was originally delivered in the now-removed Node/TypeScript runtime and its logic has since been ported to the Rust server.
 
 ## Overview
 

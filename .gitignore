@@ -21,11 +21,6 @@ dist/
 *.sqlite-wal
 *.sqlite-journal
 
-# Native addon build outputs
-crates/index_mcp_native/target/
-crates/index_mcp_native/index.node
-crates/index_mcp_native/index.*.node
-
 # Rust top-level target (for any root-level cargo builds)
 target/
 

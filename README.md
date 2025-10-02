@@ -1,246 +1,87 @@
-USE NODE-RUNTIME BRANCH. MAIN BRANCH UNDER WORK 
-
-
-
 # index-mcp
 
-An MCP (Model Context Protocol) server that scans a source-code workspace and builds a searchable SQLite index (`.mcp-index.sqlite` by default) in the project root. The index stores file metadata, hashes, and optionally file contents so MCP-compatible clients can perform fast lookups, semantic search, and graph exploration.
+`index-mcp` is a Rust-native [Model Context Protocol](https://github.com/modelcontextprotocol) (MCP) server that scans a source-code workspace and writes a searchable SQLite database (`.mcp-index.sqlite`) into the project root. Agents query the database through MCP tools to obtain semantic chunks, graph metadata, or git history without re-reading the entire repository on every request.
 
-**New in this version:** Context budget control and hotness tracking to prevent overwhelming LLMs with excessive context. Only small, focused bundles are sent based on actual usage patterns.
+The project previously shipped a Node/TypeScript runtime. That implementation has now been retired in favour of the Rust server, which owns the complete tool surface.
 
-## Key capabilities
+## Key Capabilities
 
-- **Fast ingestion** – Uses a native Rust addon (when available) to parallelize filesystem walking, hashing, and chunking.
-- **Flexible querying** – Downstream MCP clients can retrieve semantic chunks, structural graph edges, or full file context.
-- **Incremental updates** – Watch mode keeps the SQLite database aligned with live edits.
-- **Optional remotes** – Proxy additional MCP servers and expose them under configurable namespaces.
-- **Token budget control** – Context bundles respect token limits to avoid sending excessive data to LLMs.
-- **Hotness tracking** – Tracks which symbols and snippets are actually used, with optional eviction of stale data.
-- **Freshness checks** – Compares current git commit with indexed commit to detect when re-indexing is needed.
+- **Fast ingestion** – Parallel filesystem walker with `.gitignore` support, hashing, chunking, embeddings, and optional auto-eviction based on database size targets.
+- **Flexible lookups** – `code_lookup`, `semantic_search`, and `context_bundle` expose focused snippets, structured metadata, and graph context for agents.
+- **Git awareness** – `repository_timeline` and `repository_timeline_entry` summarise recent commits and cached diffs so agents can reason about repo history.
+- **Watch mode** – Optional filesystem watcher re-ingests changed paths automatically for long-running agent sessions.
+- **Remote proxies** – Mount additional MCP servers behind the same process by declaring JSON descriptors in `INDEX_MCP_REMOTE_SERVERS`.
+- **Context budgeting & hotness tracking** – Bundles respect a configurable token budget and track per-chunk usage to inform eviction heuristics.
 
 ## Requirements
 
-- Rust toolchain (`cargo`) 1.75+ (default runtime)
-- Node.js **18.17 or newer** and npm **9+** (needed for the legacy Node runtime and native addon builds)
+- [Rust](https://rustup.rs/) toolchain 1.76 or newer (`cargo` must be on `PATH`).
+- SQLite runtime libraries (bundled automatically through `rusqlite` with the `bundled` feature).
+- Optional utilities: `sqlite3` CLI for inspection, `watchexec`/`entr` for custom watch workflows.
 
-Optional but recommended:
+## Quick Start
 
-- [`@napi-rs/cli`](https://github.com/napi-rs/napi-rs/tree/main/cli) to compile the native addon manually when using the Node runtime
-
-## Quick start
-
-### Run the Rust server (default)
+Compile or run the server directly with Cargo:
 
 ```bash
-cargo run -p index-mcp-server --release
+cargo check -p index-mcp-server              # Compile only
+cargo run -p index-mcp-server --release      # Launch the MCP server (release mode)
+cargo run -p index-mcp-server -- --help      # Inspect runtime flags
+
+# Smoke test all tools in one go
+cargo run -p index-mcp-server --bin ingest_debug --release
 ```
 
-Omit `--release` for faster incremental builds or pass additional CLI flags with
-`INDEX_MCP_ARGS="--watch --watch-debounce=250" ./start.sh`.
-
-### Legacy Node runtime
-
-Install dependencies and build the TypeScript bundles:
+The repository includes a convenience launcher, `start.sh`, which wraps the same `cargo run` invocation while honouring environment overrides:
 
 ```bash
-npm install
-npm run build
+./start.sh                                  # Uses release profile by default
+INDEX_MCP_CARGO_PROFILE=debug ./start.sh    # Opt into a custom cargo profile
+INDEX_MCP_ARGS="--watch" ./start.sh        # Forward additional CLI flags
 ```
 
-Launch the compiled stdio server:
+`INDEX_MCP_ARGS` is tokenised by the shell before being appended after `--` so any runtime flag accepted by the server can be supplied (for example, `--watch-debounce=250`).
 
-```bash
-npm start
-```
+## Watch Mode
 
-During development you can run the TypeScript entrypoint directly:
-
-```bash
-npm run dev
-```
-
-## Native acceleration (Node runtime)
-
-When running the legacy Node server, the native module in `crates/index_mcp_native` is loaded automatically on startup. When present it accelerates ingestion; when it fails to load (or if you set `INDEX_MCP_NATIVE_DISABLE=true`) the server falls back to the TypeScript implementation and logs a warning.
-
-To build the addon manually:
-
-```bash
-cd crates/index_mcp_native
-npm install
-npm run build
-```
-
-Restart the server after rebuilding—the next `ingest_codebase` call will attempt to load the native scanner and report issues through the `info` tool.
-
-## Watch mode and cleanup
-
-### Rust runtime
-
-The Rust binary ships with a built-in watcher. Prefix your launch command with the desired flags:
+Enable watch mode either via Cargo directly or with the helper script:
 
 ```bash
 cargo run -p index-mcp-server --release -- --watch --watch-debounce=250
+INDEX_MCP_ARGS="--watch --watch-no-initial" ./start.sh
 ```
 
-Or, when using `start.sh`, populate `INDEX_MCP_ARGS`:
+Key flags:
 
-```bash
-INDEX_MCP_ARGS="--watch --watch-debounce=250" ./start.sh
-```
+| Flag | Description |
+|------|-------------|
+| `--cwd <path>` | Override the working directory analysed by the server. |
+| `--watch` | Enable the filesystem watcher for incremental ingests. |
+| `--watch-root <path>` | Track a directory other than the process `cwd`. |
+| `--watch-debounce <ms>` | Tune debounce (minimum 50 ms). |
+| `--watch-no-initial` | Skip the initial full ingest on startup. |
+| `--watch-quiet` | Silence watcher progress logs. |
+| `--watch-database <name>` | Use an alternate SQLite filename for watch mode. |
 
-Flags mirror the Node watcher (`--watch-root`, `--watch-no-initial`, `--watch-quiet`, `--watch-database`).
+## Context Budget & Hotness Tracking
 
-### Node runtime
+Context bundles automatically respect the `INDEX_MCP_BUDGET_TOKENS` environment variable (default: 3000 tokens). Responses prioritise focus definitions, append nearby lines, and truncate intelligently with explicit notices when content is trimmed. Each served chunk increments a `hits` counter which feeds auto-eviction heuristics during ingest.
 
-Keep the SQLite index synchronized with local edits by enabling the watcher:
-
-```bash
-npm run watch
-```
-
-You can also pass flags through `npm run dev` (e.g. `npm run dev -- --watch`). Useful options:
-
-- `--watch-debounce=<ms>` – Adjust debounce before re-ingesting (default 500 ms).
-- `--watch-database=<filename>` – Choose a custom SQLite filename.
-- `--watch-no-initial` – Skip the initial full ingest.
-- `--watch-quiet` – Silence watcher logs.
-
-When embedding the Node server in another process, call `await runCleanup()` from `src/cleanup.ts` before exit so watchers, transports, and embedding pipelines shut down cleanly.
-
-## Context Budget and Hotness Tracking
-
-This implementation ensures that **raw index data is not sent to the LLM**. Instead, everything is stored in SQLite, and only small, focused bundles are sent when requested.
-
-### Token Budget Control
-
-Context bundles automatically respect token limits to prevent overwhelming LLMs:
-
-- Default budget: **3000 tokens** (configurable via `INDEX_MCP_BUDGET_TOKENS` env var)
-- Prioritizes key definitions first, then nearby lines
-- Trims content to fit within budget
-- Warns when content is truncated
-
-```bash
-export INDEX_MCP_BUDGET_TOKENS=5000  # Increase to 5000 tokens
-```
-
-### Hotness Tracking
-
-The system tracks which symbols and snippets are actually accessed:
-
-- Every served symbol/snippet increments a `hits` counter
-- Optional automatic eviction of least-used data when database exceeds size limit (default: 150 MB)
-- Keeps high-value, frequently accessed data in the index
-
-To enable automatic eviction during ingest:
-
-```typescript
-await ingestCodebase({
-  root: '/path/to/repo',
-  autoEvict: true,
-  maxDatabaseSizeBytes: 100 * 1024 * 1024  // 100 MB limit
-});
-```
-
-### Freshness Checks
-
-The `index_status` tool now compares the current git commit with the indexed commit:
-
-- Returns `isStale: true` if commits don't match
-- Includes both current and indexed commit SHAs
-- Tracks when indexing occurred
-
-This allows agents to automatically detect when re-indexing is needed after git operations.
-
-## Rust runtime
-
-The Rust MCP server in `crates/index-mcp-server` now serves the full tool surface—ingest, semantic
-search, context bundles, graph neighbors, repository timelines, remote MCP proxying, prompts, and
-watch mode—using the official [Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk).
-
-Build or run the Rust binary with:
-
-```bash
-cargo check -p index-mcp-server
-cargo run -p index-mcp-server --release
-```
-
-The executable communicates over stdio, so it can be registered with MCP-compatible clients like
-Claude Desktop in the same way as the Node entrypoint. Use `INDEX_MCP_ARGS` (or pass CLI flags
-directly) to enable watcher mode, override the working directory, or tweak debounce settings.
-
-## Codex CLI setup
-
-The project root includes a `start.sh` helper. By default it compiles and launches the Rust binary,
-passing through any `INDEX_MCP_*` environment variables. Set `INDEX_MCP_RUNTIME=node` to boot the
-legacy JavaScript stack instead (which rebuilds `dist/`, refreshes the native addon, and starts the
-local backend before launching `node dist/server.js`). Point your Codex configuration at this script
-and customize paths for your machine:
+To cap database size during ingest:
 
 ```json
 {
-  "mcpServers": {
-    "index-mcp": {
-      "command": "/absolute/path/to/index-mcp/start.sh",
-      "env": {
-        "INDEX_MCP_LOG_LEVEL": "info",
-        "INDEX_MCP_LOG_DIR": "/absolute/path/to/.index-mcp/logs",
-        "INDEX_MCP_LOG_CONSOLE": "false",
-        "INDEX_MCP_BUDGET_TOKENS": "3000"
-      }
-    }
-  }
+  "root": ".",
+  "autoEvict": true,
+  "maxDatabaseSizeBytes": 150000000
 }
 ```
 
-For live development you can reference the TypeScript entrypoint directly:
+Pass the payload above to the `ingest_codebase` tool (for example via the MCP client you are integrating with). The server evicts the least-used rows until the size target is met.
 
-```json
-{
-  "mcpServers": {
-    "index-mcp": {
-      "command": "npx",
-      "args": ["tsx", "src/server.ts"],
-      "env": {
-        "INDEX_MCP_LOG_LEVEL": "debug",
-        "INDEX_MCP_LOG_CONSOLE": "true",
-        "INDEX_MCP_REMOTE_SERVERS": "[]"
-      }
-    }
-  }
-}
-```
+## Remote MCP Proxying
 
-A matching `agent.toml` configuration looks like:
-
-```toml
-[mcp_servers.index_mcp]
-command = "/absolute/path/to/index-mcp/start.sh"
-env = {
-  INDEX_MCP_LOG_LEVEL = "info",
-  INDEX_MCP_LOG_DIR = "/absolute/path/to/.index-mcp/logs",
-  INDEX_MCP_LOG_CONSOLE = "false",
-  INDEX_MCP_BUDGET_TOKENS = "3000"
-}
-```
-
-Set `INDEX_MCP_RUNTIME = "node"` in either configuration if you prefer the TypeScript server.
-
-### Local backend options
-
-When `INDEX_MCP_RUNTIME=node`, `start.sh` launches a lightweight HTTP/SSE backend implemented in
-`src/local-backend/server.ts`. Configure it with environment variables before invoking the script:
-
-- `LOCAL_BACKEND_HOST` (default `127.0.0.1`)
-- `LOCAL_BACKEND_PORT` (default `8765`)
-- `LOCAL_BACKEND_PATH` (default `/mcp`) – SSE subscription path
-- `LOCAL_BACKEND_MESSAGES_PATH` (default `/messages`) – POST endpoint for the SSE transport
-- `INDEX_MCP_NATIVE_DISABLE=true` – Force the JavaScript ingestion path when debugging native issues
-
-### Remote MCP proxying
-
-Expose additional MCP servers through this instance by setting `INDEX_MCP_REMOTE_SERVERS` to a JSON array. Each entry supports namespace configuration, authentication, and retry controls. Example:
+Mount additional MCP servers by exporting `INDEX_MCP_REMOTE_SERVERS` before launching the process:
 
 ```bash
 export INDEX_MCP_REMOTE_SERVERS='[
@@ -248,25 +89,25 @@ export INDEX_MCP_REMOTE_SERVERS='[
     "name": "search-backend",
     "namespace": "remote.search",
     "url": "https://example.com/mcp",
-    "auth": { "type": "bearer", "tokenEnv": "REMOTE_SEARCH_TOKEN" },
-    "retry": { "maxAttempts": Infinity, "initialDelayMs": 500, "maxDelayMs": 30000 }
+    "headers": { "x-api-key": "${SEARCH_TOKEN}" },
+    "retry": { "maxAttempts": 5, "initialDelayMs": 500, "backoffMultiplier": 2.0 }
   }
 ]'
+./start.sh
 ```
 
-On startup the server opens SSE channels to each remote. Connection failures retry in the background without blocking local tools, and remote tool namespaces are added automatically when a connection succeeds.
+Remote tools are surfaced under `<namespace>.<tool>` and benefit from the same structured logging and retry behaviour as the local toolset.
 
-## Troubleshooting tips
+## Troubleshooting
 
-- **Missing `better_sqlite3` binding:** Ensure `npm install` ran under Node ≥ 18 so prebuilt binaries download successfully.
-- **Native addon issues:** Set `INDEX_MCP_NATIVE_DISABLE=true` to force the TypeScript ingest path while you debug, then rebuild the addon when ready.
-- **Index not updating:** Re-run `ingest_codebase` or enable watch mode after making changes.
-- **Embedding download hiccups:** Rerun the ingest after network connectivity is restored or temporarily disable embeddings with `{"embedding": {"enabled": false}}`.
-- **Large repositories:** Increase `maxFileSizeBytes` or adjust `include`/`exclude` patterns.
-- **Missing bundles:** Run `npm run build` if `start.sh` reports a missing `dist/` output.
+- **Missing toolchain** – Install Rust with `rustup` and ensure `cargo` is on `PATH`.
+- **Embedding download issues** – The server uses `fastembed`; transient network failures leave the cache empty. Re-run ingest when connectivity is restored or disable embeddings via `{ "embedding": { "enabled": false } }`.
+- **SQLite locks** – Another process may hold the database. Retry after releasing the lock or configure a different database filename with `--watch-database`.
+- **Watcher noise** – Increase debounce or enable `--watch-quiet` to reduce log output.
 
-## Additional resources
+## Further Reading
 
-- `docs/` – Reference material for Codex CLI integration and MCP best practices.
-- `docs/rust-migration.md` – Status tracker for the ongoing Rust server migration.
-- `agents.md` – High-level guidance for running the MCP server alongside Codex.
+- `docs/rust-migration.md` – status tracker for the Rust rewrite.
+- `docs/rust-acceleration.md` – design notes and benchmarks for the native pipeline.
+- `agents.md` – guidance for wiring the server into MCP-compatible clients.
+- `IMPLEMENTATION_SUMMARY.md` – historical context for the token-budget and hotness tracking features.

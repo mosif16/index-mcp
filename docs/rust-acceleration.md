@@ -2,7 +2,11 @@
 
 The existing ingestion pipeline does a considerable amount of synchronous filesystem and CPU-heavy work inside the Node.js event loop. While the current architecture is solid for small and medium sized repos, Rust can help in three areas where we consistently hit bottlenecks:
 
-> **Status (February 2026):** The Rust server (`crates/index-mcp-server`) now owns the entire ingestion, search, graph, and git timeline surface. The older Node pipeline remains available only as a compatibility shim. Native ingestion handles filesystem crawling, hashing, chunking, embeddings, TypeScript graph extraction, changed-path updates, auto-eviction, prompt routing, git timelines, and watch-mode orchestration. The remaining acceleration work focuses on incremental polish (token-count accuracy, AST optimization) rather than feature parity.
+> **Note:** The Node runtime has now been removed from the repository. This document is preserved as a
+> historical reference for the migration effort and highlights how the project arrived at the
+> current Rust-only architecture.
+
+> **Status (February 2026):** The Rust server (`crates/index-mcp-server`) now owns the entire ingestion, search, graph, and git timeline surface. The older Node pipeline has been removed. Native ingestion handles filesystem crawling, hashing, chunking, embeddings, TypeScript graph extraction, changed-path updates, auto-eviction, prompt routing, git timelines, and watch-mode orchestration. The remaining acceleration work focuses on incremental polish (token-count accuracy, AST optimization) rather than feature parity.
 
 1. **Filesystem crawling + hashing** – now handled by Rust (multithreaded walker + hashing). Further work: refine adaptive batching and expose metrics to callers.
 2. **Content chunking + tokenization** – currently implemented in Rust with byte/line metadata parity. Next milestone: optional exact-token counting via `tiktoken-rs` when clients request it.
@@ -42,7 +46,7 @@ The existing ingestion pipeline does a considerable amount of synchronous filesy
 
 3. **Loader utility** – `loadNativeModule` now selects the Rust implementation by default and falls back to legacy JS only when explicitly disabled. Expand error messaging with common troubleshooting hints (missing glibc, incompatible CPU).
 
-4. **Node fallback** – keep the legacy TypeScript ingest path around for a couple of releases but document it as deprecated. Plan a final removal once the Rust server has been battle-tested with large installations.
+4. **Node fallback (retired)** – the legacy TypeScript ingest path has been removed now that the Rust server has been battle-tested with large installations.
 
 5. **Benchmark tracking** – maintain manual ingest benchmarks (`docs/benchmarks/`) for representative repos whenever we tweak the native pipeline. Include watch-mode deltas and auto-eviction timing.
 
