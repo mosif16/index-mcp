@@ -88,8 +88,22 @@ struct SemanticSearchRequest {
 }
 
 /// Textual instructions shared with MCP clients.
-const SERVER_INSTRUCTIONS: &str = "Rust rewrite in progress. Rust server currently supports ingest_codebase, semantic_search, code_lookup (search or bundle modes), context_bundle (requires a file path and optional symbol), index_status, repository_timeline, and repository_timeline_entry; graph_neighbors is not available yet in the Rust runtime.";
-const INDEXING_GUIDANCE_PROMPT_TEXT: &str = "Tools: code_lookup (routes to semantic search or context bundles), ingest_codebase (refresh the SQLite index; enable autoEvict/maxDatabaseSizeBytes to prune unused chunks), index_status (check freshness), semantic_search (direct embedding-powered retrieval that updates hotness), context_bundle (requires a file path and returns a structured bundle trimmed to budgetTokens or INDEX_MCP_BUDGET_TOKENS), indexing_guidance_tool (tool-form reminders), indexing_guidance (prompt version), repository_timeline (summarize recent git commits), repository_timeline_entry (recover cached commit details), and info (runtime diagnostics). Workflow: run ingest_codebase on a new checkout or after edits while respecting .gitignore, call index_status when freshness is uncertain, then reach for code_lookup—use query=\"...\" for discovery and file=\"...\" plus optional symbol for file context. If ingest_codebase hits a \"UNIQUE constraint failed: code_graph_nodes...\" error, rerun it with graph.enabled=false until the duplicate-node fix lands. Invoke the specialist tools directly when you need their richer metadata, and tune budgetTokens to keep downstream LLM context under control.";
+const SERVER_INSTRUCTIONS: &str = r#"Rust rewrite in progress. Follow this workflow so the index stays authoritative and queries stay lean:
+1. Run ingest_codebase {"root": "."} (or start watch mode) before any lookup. Honor .gitignore, skip files larger than 8 MiB, and set autoEvict/maxDatabaseSizeBytes when the SQLite file grows.
+2. Call index_status whenever freshness is unclear. Re-ingest immediately if it reports staleness.
+3. Prefer code_lookup for discovery: query="..." routes to semantic search; file="..." plus an optional symbol returns a bundle.
+4. Review repository_timeline (and repository_timeline_entry) before planning or applying code changes.
+5. Use semantic_search for follow-up refinement and context_bundle for targeted file context, keeping responses within INDEX_MCP_BUDGET_TOKENS or an explicit budgetTokens value.
+6. Re-run ingest_codebase after edits, or rely on watch mode so the database reflects the latest workspace state.
+7. Keep responses compact—set INDEX_MCP_BUDGET_TOKENS, trim limits, and reach for info or indexing_guidance when diagnostics or reminders are needed.
+
+Available tools: ingest_codebase, index_status, code_lookup (search/bundle), semantic_search, context_bundle, repository_timeline, repository_timeline_entry, indexing_guidance, indexing_guidance_tool, info."#;
+const INDEXING_GUIDANCE_PROMPT_TEXT: &str = r#"Workflow reminder:
+1. ingest_codebase {"root": "."} (or watch) after a checkout or edits—respect .gitignore, skip files >8 MiB, and tune autoEvict/maxDatabaseSizeBytes as needed.
+2. index_status whenever freshness is uncertain; rerun ingest_codebase if it reports stale data.
+3. code_lookup first (query="..." for search, file="..." + symbol for bundles), then semantic_search/context_bundle for refinements.
+4. repository_timeline and repository_timeline_entry before planning or applying changes.
+5. Keep answers tight: set INDEX_MCP_BUDGET_TOKENS or pass budgetTokens, trim limits, and prefer info/indexing_guidance_tool for diagnostics."#;
 
 /// Primary server state for the Rust MCP implementation.
 #[derive(Clone)]

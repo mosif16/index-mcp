@@ -15,7 +15,7 @@ The implementation ensures that **raw index data is not sent to the LLM**. Inste
 - Added `meta` table to store:
   - `commit_sha`: Current git commit at index time
   - `indexed_at`: Timestamp when indexing occurred
-- Added `hits` column to both `file_chunks` and `code_graph_nodes` tables
+- Added `hits` column to the `file_chunks` table
 - Already respected `.gitignore` (existing functionality)
 
 **Files modified:**
@@ -31,7 +31,6 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 
 ALTER TABLE file_chunks ADD COLUMN hits INTEGER DEFAULT 0;
-ALTER TABLE code_graph_nodes ADD COLUMN hits INTEGER DEFAULT 0;
 ```
 
 ### 2. Lookup → SQLite First ✅
@@ -40,7 +39,6 @@ ALTER TABLE code_graph_nodes ADD COLUMN hits INTEGER DEFAULT 0;
 - The existing `code_lookup` tool already implements intelligent routing:
   - Tries exact symbol/file match
   - Falls back to semantic search
-  - Includes graph traversal mode
 - Hit tracking is automatically incremented when data is accessed
 
 **Files modified:**
@@ -96,7 +94,6 @@ ALTER TABLE code_graph_nodes ADD COLUMN hits INTEGER DEFAULT 0;
 **What was built:**
 - Every served symbol/snippet increments `hits` in SQLite:
   - `file_chunks.hits` incremented on semantic search results
-  - `code_graph_nodes.hits` incremented on context bundle access
 - Optional eviction mechanism:
   - New `eviction.ts` module
   - Evicts least-used rows when DB > configurable limit (default 150 MB)
@@ -120,7 +117,7 @@ The existing `code_lookup` tool already implements the router pattern:
 
 2. **Use code_lookup(mode="auto")**
    - Already implemented in `src/server.ts`
-   - Routes to semantic_search, context_bundle, or graph_neighbors
+   - Routes to semantic_search or context_bundle
    - Falls back to semantic_search for low confidence
 
 3. **Never exceed bundle budget**

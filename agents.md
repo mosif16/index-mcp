@@ -12,7 +12,7 @@ Framing
 
 Configuration
 	•	Configure servers in `~/.codex/config.toml` under `[mcp_servers.<name>]` with `command`, optional `args`, and `env`.
-	•	Tune `startup_timeout_sec` for slower binaries (Rust builds) and `tool_timeout_sec` for long-running ingests or graph traversals.
+	•	Tune `startup_timeout_sec` for slower binaries (Rust builds) and `tool_timeout_sec` for long-running ingests or history queries.
 
 Security
 	•	Inject secrets through environment variables or MCP headers; never bake them into binaries or config files.
@@ -41,7 +41,7 @@ This guide explains how to run the **index-mcp** Rust server with Codex CLI (or 
 
 ## 1. Overview
 
-- **Purpose:** Build and query a `.mcp-index.sqlite` database that captures file metadata, embeddings, graph edges, and git history so agents can answer questions without re-parsing the repo.
+- **Purpose:** Build and query a `.mcp-index.sqlite` database that captures file metadata, embeddings, and git history so agents can answer questions without re-parsing the repo.
 - **Primary runtime:** `crates/index-mcp-server` – a Rust binary using the official [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) SDK.
 - **Helper script:** `start.sh` launches the Rust binary via `cargo run`, honouring `INDEX_MCP_ARGS` and `INDEX_MCP_CARGO_PROFILE` overrides.
 - **Watch mode:** `cargo run -p index-mcp-server -- --watch` (or `INDEX_MCP_ARGS="--watch" ./start.sh`) keeps the SQLite index fresh after file edits.
@@ -115,13 +115,13 @@ The server banner reminds clients to re-run `ingest_codebase` after edits, check
 
 ## 5. Typical Workflow
 
-1. **Initial ingest** – `ingest_codebase { "root": "." }` (or rely on `--watch`). Honor `.gitignore` to avoid bloating the database.
-2. **Verify freshness** – `index_status` reports missing ingests, schema mismatches, or git drift.
-3. **Discover context** – `code_lookup` (search/bundle), `semantic_search`, or `context_bundle` supply snippets and structured metadata.
-4. **Explore structure** – Use `context_bundle` for localised snippets and `repository_timeline`/`repository_timeline_entry` for commit history and cached diffs.
-5. **Budget management** – Set `INDEX_MCP_BUDGET_TOKENS` (or pass `budgetTokens`) so responses fit within downstream context limits.
-6. **Remote tooling** – Configure `INDEX_MCP_REMOTE_SERVERS` (JSON array) to mount remote MCP endpoints; the Rust proxy maintains SSE connections, retries with exponential backoff, and mirrors tool metadata under `<namespace>.*` names.
-7. **Re-ingest after changes** – Re-run `ingest_codebase` or let watch mode feed the database incremental updates.
+1. **Ingest first** – `ingest_codebase { "root": "." }` (or `--watch`) before any lookup. Honor `.gitignore`, skip files larger than 8 MiB, and enable `autoEvict`/`maxDatabaseSizeBytes` when the SQLite file grows.
+2. **Verify freshness** – Run `index_status` whenever the agent is unsure about recency; re-run `ingest_codebase` immediately if it reports staleness.
+3. **Default to `code_lookup`** – Use `query="..."` for semantic discovery and `file="..."` plus an optional symbol for bundles before escalating to other tools.
+4. **Review repo history** – Call `repository_timeline` (and `repository_timeline_entry`) prior to planning or applying code changes so diffs stay in view.
+5. **Refine context** – Reach for `semantic_search` follow-ups and `context_bundle` for focused file context while staying within `INDEX_MCP_BUDGET_TOKENS` or an explicit `budgetTokens` value.
+6. **Keep the index current** – Re-run `ingest_codebase` after edits or rely on watch mode so the database mirrors the workspace.
+7. **Budget & diagnostics** – Set `INDEX_MCP_BUDGET_TOKENS`, tune tool limits, and use `info`/`indexing_guidance` when you need diagnostics or reminders.
 
 ## 6. SQLite Layout
 
@@ -130,7 +130,6 @@ The Rust runtime preserves the schema introduced by the legacy implementation:
 - `files` – path, size, modified time (ms), SHA-256 hash, stored content, last indexed timestamp.
 - `file_chunks` – chunk text, embeddings (float32 blobs), byte/line spans, hit counters, embedding model id.
 - `ingestions` – ingest history, durations, counts, and root paths.
-- `code_graph_nodes` / `code_graph_edges` – TypeScript graph metadata (imports, calls, visibility, signatures, docstrings).
 - `meta` – key/value store for commit SHA, last indexed timestamp, and other metadata.
 
 Databases created before the rewrite remain compatible with the current runtime.

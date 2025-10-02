@@ -1,13 +1,13 @@
 # index-mcp
 
-`index-mcp` is a Rust-native [Model Context Protocol](https://github.com/modelcontextprotocol) (MCP) server that scans a source-code workspace and writes a searchable SQLite database (`.mcp-index.sqlite`) into the project root. Agents query the database through MCP tools to obtain semantic chunks, graph metadata, or git history without re-reading the entire repository on every request.
+`index-mcp` is a Rust-native [Model Context Protocol](https://github.com/modelcontextprotocol) (MCP) server that scans a source-code workspace and writes a searchable SQLite database (`.mcp-index.sqlite`) into the project root. Agents query the database through MCP tools to obtain semantic chunks and git history without re-reading the entire repository on every request.
 
 The project previously shipped a Node/TypeScript runtime. That implementation has now been retired in favour of the Rust server, which owns the complete tool surface.
 
 ## Key Capabilities
 
 - **Fast ingestion** – Parallel filesystem walker with `.gitignore` support, hashing, chunking, embeddings, and optional auto-eviction based on database size targets.
-- **Flexible lookups** – `code_lookup`, `semantic_search`, and `context_bundle` expose focused snippets, structured metadata, and graph context for agents.
+- **Flexible lookups** – `code_lookup`, `semantic_search`, and `context_bundle` expose focused snippets and structured metadata for agents.
 - **Git awareness** – `repository_timeline` and `repository_timeline_entry` summarise recent commits and cached diffs so agents can reason about repo history.
 - **Watch mode** – Optional filesystem watcher re-ingests changed paths automatically for long-running agent sessions.
 - **Remote proxies** – Mount additional MCP servers behind the same process by declaring JSON descriptors in `INDEX_MCP_REMOTE_SERVERS`.
