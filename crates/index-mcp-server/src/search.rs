@@ -527,10 +527,23 @@ pub fn summarize_semantic_search(payload: &SemanticSearchResponse) -> String {
         .embedding_model
         .as_deref()
         .unwrap_or(DEFAULT_EMBEDDING_MODEL);
-    format!(
+    let mut summary = format!(
         "Semantic search scanned {} chunk(s) and returned {} match(es) (model {}).",
         payload.evaluated_chunks,
         payload.results.len(),
         model
-    )
+    );
+
+    if let Some(top) = payload.results.first() {
+        let location = match top.line_start {
+            Some(line) if line > 0 => format!("{}#L{}", top.path, line),
+            _ => top.path.clone(),
+        };
+        summary.push_str(&format!(
+            " Top hit: {} (score {:.2}).",
+            location, top.normalized_score
+        ));
+    }
+
+    summary
 }

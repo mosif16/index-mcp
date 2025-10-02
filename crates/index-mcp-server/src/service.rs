@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::bundle::{
-    context_bundle, ContextBundleError, ContextBundleParams, ContextBundleResponse,
+    context_bundle, ContextBundleError, ContextBundleParams, ContextBundleResponse, QuickLinkType,
+    SnippetSource,
 };
 use crate::git_timeline::{
     repository_timeline, repository_timeline_entry_detail, RepositoryTimelineEntryLookupParams,
@@ -291,6 +292,8 @@ impl IndexMcpService {
                     max_snippets: max_snippets.or(limit),
                     max_neighbors,
                     budget_tokens,
+                    ranges: None,
+                    focus_line: None,
                 };
 
                 let response = context_bundle(bundle_params)
@@ -420,12 +423,8 @@ fn build_ingest_result(response: IngestResponse) -> Result<CallToolResult, McpEr
         McpError::internal_error(format!("Failed to serialize ingest result: {error}"), None)
     })?;
 
-    let json_content = Content::json(value.clone()).map_err(|error| {
-        McpError::internal_error(format!("Failed to encode JSON content: {error}"), None)
-    })?;
-
     Ok(CallToolResult {
-        content: vec![Content::text(summary), json_content],
+        content: vec![Content::text(summary)],
         structured_content: Some(value),
         is_error: Some(false),
         meta: None,
@@ -434,11 +433,21 @@ fn build_ingest_result(response: IngestResponse) -> Result<CallToolResult, McpEr
 
 fn summarize_ingest(payload: &IngestResponse) -> String {
     let mut summary = format!(
-        "Indexed {} file(s) at {} in {:.2}s.",
+        "Indexed {} file(s) ({} chunk(s)) at {} in {:.2}s.",
         payload.ingested_file_count,
+        payload.embedded_chunk_count,
         payload.root,
         payload.duration_ms as f64 / 1000.0
     );
+
+    summary.push_str(&format!(
+        " Database size is {}.",
+        format_bytes(payload.database_size_bytes)
+    ));
+
+    if let Some(model) = &payload.embedding_model {
+        summary.push_str(&format!(" Embedding model {}.", model));
+    }
 
     if let Some(reused) = payload.reused_file_count {
         summary.push_str(&format!(
@@ -479,12 +488,8 @@ fn build_index_status_result(response: IndexStatusResponse) -> Result<CallToolRe
         McpError::internal_error(format!("Failed to serialize status: {error}"), None)
     })?;
 
-    let json_content = Content::json(value.clone()).map_err(|error| {
-        McpError::internal_error(format!("Failed to encode JSON content: {error}"), None)
-    })?;
-
     Ok(CallToolResult {
-        content: vec![Content::text(summary), json_content],
+        content: vec![Content::text(summary)],
         structured_content: Some(value),
         is_error: Some(false),
         meta: None,
@@ -504,6 +509,10 @@ fn summarize_index_status(payload: &IndexStatusResponse) -> String {
         payload.database_path, payload.total_files, payload.total_chunks
     );
 
+    if let Some(size) = payload.database_size_bytes {
+        summary.push_str(&format!(" Size {}.", format_bytes(size)));
+    }
+
     if let Some(latest) = &payload.latest_ingestion {
         summary.push_str(&format!(
             " Last ingest processed {} file(s) in {:.2}s.",
@@ -515,7 +524,25 @@ fn summarize_index_status(payload: &IndexStatusResponse) -> String {
     }
 
     if payload.is_stale {
-        summary.push_str(" Index appears stale compared to the current git HEAD.");
+        let indexed = payload
+            .commit_sha
+            .as_deref()
+            .map(short_sha)
+            .unwrap_or_else(|| "unknown".to_string());
+        let current = payload
+            .current_commit_sha
+            .as_deref()
+            .map(short_sha)
+            .unwrap_or_else(|| "unknown".to_string());
+        summary.push_str(&format!(
+            " Index is stale (stored {} vs. workspace {}).",
+            indexed, current
+        ));
+    } else if let Some(commit) = payload.commit_sha.as_deref() {
+        summary.push_str(&format!(
+            " Index aligned with commit {}.",
+            short_sha(commit)
+        ));
     }
 
     if !payload.embedding_models.is_empty() {
@@ -566,12 +593,8 @@ fn build_semantic_search_result(
         )
     })?;
 
-    let json_content = Content::json(value.clone()).map_err(|error| {
-        McpError::internal_error(format!("Failed to encode JSON content: {error}"), None)
-    })?;
-
     Ok(CallToolResult {
-        content: vec![Content::text(summary), json_content],
+        content: vec![Content::text(summary)],
         structured_content: Some(value),
         is_error: Some(false),
         meta: None,
@@ -597,12 +620,8 @@ fn build_code_lookup_result(
         )
     })?;
 
-    let json_content = Content::json(value.clone()).map_err(|error| {
-        McpError::internal_error(format!("Failed to encode JSON content: {error}"), None)
-    })?;
-
     Ok(CallToolResult {
-        content: vec![Content::text(summary), json_content],
+        content: vec![Content::text(summary)],
         structured_content: Some(value),
         is_error: Some(false),
         meta: None,
@@ -613,12 +632,7 @@ fn build_code_lookup_bundle_response(
     mode: String,
     bundle: ContextBundleResponse,
 ) -> Result<CallToolResult, McpError> {
-    let summary = format!(
-        "Context bundle prepared for {} with {} definition(s) and {} snippet(s).",
-        bundle.file.path,
-        bundle.definitions.len(),
-        bundle.snippets.len()
-    );
+    let summary = summarize_bundle(&bundle);
 
     let payload = CodeLookupResponse {
         mode,
@@ -639,16 +653,133 @@ fn build_code_lookup_bundle_response(
         )
     })?;
 
-    let json_content = Content::json(value.clone()).map_err(|error| {
-        McpError::internal_error(format!("Failed to encode JSON content: {error}"), None)
-    })?;
-
     Ok(CallToolResult {
-        content: vec![Content::text(summary), json_content],
+        content: vec![Content::text(summary)],
         structured_content: Some(value),
         is_error: Some(false),
         meta: None,
     })
+}
+
+fn summarize_bundle(bundle: &ContextBundleResponse) -> String {
+    let mut parts = Vec::new();
+    parts.push(format!(
+        "Context bundle prepared for {} with {} definition(s) and {} snippet(s).",
+        bundle.file.path,
+        bundle.definitions.len(),
+        bundle.snippets.len()
+    ));
+
+    if let Some(focus) = &bundle.focus_definition {
+        parts.push(format!("Focus on {} {}.", focus.kind, focus.name));
+    } else if let Some(primary) = bundle.definitions.first() {
+        parts.push(format!(
+            "Primary definition {} {}.",
+            primary.kind, primary.name
+        ));
+    }
+
+    match summarize_snippets(bundle) {
+        Some(detail) => parts.push(detail),
+        None => {
+            parts.push("Snippets: none captured; adjust selection or increase limits.".to_string())
+        }
+    }
+
+    if let Some(link) = bundle.quick_links.first() {
+        let label = match link.r#type {
+            QuickLinkType::File => format!("file {}", link.label),
+            QuickLinkType::RelatedSymbol => format!("symbol {}", link.label),
+        };
+        parts.push(format!("First quick link: {}.", label));
+    }
+
+    if !bundle.warnings.is_empty() {
+        let warning_excerpt = bundle
+            .warnings
+            .get(0)
+            .map(|first| first.as_str())
+            .unwrap_or_default();
+        let warning_note = if bundle.warnings.len() > 1 {
+            format!(
+                "Warnings: {} (first: {}).",
+                bundle.warnings.len(),
+                warning_excerpt
+            )
+        } else {
+            format!("Warning: {}.", warning_excerpt)
+        };
+        parts.push(warning_note);
+    }
+
+    parts.join(" ")
+}
+
+fn summarize_snippets(bundle: &ContextBundleResponse) -> Option<String> {
+    if bundle.snippets.is_empty() {
+        return None;
+    }
+
+    let token_estimate: usize = bundle
+        .snippets
+        .iter()
+        .map(|snippet| approx_token_count(&snippet.content))
+        .sum();
+
+    let mut descriptors: Vec<String> = bundle
+        .snippets
+        .iter()
+        .take(3)
+        .map(|snippet| {
+            let source = match snippet.source {
+                SnippetSource::Chunk => "chunk",
+                SnippetSource::Content => "content",
+            };
+            let span = match (snippet.line_start, snippet.line_end) {
+                (Some(start), Some(end)) if start == end => format!("line {start}"),
+                (Some(start), Some(end)) => format!("lines {start}-{end}"),
+                (Some(start), None) => format!("line {start}"),
+                _ => "lines n/a".to_string(),
+            };
+            format!("{source} {span}")
+        })
+        .collect();
+
+    if bundle.snippets.len() > descriptors.len() {
+        descriptors.push(format!(
+            "+{} more",
+            bundle.snippets.len() - descriptors.len()
+        ));
+    }
+
+    Some(format!(
+        "Snippets: {} (~{} token(s)).",
+        descriptors.join(", "),
+        token_estimate
+    ))
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{:.1} {}", value, UNITS[unit])
+    }
+}
+
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(7).collect()
+}
+
+fn approx_token_count(text: &str) -> usize {
+    ((text.len() as f64 / 4.0).ceil()) as usize
 }
 
 fn convert_context_bundle_error(error: ContextBundleError) -> McpError {
@@ -699,12 +830,7 @@ fn convert_repository_timeline_error(error: RepositoryTimelineError) -> McpError
 fn build_context_bundle_result(
     response: ContextBundleResponse,
 ) -> Result<CallToolResult, McpError> {
-    let summary = format!(
-        "Context bundle prepared for {} with {} definition(s) and {} snippet(s).",
-        response.file.path,
-        response.definitions.len(),
-        response.snippets.len()
-    );
+    let summary = summarize_bundle(&response);
 
     let value: Value = serde_json::to_value(&response).map_err(|error| {
         McpError::internal_error(
@@ -713,12 +839,8 @@ fn build_context_bundle_result(
         )
     })?;
 
-    let json_content = Content::json(value.clone()).map_err(|error| {
-        McpError::internal_error(format!("Failed to encode JSON content: {error}"), None)
-    })?;
-
     Ok(CallToolResult {
-        content: vec![Content::text(summary), json_content],
+        content: vec![Content::text(summary)],
         structured_content: Some(value),
         is_error: Some(false),
         meta: None,
@@ -782,12 +904,8 @@ fn build_repository_timeline_result(
         )
     })?;
 
-    let json_content = Content::json(value.clone()).map_err(|error| {
-        McpError::internal_error(format!("Failed to encode JSON content: {error}"), None)
-    })?;
-
     Ok(CallToolResult {
-        content: vec![Content::text(summary), json_content],
+        content: vec![Content::text(summary)],
         structured_content: Some(value),
         is_error: Some(false),
         meta: None,
@@ -817,14 +935,173 @@ fn build_repository_timeline_entry_result(
         )
     })?;
 
-    let json_content = Content::json(value.clone()).map_err(|error| {
-        McpError::internal_error(format!("Failed to encode JSON content: {error}"), None)
-    })?;
-
     Ok(CallToolResult {
-        content: vec![Content::text(summary), json_content],
+        content: vec![Content::text(summary)],
         structured_content: Some(value),
         is_error: Some(false),
         meta: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bundle::{
+        BundleDefinition, BundleFileMetadata, BundleSnippet, ContextBundleQuickLink,
+        ContextBundleResponse, QuickLinkType, SnippetSource,
+    };
+    use crate::index_status::{IndexStatusIngestion, IndexStatusResponse};
+    use crate::ingest::IngestResponse;
+    use crate::search::{Classification, SemanticSearchMatch, SemanticSearchResponse};
+
+    #[test]
+    fn summarize_ingest_reports_key_metrics() {
+        let payload = IngestResponse {
+            root: "/workspace".into(),
+            database_path: "/workspace/.mcp-index.sqlite".into(),
+            database_size_bytes: 1_024,
+            ingested_file_count: 3,
+            skipped: Vec::new(),
+            deleted_paths: Vec::new(),
+            duration_ms: 1_500,
+            embedded_chunk_count: 42,
+            embedding_model: Some("Xenova/all-MiniLM-L6-v2".into()),
+            graph_node_count: 0,
+            graph_edge_count: 0,
+            evicted: None,
+            reused_file_count: Some(1),
+        };
+
+        let summary = summarize_ingest(&payload);
+
+        assert!(summary.contains("(42 chunk(s))"));
+        assert!(summary.contains("Database size is 1.0 KiB."));
+        assert!(summary.contains("Embedding model Xenova/all-MiniLM-L6-v2."));
+    }
+
+    #[test]
+    fn summarize_index_status_highlights_stale_commit_delta() {
+        let latest = IndexStatusIngestion {
+            id: "ingest-1".into(),
+            root: "/workspace".into(),
+            started_at: 0,
+            finished_at: 1,
+            duration_ms: 750,
+            file_count: 12,
+            skipped_count: 0,
+            deleted_count: 0,
+        };
+
+        let payload = IndexStatusResponse {
+            database_path: "/workspace/.mcp-index.sqlite".into(),
+            database_exists: true,
+            database_size_bytes: Some(10_485_760),
+            total_files: 64,
+            total_chunks: 512,
+            embedding_models: vec!["model-A".into(), "model-B".into()],
+            total_graph_nodes: 0,
+            total_graph_edges: 0,
+            latest_ingestion: Some(latest.clone()),
+            recent_ingestions: vec![latest],
+            commit_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            indexed_at: Some(0),
+            current_commit_sha: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
+            is_stale: true,
+        };
+
+        let summary = summarize_index_status(&payload);
+
+        assert!(summary.contains("Size 10.0 MiB."));
+        assert!(summary.contains("Index is stale (stored aaaaaaa vs. workspace bbbbbbb)."));
+        assert!(summary.contains("Embedding models: model-A, model-B."));
+    }
+
+    #[test]
+    fn summarize_bundle_surfaces_primary_snippets_and_links() {
+        let bundle = ContextBundleResponse {
+            database_path: "db.sqlite".into(),
+            file: BundleFileMetadata {
+                path: "src/lib.rs".into(),
+                size: 128,
+                modified: 1_710_000_000,
+                hash: "abc123".into(),
+                last_indexed_at: 1_710_000_123,
+                content: None,
+            },
+            definitions: vec![BundleDefinition {
+                id: "def-1".into(),
+                name: "foo".into(),
+                kind: "function".into(),
+                signature: Some("fn foo()".into()),
+                range_start: Some(1),
+                range_end: Some(10),
+                metadata: None,
+                visibility: Some("pub".into()),
+                docstring: None,
+                todo_count: None,
+            }],
+            focus_definition: None,
+            related: Vec::new(),
+            snippets: vec![BundleSnippet {
+                source: SnippetSource::Chunk,
+                chunk_index: Some(0),
+                content: "fn foo() {}".into(),
+                byte_start: Some(0),
+                byte_end: Some(12),
+                line_start: Some(1),
+                line_end: Some(1),
+            }],
+            latest_ingestion: None,
+            warnings: vec!["No graph metadata".into()],
+            quick_links: vec![ContextBundleQuickLink {
+                r#type: QuickLinkType::File,
+                label: "src/lib.rs".into(),
+                path: Some("src/lib.rs".into()),
+                direction: None,
+                symbol_id: None,
+                symbol_kind: None,
+            }],
+        };
+
+        let summary = summarize_bundle(&bundle);
+
+        assert!(summary.contains("Context bundle prepared for src/lib.rs with 1 definition(s) and 1 snippet(s)."));
+        assert!(summary.contains("Primary definition function foo."));
+        assert!(summary.contains("Snippets: chunk line 1 (~3 token(s))."));
+        assert!(summary.contains("First quick link: file src/lib.rs."));
+        assert!(summary.contains("Warning: No graph metadata."));
+    }
+
+    #[test]
+    fn summarize_semantic_search_reports_top_hit_and_score() {
+        let response = SemanticSearchResponse {
+            database_path: "db.sqlite".into(),
+            embedding_model: Some("custom-model".into()),
+            total_chunks: 1_000,
+            evaluated_chunks: 250,
+            results: vec![SemanticSearchMatch {
+                path: "src/main.rs".into(),
+                chunk_index: 0,
+                score: 0.92,
+                normalized_score: 0.87,
+                language: Some("Rust".into()),
+                classification: Classification::Function,
+                content: "fn main() {}".into(),
+                embedding_model: "custom-model".into(),
+                byte_start: None,
+                byte_end: None,
+                line_start: Some(42),
+                line_end: Some(45),
+                context_before: None,
+                context_after: None,
+            }],
+        };
+
+        let summary = crate::search::summarize_semantic_search(&response);
+
+        assert!(summary.contains(
+            "Semantic search scanned 250 chunk(s) and returned 1 match(es) (model custom-model)."
+        ));
+        assert!(summary.contains("Top hit: src/main.rs#L42 (score 0.87)."));
+    }
 }

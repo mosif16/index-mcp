@@ -17,6 +17,7 @@ const MAX_SNIPPET_LIMIT: usize = 10;
 const DEFAULT_NEIGHBOR_LIMIT: usize = 12;
 const MAX_NEIGHBOR_LIMIT: usize = 50;
 const DEFAULT_TOKEN_BUDGET: usize = 3_000;
+const FOCUS_CONTEXT_RADIUS: u32 = 25;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -34,6 +35,10 @@ pub struct ContextBundleParams {
     pub max_neighbors: Option<u32>,
     #[serde(default)]
     pub budget_tokens: Option<u32>,
+    #[serde(default)]
+    pub ranges: Option<Vec<LineRange>>,
+    #[serde(default)]
+    pub focus_line: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -42,6 +47,13 @@ pub struct SymbolSelector {
     pub name: String,
     #[serde(default)]
     pub kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LineRange {
+    pub start_line: u32,
+    pub end_line: u32,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -198,6 +210,8 @@ fn build_bundle(params: ContextBundleParams) -> Result<ContextBundleResponse, Co
         max_snippets,
         max_neighbors,
         budget_tokens,
+        ranges,
+        focus_line,
     } = params;
 
     let root_path = resolve_root(root.unwrap_or_else(|| "./".to_string()))?;
@@ -241,11 +255,24 @@ fn build_bundle(params: ContextBundleParams) -> Result<ContextBundleResponse, Co
         focus_definition.as_ref(),
     );
 
-    let snippets = load_snippets(&conn, &target_file, max_snippets);
+    let ranges = ranges.unwrap_or_default();
+    let content_ref = file_content.as_deref();
+    let line_offsets = content_ref.map(compute_line_offsets);
+
+    let (snippets, mut snippet_warnings) = collect_snippets(
+        &conn,
+        &target_file,
+        max_snippets,
+        &ranges,
+        focus_line,
+        content_ref,
+        line_offsets.as_deref(),
+    );
     let trimmed_snippets = trim_snippets_to_budget(snippets, &definitions, budget_tokens);
 
     let ingestion = load_latest_ingestion(&conn)?;
-    let warnings = gather_warnings(&definitions, file_content.as_deref());
+    let mut warnings = gather_warnings(&definitions, content_ref);
+    warnings.append(&mut snippet_warnings);
     let quick_links = build_quick_links(
         &target_file,
         &definitions,
@@ -584,6 +611,174 @@ fn load_snippets(conn: &Connection, path: &str, max_snippets: usize) -> Vec<Bund
     })
     .map(|rows| rows.flatten().collect())
     .unwrap_or_default()
+}
+
+fn collect_snippets(
+    conn: &Connection,
+    path: &str,
+    max_snippets: usize,
+    ranges: &[LineRange],
+    focus_line: Option<u32>,
+    file_content: Option<&str>,
+    line_offsets: Option<&[usize]>,
+) -> (Vec<BundleSnippet>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut snippets: Vec<BundleSnippet> = Vec::new();
+
+    if !ranges.is_empty() {
+        if let (Some(content), Some(offsets)) = (file_content, line_offsets) {
+            for range in ranges {
+                if let Some(snippet) =
+                    build_range_snippet(content, offsets, range.start_line, range.end_line)
+                {
+                    let duplicate = snippets.iter().any(|existing| {
+                        existing.line_start == snippet.line_start
+                            && existing.line_end == snippet.line_end
+                    });
+                    if duplicate {
+                        continue;
+                    }
+                    snippets.push(snippet);
+                }
+            }
+            if snippets.len() > max_snippets {
+                snippets.truncate(max_snippets);
+            }
+        } else {
+            warnings
+                .push("Requested ranges ignored because file content is unavailable.".to_string());
+        }
+    }
+
+    if let Some(line) = focus_line {
+        if let (Some(content), Some(offsets)) = (file_content, line_offsets) {
+            let covers_line = snippets
+                .iter()
+                .any(|snippet| snippet_covers_line(snippet, line));
+            if !covers_line {
+                if let Some(snippet) = build_focus_snippet(content, offsets, line) {
+                    let duplicate = snippets.iter().any(|existing| {
+                        existing.line_start == snippet.line_start
+                            && existing.line_end == snippet.line_end
+                    });
+                    if !duplicate {
+                        snippets.insert(0, snippet);
+                        if snippets.len() > max_snippets {
+                            snippets.truncate(max_snippets);
+                        }
+                    }
+                }
+            }
+        } else {
+            warnings.push("focusLine ignored because file content is unavailable.".to_string());
+        }
+    }
+
+    if snippets.is_empty() {
+        let fallback = load_snippets(conn, path, max_snippets);
+        if fallback.is_empty() && (!ranges.is_empty() || focus_line.is_some()) {
+            warnings.push(
+                "No stored snippets matched the requested ranges; returning database defaults."
+                    .to_string(),
+            );
+        }
+        return (fallback, warnings);
+    }
+
+    (snippets, warnings)
+}
+
+fn build_range_snippet(
+    content: &str,
+    offsets: &[usize],
+    start_line: u32,
+    end_line: u32,
+) -> Option<BundleSnippet> {
+    if offsets.len() < 2 {
+        return None;
+    }
+
+    let line_count = offsets.len() - 1;
+    if line_count == 0 {
+        return None;
+    }
+
+    let start = start_line.max(1) as usize;
+    if start > line_count {
+        return None;
+    }
+
+    let mut end = end_line.max(start_line) as usize;
+    if end > line_count {
+        end = line_count;
+    }
+
+    let start_index = start - 1;
+    let end_index = end;
+
+    if start_index >= offsets.len() || end_index >= offsets.len() || start_index >= end_index {
+        return None;
+    }
+
+    let start_byte = offsets[start_index];
+    let end_byte = offsets[end_index];
+    let snippet_content = content[start_byte..end_byte].to_string();
+
+    Some(BundleSnippet {
+        source: SnippetSource::Content,
+        chunk_index: None,
+        content: snippet_content,
+        byte_start: Some(start_byte as i64),
+        byte_end: Some(end_byte as i64),
+        line_start: Some(start as i64),
+        line_end: Some(end as i64),
+    })
+}
+
+fn build_focus_snippet(content: &str, offsets: &[usize], focus_line: u32) -> Option<BundleSnippet> {
+    if offsets.len() < 2 {
+        return None;
+    }
+
+    let line_count = (offsets.len() - 1) as u32;
+    if line_count == 0 {
+        return None;
+    }
+
+    let clamped = focus_line.clamp(1, line_count);
+    let start_line = clamped.saturating_sub(FOCUS_CONTEXT_RADIUS).max(1);
+    let mut end_line = clamped + FOCUS_CONTEXT_RADIUS;
+    if end_line > line_count {
+        end_line = line_count;
+    }
+
+    build_range_snippet(content, offsets, start_line, end_line)
+}
+
+fn snippet_covers_line(snippet: &BundleSnippet, line: u32) -> bool {
+    match (snippet.line_start, snippet.line_end) {
+        (Some(start), Some(end)) => {
+            let line = line as i64;
+            line >= start && line <= end
+        }
+        _ => false,
+    }
+}
+
+fn compute_line_offsets(content: &str) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    offsets.push(0);
+    for (idx, ch) in content.char_indices() {
+        if ch == '\n' {
+            offsets.push(idx + ch.len_utf8());
+        }
+    }
+    if let Some(last) = offsets.last().copied() {
+        if last != content.len() {
+            offsets.push(content.len());
+        }
+    }
+    offsets
 }
 
 fn trim_snippets_to_budget(

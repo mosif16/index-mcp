@@ -637,6 +637,8 @@ async fn run_context_bundle(
         max_snippets: Some(config.max_snippets),
         max_neighbors: Some(config.max_neighbors),
         budget_tokens: Some(config.budget_tokens),
+        ranges: None,
+        focus_line: None,
     };
 
     context_bundle(params).await

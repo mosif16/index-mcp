@@ -16,10 +16,13 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
     path::PathBuf,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{
+    filter::{Directive, LevelFilter},
+    fmt, EnvFilter,
+};
 
 use crate::index_status::DEFAULT_DB_FILENAME;
 use crate::watcher::{start_ingest_watcher, WatcherOptions};
@@ -158,6 +161,7 @@ impl Write for CombinedWriter {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let start_time = Instant::now();
     let cli = Cli::parse();
 
     let log_filter = if let Ok(value) = env::var("INDEX_MCP_LOG_LEVEL") {
@@ -168,9 +172,24 @@ async fn main() -> Result<()> {
         cli.log_level.clone()
     };
 
-    let env_filter = EnvFilter::try_new(log_filter)
-        .or_else(|_| EnvFilter::try_new("info"))
-        .unwrap();
+    let mut env_filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .parse_lossy(log_filter.as_str());
+
+    let lower_filter = log_filter.to_ascii_lowercase();
+    let default_directives = [
+        ("rmcp::service", "rmcp::service=info"),
+        ("rmcp::handler::server", "rmcp::handler::server=info"),
+        ("hf_hub", "hf_hub=warn"),
+    ];
+
+    for (needle, directive_str) in default_directives {
+        if !lower_filter.contains(needle) {
+            if let Ok(directive) = directive_str.parse::<Directive>() {
+                env_filter = env_filter.add_directive(directive);
+            }
+        }
+    }
 
     let log_console = env::var("INDEX_MCP_LOG_CONSOLE")
         .ok()
@@ -249,6 +268,10 @@ async fn main() -> Result<()> {
     }
 
     let service = service::IndexMcpService::new().await?;
+    tracing::info!(
+        elapsed_ms = start_time.elapsed().as_millis() as u64,
+        "Server initialization finished"
+    );
     let server = service.serve(stdio()).await.map_err(anyhow::Error::from)?;
 
     // Wait until the client disconnects or the server shuts down.
