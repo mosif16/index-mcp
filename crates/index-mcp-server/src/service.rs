@@ -402,8 +402,8 @@ struct SemanticSearchRequest {
 }
 
 /// Textual instructions shared with MCP clients.
-const SERVER_INSTRUCTIONS: &str = r#"Rust rewrite is production-ready. Treat this server as the workspace source of truth and follow this proactive workflow:
-1. Prime the index at session start with ingest_codebase {"root": "."} or --watch. Honor .gitignore, skip files larger than 8 MiB, and tune autoEvict/maxDatabaseSizeBytes before the SQLite file balloons.
+const SERVER_INSTRUCTIONS_TEMPLATE: &str = r#"Rust rewrite is production-ready. Treat this server as the workspace source of truth and follow this proactive workflow:
+1. Prime the index at session start with ingest_codebase {"root": "{ABSOLUTE_ROOT}"} or --watch. Honor .gitignore, skip files larger than 8 MiB, and tune autoEvict/maxDatabaseSizeBytes before the SQLite file balloons. Always pass the absolute workspace root; relative paths often target the wrong codebase.
 2. Check index_status before planning or answering. If HEAD moved or isStale is true, ingest again before proceeding.
 3. Brief yourself with repository_timeline (and repository_timeline_entry for deep dives) so your plan reflects the latest commits.
 4. Use code_lookup in auto mode to assemble payloads: start with query="..." to explore, then request file/symbol bundles for snippets you will cite.
@@ -412,12 +412,34 @@ const SERVER_INSTRUCTIONS: &str = r#"Rust rewrite is production-ready. Treat thi
 7. After modifying files, re-run ingest_codebase or rely on watch mode, then confirm freshness with index_status/info so the next task sees the updated payload.
 
 Available tools: ingest_codebase, index_status, code_lookup (search/bundle), semantic_search, context_bundle, repository_timeline, repository_timeline_entry, indexing_guidance, indexing_guidance_tool, info."#;
-const INDEXING_GUIDANCE_PROMPT_TEXT: &str = r#"Workflow reminder:
-1. Prime the index after a checkout, pull, or edit by running ingest_codebase {"root": "."} (or enabling watch mode); respect .gitignore, skip files >8 MiB, and configure autoEvict/maxDatabaseSizeBytes when needed.
+const INDEXING_GUIDANCE_PROMPT_TEMPLATE: &str = r#"Workflow reminder:
+1. Prime the index after a checkout, pull, or edit by running ingest_codebase {"root": "{ABSOLUTE_ROOT}"} (or enabling watch mode); respect .gitignore, skip files >8 MiB, and configure autoEvict/maxDatabaseSizeBytes when needed. Always provide the absolute workspace root to avoid indexing the wrong project.
 2. Call index_status before reasoning. If it reports staleness or a HEAD mismatch, ingest before continuing.
 3. code_lookup first (query="..." for search, file="..." + symbol for bundles), then semantic_search/context_bundle for refinements.
 4. repository_timeline and repository_timeline_entry before planning or applying changes.
 5. Keep answers tight: set INDEX_MCP_BUDGET_TOKENS or pass budgetTokens, trim limits, and prefer info/indexing_guidance_tool for diagnostics."#;
+
+fn workspace_root_for_instructions() -> String {
+    std::env::current_dir()
+        .map(|path| match path.canonicalize() {
+            Ok(resolved) => resolved,
+            Err(_) => path,
+        })
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "/ABSOLUTE/PATH/TO/WORKSPACE".to_string())
+}
+
+fn render_instruction(template: &str) -> String {
+    template.replace("{ABSOLUTE_ROOT}", &workspace_root_for_instructions())
+}
+
+fn server_instructions() -> String {
+    render_instruction(SERVER_INSTRUCTIONS_TEMPLATE)
+}
+
+fn indexing_guidance_prompt_text() -> String {
+    render_instruction(INDEXING_GUIDANCE_PROMPT_TEMPLATE)
+}
 
 /// Primary server state for the Rust MCP implementation.
 #[derive(Clone)]
@@ -477,7 +499,7 @@ impl IndexMcpService {
             ),
             messages: vec![PromptMessage::new_text(
                 PromptMessageRole::Assistant,
-                INDEXING_GUIDANCE_PROMPT_TEXT,
+                indexing_guidance_prompt_text(),
             )],
         }
     }
@@ -750,7 +772,7 @@ impl ServerHandler for IndexMcpService {
                 .enable_prompts()
                 .build(),
             server_info: Implementation::from_build_env(),
-            instructions: Some(SERVER_INSTRUCTIONS.to_string()),
+            instructions: Some(server_instructions()),
         }
     }
 }
