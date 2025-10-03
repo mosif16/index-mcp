@@ -14,9 +14,14 @@ use tokio::task::JoinError;
 use crate::index_status::DEFAULT_DB_FILENAME;
 use crate::ingest::DEFAULT_EMBEDDING_MODEL;
 
-const DEFAULT_RESULT_LIMIT: usize = 8;
+const DEFAULT_RESULT_LIMIT: usize = 6;
+const DEFAULT_IDENTIFIER_LIMIT: usize = 3;
 const MAX_RESULT_LIMIT: usize = 50;
-const CONTEXT_LINE_PADDING: usize = 2;
+const DEFAULT_CONTEXT_BEFORE: usize = 1;
+const DEFAULT_CONTEXT_AFTER: usize = 1;
+const MAX_CONTEXT_LINES: usize = 6;
+const MAX_BRIEF_CONTENT_CHARS: usize = 240;
+const MAX_BRIEF_CONTEXT_CHARS: usize = 160;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -30,14 +35,41 @@ pub struct SemanticSearchParams {
     pub limit: Option<u32>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    #[serde(default)]
+    pub path_contains: Option<String>,
+    #[serde(default)]
+    pub classification: Option<Classification>,
+    #[serde(default)]
+    pub summary_mode: Option<SummaryMode>,
+    #[serde(default)]
+    pub max_context_before: Option<u32>,
+    #[serde(default)]
+    pub max_context_after: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum Classification {
     Function,
     Comment,
     Code,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SummaryMode {
+    Brief,
+    Full,
+}
+
+impl Default for SummaryMode {
+    fn default() -> Self {
+        SummaryMode::Brief
+    }
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -82,6 +114,7 @@ pub struct SemanticSearchResponse {
     pub total_chunks: u64,
     pub evaluated_chunks: u64,
     pub results: Vec<SemanticSearchMatch>,
+    pub summary_mode: SummaryMode,
     #[serde(default)]
     pub suggested_tools: Vec<SuggestedTool>,
 }
@@ -131,6 +164,8 @@ struct PendingMatch {
     line_end: Option<i64>,
     embedding_model: String,
     score: f32,
+    classification: Classification,
+    language: Option<String>,
 }
 
 fn perform_semantic_search(
@@ -142,12 +177,40 @@ fn perform_semantic_search(
         database_name,
         limit,
         model,
+        language,
+        path_prefix,
+        path_contains,
+        classification,
+        summary_mode,
+        max_context_before,
+        max_context_after,
     } = params;
 
     let trimmed_query = query.trim();
     if trimmed_query.is_empty() {
         return Ok(empty_response("", None, None));
     }
+
+    let summary_mode = summary_mode.unwrap_or_default();
+    let normalized_limit = normalize_limit(limit);
+    let adaptive_limit = if limit.is_none() {
+        let base = if is_identifier_query(trimmed_query) {
+            DEFAULT_IDENTIFIER_LIMIT
+        } else {
+            DEFAULT_RESULT_LIMIT
+        };
+        base.min(normalized_limit)
+    } else {
+        normalized_limit
+    };
+
+    let language_filter = language.map(|value| value.to_lowercase());
+    let context_before_lines = max_context_before
+        .map(|value| value.min(MAX_CONTEXT_LINES as u32) as usize)
+        .unwrap_or(DEFAULT_CONTEXT_BEFORE);
+    let context_after_lines = max_context_after
+        .map(|value| value.min(MAX_CONTEXT_LINES as u32) as usize)
+        .unwrap_or(DEFAULT_CONTEXT_AFTER);
 
     let root_param = root.unwrap_or_else(|| "./".to_string());
     let absolute_root = resolve_root(&root_param)?;
@@ -173,7 +236,6 @@ fn perform_semantic_search(
     let available_models = available_embedding_models(&conn)?;
     let requested_model = resolve_requested_model(model, &available_models)?;
 
-    let limit = normalize_limit(limit);
     let mut top_matches: Vec<PendingMatch> = Vec::new();
     let mut evaluated_chunks: u64 = 0;
 
@@ -198,6 +260,34 @@ fn perform_semantic_search(
         let byte_end: Option<i64> = row.get(7)?;
         let line_start: Option<i64> = row.get(8)?;
         let line_end: Option<i64> = row.get(9)?;
+
+        let classification_value = classify_snippet(&content);
+        if let Some(required) = &classification {
+            if &classification_value != required {
+                continue;
+            }
+        }
+
+        if let Some(prefix) = &path_prefix {
+            if !path.starts_with(prefix) {
+                continue;
+            }
+        }
+
+        if let Some(fragment) = &path_contains {
+            if !path.contains(fragment) {
+                continue;
+            }
+        }
+
+        let detected_language = detect_language(&path);
+        if let Some(required_lang) = &language_filter {
+            match detected_language.as_ref().map(|value| value.to_lowercase()) {
+                Some(ref lang) if lang == required_lang => {}
+                Some(_) => continue,
+                None => continue,
+            }
+        }
 
         let chunk_embedding = blob_to_vec(&embedding_blob);
         if chunk_embedding.is_empty() {
@@ -233,8 +323,10 @@ fn perform_semantic_search(
                 line_end,
                 embedding_model,
                 score,
+                classification: classification_value,
+                language: detected_language,
             },
-            limit,
+            adaptive_limit,
         );
     }
 
@@ -245,35 +337,61 @@ fn perform_semantic_search(
 
     let mut results = Vec::new();
     for pending in top_matches.into_iter().rev() {
-        let file_entry = load_file_entry(
-            &mut file_cache,
-            &absolute_root,
-            &mut file_stmt,
-            &pending.path,
-        )?;
+        let PendingMatch {
+            id,
+            path,
+            chunk_index,
+            content,
+            byte_start,
+            byte_end,
+            line_start,
+            line_end,
+            embedding_model,
+            score,
+            classification,
+            language,
+        } = pending;
+
+        let file_entry = load_file_entry(&mut file_cache, &absolute_root, &mut file_stmt, &path)?;
         let (context_before, context_after) = extract_context(
             file_entry.lines.as_ref(),
-            pending.line_start,
-            pending.line_end,
+            line_start,
+            line_end,
+            context_before_lines,
+            context_after_lines,
         );
 
-        update_stmt.execute(params![&pending.id])?;
+        update_stmt.execute(params![&id])?;
+
+        let final_content = match summary_mode {
+            SummaryMode::Brief => trim_with_ellipsis(&content, MAX_BRIEF_CONTENT_CHARS),
+            SummaryMode::Full => content,
+        };
+
+        let mut before_context = context_before;
+        let mut after_context = context_after;
+        if summary_mode == SummaryMode::Brief {
+            before_context =
+                before_context.map(|value| trim_with_ellipsis(&value, MAX_BRIEF_CONTEXT_CHARS));
+            after_context =
+                after_context.map(|value| trim_with_ellipsis(&value, MAX_BRIEF_CONTEXT_CHARS));
+        }
 
         results.push(SemanticSearchMatch {
-            path: pending.path.clone(),
-            chunk_index: pending.chunk_index,
-            score: pending.score,
-            normalized_score: normalize_score(pending.score),
-            language: detect_language(&pending.path),
-            classification: classify_snippet(&pending.content),
-            content: pending.content,
-            embedding_model: pending.embedding_model,
-            byte_start: pending.byte_start,
-            byte_end: pending.byte_end,
-            line_start: pending.line_start,
-            line_end: pending.line_end,
-            context_before,
-            context_after,
+            path: path.clone(),
+            chunk_index,
+            score,
+            normalized_score: normalize_score(score),
+            language,
+            classification,
+            content: final_content,
+            embedding_model,
+            byte_start,
+            byte_end,
+            line_start,
+            line_end,
+            context_before: before_context,
+            context_after: after_context,
         });
     }
 
@@ -284,6 +402,7 @@ fn perform_semantic_search(
         total_chunks,
         evaluated_chunks,
         results,
+        summary_mode,
         suggested_tools: Vec::new(),
     })
 }
@@ -300,6 +419,7 @@ fn empty_response(
         total_chunks: 0,
         evaluated_chunks: 0,
         results: Vec::new(),
+        summary_mode: SummaryMode::Brief,
         suggested_tools: Vec::new(),
     }
 }
@@ -444,6 +564,8 @@ fn extract_context(
     lines: Option<&Vec<String>>,
     line_start: Option<i64>,
     line_end: Option<i64>,
+    before_padding: usize,
+    after_padding: usize,
 ) -> (Option<String>, Option<String>) {
     let lines = match lines {
         Some(lines) => lines,
@@ -458,7 +580,7 @@ fn extract_context(
     }
 
     let before_start = start.saturating_sub(1);
-    let before_begin = before_start.saturating_sub(CONTEXT_LINE_PADDING);
+    let before_begin = before_start.saturating_sub(before_padding);
     let before = if before_start == 0 || before_begin >= lines.len() {
         None
     } else {
@@ -472,7 +594,7 @@ fn extract_context(
     };
 
     let after_start = end.saturating_sub(1).saturating_add(1);
-    let after_end = (after_start + CONTEXT_LINE_PADDING).min(lines.len());
+    let after_end = (after_start + after_padding).min(lines.len());
     let after = if after_start >= lines.len() {
         None
     } else if after_start < after_end {
@@ -486,6 +608,35 @@ fn extract_context(
 
 fn normalize_score(score: f32) -> f32 {
     ((score + 1.0) / 2.0).clamp(0.0, 1.0)
+}
+
+fn trim_with_ellipsis(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+
+    let mut truncated = String::new();
+    let mut count = 0;
+    for c in text.chars() {
+        if count >= max_chars.saturating_sub(1) {
+            break;
+        }
+        truncated.push(c);
+        count += 1;
+    }
+    truncated.push('…');
+    truncated
+}
+
+fn is_identifier_query(query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 || trimmed.contains(char::is_whitespace) {
+        return false;
+    }
+
+    trimmed
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '_' | ':' | '.' | '#'))
 }
 
 fn detect_language(path: &str) -> Option<String> {

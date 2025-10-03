@@ -22,7 +22,7 @@ use index_status::{get_index_status, IndexStatusError, IndexStatusParams, IndexS
 use ingest::{ingest_codebase, warm_up_embedder, IngestError, IngestParams, IngestResponse};
 use search::{
     semantic_search, summarize_semantic_search, SemanticSearchError, SemanticSearchParams,
-    SemanticSearchResponse,
+    SemanticSearchResponse, SummaryMode,
 };
 use serde::Serialize;
 use std::collections::HashSet;
@@ -621,6 +621,13 @@ async fn run_semantic_search(
         database_name: config.database.clone(),
         limit: Some(config.limit),
         model: None,
+        language: None,
+        path_prefix: None,
+        path_contains: None,
+        classification: None,
+        summary_mode: Some(SummaryMode::Brief),
+        max_context_before: Some(1),
+        max_context_after: Some(1),
     };
 
     semantic_search(params).await

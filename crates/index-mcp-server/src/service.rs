@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
 use crate::bundle::{
@@ -18,8 +19,8 @@ use crate::index_status::{
 use crate::ingest::{ingest_codebase, warm_up_embedder, IngestError, IngestParams, IngestResponse};
 use crate::remote_proxy::RemoteProxyRegistry;
 use crate::search::{
-    semantic_search, summarize_semantic_search, SemanticSearchError, SemanticSearchParams,
-    SemanticSearchResponse, SuggestedTool,
+    semantic_search, summarize_semantic_search, Classification, SemanticSearchError,
+    SemanticSearchMatch, SemanticSearchParams, SemanticSearchResponse, SuggestedTool, SummaryMode,
 };
 use tracing::warn;
 
@@ -47,6 +48,7 @@ struct EnvironmentSnapshot {
     cwd: Option<String>,
     bundle_budget_override: Option<usize>,
     remaining_context_tokens: Option<usize>,
+    recent_hits: Vec<RecentHit>,
 }
 
 impl EnvironmentSnapshot {
@@ -67,6 +69,14 @@ impl EnvironmentSnapshot {
 struct EnvironmentState {
     inner: Arc<RwLock<EnvironmentSnapshot>>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RecentHit {
+    path: String,
+    chunk_index: i32,
+}
+
+const RECENT_HIT_HISTORY: usize = 32;
 
 impl EnvironmentState {
     fn new() -> Self {
@@ -141,6 +151,15 @@ impl EnvironmentState {
         if params.limit.is_none() {
             params.limit = Some(DEFAULT_SEARCH_LIMIT_HINT);
         }
+        if params.summary_mode.is_none() {
+            params.summary_mode = Some(SummaryMode::Brief);
+        }
+        if params.max_context_before.is_none() {
+            params.max_context_before = Some(1);
+        }
+        if params.max_context_after.is_none() {
+            params.max_context_after = Some(1);
+        }
     }
 
     fn apply_bundle_defaults(&self, params: &mut ContextBundleParams) {
@@ -170,6 +189,65 @@ impl EnvironmentState {
         if params.mode.is_none() {
             params.mode = Some("search".to_string());
         }
+        if params.summary_mode.is_none() {
+            params.summary_mode = Some(SummaryMode::Brief);
+        }
+        if params.max_context_before.is_none() {
+            params.max_context_before = Some(1);
+        }
+        if params.max_context_after.is_none() {
+            params.max_context_after = Some(1);
+        }
+    }
+
+    fn deduplicate_search_results(
+        &self,
+        results: Vec<SemanticSearchMatch>,
+    ) -> (Vec<SemanticSearchMatch>, usize) {
+        if let Ok(mut guard) = self.inner.write() {
+            let mut seen: HashSet<(String, i32)> = guard
+                .recent_hits
+                .iter()
+                .map(|hit| (hit.path.clone(), hit.chunk_index))
+                .collect();
+
+            let mut retained = Vec::with_capacity(results.len());
+            let mut duplicates = Vec::new();
+
+            for result in results {
+                let key = (result.path.clone(), result.chunk_index);
+                if seen.insert(key.clone()) {
+                    guard.recent_hits.push(RecentHit {
+                        path: key.0,
+                        chunk_index: key.1,
+                    });
+                    retained.push(result);
+                } else {
+                    duplicates.push(result);
+                }
+            }
+
+            if guard.recent_hits.len() > RECENT_HIT_HISTORY {
+                let excess = guard.recent_hits.len() - RECENT_HIT_HISTORY;
+                guard.recent_hits.drain(0..excess);
+            }
+
+            if retained.is_empty() && !duplicates.is_empty() {
+                if let Some(result) = duplicates.pop() {
+                    let key = (result.path.clone(), result.chunk_index);
+                    guard.recent_hits.push(RecentHit {
+                        path: key.0,
+                        chunk_index: key.1,
+                    });
+                    retained.push(result);
+                }
+            }
+
+            let removed = duplicates.len();
+            (retained, removed)
+        } else {
+            (results, 0)
+        }
     }
 
     fn build_bundle_meta(&self, usage: &crate::bundle::BundleUsageStats, cache_hit: bool) -> Meta {
@@ -190,16 +268,25 @@ impl EnvironmentState {
         meta
     }
 
-    fn build_search_meta(&self, response: &SemanticSearchResponse) -> Meta {
+    fn build_search_meta(
+        &self,
+        response: &SemanticSearchResponse,
+        duplicates_filtered: usize,
+        filters: Option<Value>,
+    ) -> Meta {
         let snapshot = self.snapshot();
         let mut meta = Meta::new();
-        meta.insert(
-            "semanticSearch".to_string(),
-            json!({
-                "evaluatedChunks": response.evaluated_chunks,
-                "resultCount": response.results.len(),
-            }),
-        );
+        let mut info = json!({
+            "evaluatedChunks": response.evaluated_chunks,
+            "resultCount": response.results.len(),
+            "summaryMode": response.summary_mode,
+            "estimatedTokenCost": estimate_token_cost(&response.results),
+            "duplicatesFiltered": duplicates_filtered,
+        });
+        if let Some(filters) = filters {
+            info["filters"] = filters;
+        }
+        meta.insert("semanticSearch".to_string(), info);
         if let Some(remaining) = snapshot.remaining_context_tokens {
             meta.insert("remainingContextTokens".to_string(), json!(remaining));
         }
@@ -259,6 +346,20 @@ struct CodeLookupParams {
     limit: Option<u32>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    path_prefix: Option<String>,
+    #[serde(default)]
+    path_contains: Option<String>,
+    #[serde(default)]
+    classification: Option<Classification>,
+    #[serde(default)]
+    summary_mode: Option<SummaryMode>,
+    #[serde(default)]
+    max_context_before: Option<u32>,
+    #[serde(default)]
+    max_context_after: Option<u32>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -284,6 +385,20 @@ struct SemanticSearchRequest {
     limit: Option<u32>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    path_prefix: Option<String>,
+    #[serde(default)]
+    path_contains: Option<String>,
+    #[serde(default)]
+    classification: Option<Classification>,
+    #[serde(default)]
+    summary_mode: Option<SummaryMode>,
+    #[serde(default)]
+    max_context_before: Option<u32>,
+    #[serde(default)]
+    max_context_after: Option<u32>,
 }
 
 /// Textual instructions shared with MCP clients.
@@ -400,22 +515,37 @@ impl IndexMcpService {
     ) -> Result<CallToolResult, McpError> {
         self.environment.update_from_meta(&ctx.meta);
         self.environment.apply_semantic_defaults(&mut params);
+        let filter_summary = build_search_filter_summary(&params);
         let search_params = SemanticSearchParams {
-            root: params.root,
-            query: params.query,
-            database_name: params.database_name,
+            root: params.root.clone(),
+            query: params.query.clone(),
+            database_name: params.database_name.clone(),
             limit: params.limit,
-            model: params.model,
+            model: params.model.clone(),
+            language: params.language.clone(),
+            path_prefix: params.path_prefix.clone(),
+            path_contains: params.path_contains.clone(),
+            classification: params.classification.clone(),
+            summary_mode: params.summary_mode,
+            max_context_before: params.max_context_before,
+            max_context_after: params.max_context_after,
         };
 
         let mut response = semantic_search(search_params)
             .await
             .map_err(convert_semantic_search_error)?;
 
+        let (deduplicated, duplicates_filtered) = self
+            .environment
+            .deduplicate_search_results(response.results);
+        response.results = deduplicated;
+
         let snapshot = self.environment.snapshot();
         response.suggested_tools = build_search_suggestions(&snapshot, &response);
 
-        let meta = self.environment.build_search_meta(&response);
+        let meta =
+            self.environment
+                .build_search_meta(&response, duplicates_filtered, filter_summary);
         build_semantic_search_result(response, meta)
     }
 
@@ -464,6 +594,13 @@ impl IndexMcpService {
             budget_tokens,
             limit,
             model,
+            language,
+            path_prefix,
+            path_contains,
+            classification,
+            summary_mode,
+            max_context_before,
+            max_context_after,
         } = params;
 
         let resolved_mode = mode.unwrap_or_else(|| {
@@ -488,14 +625,35 @@ impl IndexMcpService {
                     database_name,
                     limit,
                     model,
+                    language: language.clone(),
+                    path_prefix: path_prefix.clone(),
+                    path_contains: path_contains.clone(),
+                    classification: classification.clone(),
+                    summary_mode,
+                    max_context_before,
+                    max_context_after,
                 };
 
                 let mut response = semantic_search(search_params)
                     .await
                     .map_err(convert_semantic_search_error)?;
+                let (deduplicated, duplicates_filtered) = self
+                    .environment
+                    .deduplicate_search_results(response.results);
+                response.results = deduplicated;
                 let snapshot = self.environment.snapshot();
                 response.suggested_tools = build_search_suggestions(&snapshot, &response);
-                let meta = self.environment.build_search_meta(&response);
+                let filter_summary = build_lookup_filter_summary(
+                    &language,
+                    &path_prefix,
+                    &path_contains,
+                    &classification,
+                );
+                let meta = self.environment.build_search_meta(
+                    &response,
+                    duplicates_filtered,
+                    filter_summary,
+                );
                 build_code_lookup_result(resolved_mode, response, Some(meta))
             }
             "bundle" => {
@@ -1121,6 +1279,78 @@ fn approx_token_count(text: &str) -> usize {
     ((text.len() as f64 / 4.0).ceil()) as usize
 }
 
+fn estimate_token_cost(results: &[SemanticSearchMatch]) -> usize {
+    let total_chars: usize = results
+        .iter()
+        .map(|result| {
+            result.content.len()
+                + result
+                    .context_before
+                    .as_ref()
+                    .map(|value| value.len())
+                    .unwrap_or(0)
+                + result
+                    .context_after
+                    .as_ref()
+                    .map(|value| value.len())
+                    .unwrap_or(0)
+        })
+        .sum();
+
+    ((total_chars as f64) / 4.0).ceil() as usize
+}
+
+fn build_search_filter_summary(request: &SemanticSearchRequest) -> Option<Value> {
+    filters_to_value(
+        &request.language,
+        &request.path_prefix,
+        &request.path_contains,
+        &request.classification,
+    )
+}
+
+fn build_lookup_filter_summary(
+    language: &Option<String>,
+    path_prefix: &Option<String>,
+    path_contains: &Option<String>,
+    classification: &Option<Classification>,
+) -> Option<Value> {
+    filters_to_value(language, path_prefix, path_contains, classification)
+}
+
+fn filters_to_value(
+    language: &Option<String>,
+    path_prefix: &Option<String>,
+    path_contains: &Option<String>,
+    classification: &Option<Classification>,
+) -> Option<Value> {
+    let mut map = Map::new();
+    if let Some(language) = language.as_ref() {
+        if !language.trim().is_empty() {
+            map.insert("language".to_string(), json!(language));
+        }
+    }
+    if let Some(prefix) = path_prefix.as_ref() {
+        if !prefix.trim().is_empty() {
+            map.insert("pathPrefix".to_string(), json!(prefix));
+        }
+    }
+    if let Some(fragment) = path_contains.as_ref() {
+        if !fragment.trim().is_empty() {
+            map.insert("pathContains".to_string(), json!(fragment));
+        }
+    }
+    if let Some(classification) = classification.as_ref() {
+        map.insert("classification".to_string(), json!(classification));
+    }
+
+    if map.is_empty() {
+        None
+    } else {
+        Some(Value::Object(map))
+    }
+}
+
 fn convert_context_bundle_error(error: ContextBundleError) -> McpError {
     match error {
         ContextBundleError::InvalidRoot { path, source } => {
@@ -1451,6 +1681,7 @@ mod tests {
                 context_before: None,
                 context_after: None,
             }],
+            summary_mode: SummaryMode::Brief,
             suggested_tools: Vec::new(),
         };
 
