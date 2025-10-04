@@ -31,6 +31,7 @@ static CONTEXT_BUNDLE_CACHE: Lazy<Mutex<BundleCache>> =
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BundleCacheKey {
+    database_path: String,
     file_path: String,
     file_hash: String,
     symbol: Option<(String, Option<String>)>,
@@ -349,6 +350,7 @@ fn build_bundle(params: ContextBundleParams) -> Result<ContextBundleResponse, Co
         .collect();
 
     let cache_key = BundleCacheKey {
+        database_path: db_path_string.clone(),
         file_path: target_file.clone(),
         file_hash: file_record.hash.clone(),
         symbol: symbol_fingerprint.clone(),

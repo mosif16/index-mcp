@@ -12,47 +12,6 @@ The previous `agents.md` contents now live in two focused guides:
 - [`rust-best-practices.md`](rust-best-practices.md) – Production readiness, security, and observability guidance for Rust MCP servers.
 
 Update both documents together when workflows change so global expectations and repo details stay aligned.
-
-## Best Practices — Recommended Workflow
-
-**Purpose:** This document provides guidance on effectively using index-mcp tools to work efficiently with your codebase. These recommendations help you get the most value from the available tooling.
-
-### Available Tools & Their Uses
-
-| Tool / Prompt | Purpose & When to Use |
-|---------------|-------|
-| `ingest_codebase` | Walks the workspace, respects `.gitignore`, stores metadata and embeddings, and can auto‑evict least‑used chunks when requested. Run at session start or when the codebase changes significantly. |
-| `semantic_search` | Embedding‑powered chunk retrieval with language guesses, context padding, hit counters, and ranked follow-up suggestions. Ideal for finding code by concept or behavior before chaining into deeper tools. |
-| `code_lookup` | Router: `mode="search"` → semantic search, `mode="bundle"` → context bundles. Mirrors search results plus suggestions, then executes the follow-up you choose. |
-| `context_bundle` | Returns file metadata, focus definitions, nearby snippets, and quick links within a token budget. It memoizes responses by file hash/ranges and will downgrade to excerpts or summaries while warning when you hit the budget; raise `budgetTokens` or narrow ranges when prompted. Great for assembling focused context. |
-| `index_status` | Summarizes index freshness, embedding models, ingestion history, and git parity. Check this to understand the current state of your index. |
-| `repository_timeline` | Streams recent git commits with churn stats, directory highlights, optional diffs, and PR URLs. Useful for understanding recent changes and project history. |
-| `repository_timeline_entry` | Recovers cached commit details and (when available) full diff text for a specific SHA. |
-| `indexing_guidance` / `indexing_guidance_tool` | Prompt and tool variants for ingest reminders. |
-| Remote proxies | Any remote declared in `INDEX_MCP_REMOTE_SERVERS` is namespaced and surfaced alongside local tools. |
-
-**Recommendation:** These tools provide powerful capabilities for code search, navigation, and understanding. Use them when they make your workflow more efficient and accurate.
-
-### Suggested Workflow
-
-1. **Prime the index** — Run `ingest_codebase { "root": "." }` at session start (or enable `--watch`) to ensure you have fresh data. Honor `.gitignore`, skip files larger than **8 MiB**, and configure `autoEvict`/`maxDatabaseSizeBytes` to manage database size.
-
-2. **Check freshness before major operations** — Call `index_status` before planning or significant code operations. If `isStale` is true or HEAD moved, consider re-ingesting to work with current data.
-
-3. **Understand recent history** — Use `repository_timeline` (and `repository_timeline_entry` for detail) to see recent commits and changes that might inform your approach.
-
-4. **Scout with `semantic_search`** — Issue a search first to get lightweight hit summaries and the auto-generated “suggested tool chain.” Let those suggestions guide the next hop instead of immediately fetching large bundles.
-
-5. **Select guided follow-ups** — Execute the provided `context_bundle`, `repository_timeline`, or other suggested tool payloads. They inherit cwd, focus lines, snippet limits, and budgets so results stay tight and token-efficient.
-
-6. **Assemble focused context** — When deeper detail is required, run the suggested `context_bundle` (or craft one manually) with `budgetTokens` or `INDEX_MCP_BUDGET_TOKENS` to pull just the relevant snippets.
-
-7. **Iterate efficiently** — Use additional `semantic_search` calls to branch into new areas. Breadcrumb-aware suggestions will avoid repeating the same symbols and keep your context window clear.
-
-8. **Keep the index current** — After editing files, re-run `ingest_codebase` (or rely on watch mode) and confirm with `index_status` so subsequent operations work with updated information.
-
-**Smart Tool Usage:** When index-mcp tools are available, they typically provide the most efficient and accurate way to search, navigate, and understand codebases. Use them intelligently as your primary approach, but apply judgment about when direct file access or other methods might be more appropriate for specific tasks.
-
 ## Required Local Testing
 
 With the GitHub workflows removed, agents must run these checks before handing work back to the user:
@@ -62,3 +21,119 @@ With the GitHub workflows removed, agents must run these checks before handing w
 - `cargo test --all --all-targets`
 
 If any command cannot be executed, explain why in the final response and highlight follow-up steps for the user.
+
+## Agent Policy — Tool Chaining for Efficient, Context‑Aware Workflows
+
+**Purpose:** Define the *mandatory* chain of MCP tools that agents must follow to stay fast, fresh, and token‑efficient while maintaining accurate context. This policy removes ambiguity about which tool runs first, which tool routes follow‑ups, and how to keep the index authoritative.
+
+---
+
+### Tool Roles (authoritative)
+
+| Tool / Prompt | Role & Routing | Notes |
+|---|---|---|
+| `ingest_codebase` | **Index priming & updates** | Always pass **absolute** `root` (e.g., `/Users/.../repo`). Honor `.gitignore`. Skip files **> 8 MiB**. Tune `autoEvict`/`maxDatabaseSizeBytes`. Prefer `--watch` when available. |
+| `index_status` | **Freshness gate** | Call before planning/answering. If `isStale` or HEAD moved, **re‑ingest** before continuing. |
+| `repository_timeline` | **Recent history brief** | Summarize latest commits & churn to steer exploration. |
+| `repository_timeline_entry` | **Deep dive commit** | Fetch cached details/diffs for a specific SHA when planning changes. |
+| `semantic_search` | **Primary discovery tool** | **Start here for exploration.** Embedding‑powered retrieval with ranked suggestions. Use to find concepts, behaviors, or entry points before deeper context assembly. |
+| `code_lookup` | **Routing & orchestration** | Router tool: `mode="search"` mirrors semantic search + suggestions; `mode="bundle"` fetches focused context. Use after initial discovery to assemble targeted context. |
+| `context_bundle` | **Compact, focused context** | Assemble trimmed, cited snippets for selected files/symbols. Always set `budgetTokens` (or `INDEX_MCP_BUDGET_TOKENS`). Called directly or via `code_lookup` bundles. |
+| `indexing_guidance` / `indexing_guidance_tool` | Operational reminders | Use for quick diagnostics and best‑practice prompts. |
+| `info` | Diagnostics | Environment/runtime metadata and sanity checks. |
+
+> **Design principle:** `semantic_search` discovers the space; `code_lookup` orchestrates follow‑ups; `context_bundle` assembles the final payload.
+
+---
+
+### Mandatory Tool Chain (do not deviate)
+
+**Step 0 — Workspace root & budgets**  
+- Always compute the **absolute** workspace root and reuse it for every call.  
+- Set `INDEX_MCP_BUDGET_TOKENS` globally (start around **3000–4000** for bundles).  
+- Never dump whole files; aim for minimal, cited snippets.
+
+**Step 1 — Prime the index**  
+Run `ingest_codebase {"root": "{ABSOLUTE_ROOT}"}` (or enable `--watch`). Respect `.gitignore`. Skip files > 8 MiB. Tune `autoEvict`/`maxDatabaseSizeBytes` before the SQLite file balloons.
+
+**Step 2 — Freshness gate**  
+Call `index_status`. If `isStale: true` **or** HEAD moved: run `ingest_codebase` again, then recheck `index_status`.
+
+**Step 3 — Brief on recent changes**  
+Call `repository_timeline` (optionally `repository_timeline_entry` for SHAs that matter). Use this to aim your first search at what recently changed.
+
+**Step 4 — Discover with semantic search (start exploration here)**  
+Call `semantic_search` with `query="..."` to get lightweight hit summaries and ranked follow‑up suggestions. Review the suggested tool chain before proceeding.
+
+**Step 5 — Execute guided follow‑ups**  
+Use the auto‑generated suggestions from `semantic_search` results:
+- Execute suggested `context_bundle` payloads for focused context assembly, or
+- Use suggested `code_lookup` calls to route into deeper exploration, or
+- Follow suggested `repository_timeline` links for change context.
+
+**Step 6 — Assemble focused bundles via router**  
+When ready for detailed context, call `code_lookup` with `mode="bundle"`, `file="..."`, and optional `symbol="..."` to get compact, budgeted snippets. Pass `budgetTokens` or rely on `INDEX_MCP_BUDGET_TOKENS`.
+
+**Step 7 — Fill gaps intelligently**  
+If bundles miss details, either:  
+- Refine the **semantic search** query with tighter terms, or  
+- Use `code_lookup` with `mode="search"` to mirror search + suggestions, or
+- Run additional narrowly scoped `semantic_search` for cross‑checking patterns.
+
+**Step 8 — Assemble answer payload**  
+Prefer **one** final `context_bundle` (direct or via `code_lookup` bundle mode) with tight `budgetTokens`. Include **file path + line range** citations. Avoid overlapping or duplicate spans.
+
+**Step 9 — After edits**  
+Once code changes are applied (outside the scope of this toolchain), immediately re‑run `ingest_codebase` (or rely on `--watch`) and confirm with `index_status` so subsequent steps see the updated code.
+
+**Step 10 — Deliver**  
+Answer concisely. Provide citations. No full‑file dumps. If more detail is requested, iterate Steps 4–8 with stricter targeting.
+
+---
+
+### Chain Recipes (copy‑driven playbooks)
+
+**A) Understand a feature or bug surface**
+1. `index_status` → gate  
+2. `repository_timeline` → recent churn  
+3. `semantic_search query="{feature|bug}"` → ranked hits + suggestions  
+4. Execute suggested `context_bundle` or `code_lookup` payloads (budgeted)  
+5. (Optional) Additional `semantic_search` for confirming patterns  
+6. Final bundle → answer w/ citations
+
+**B) Locate implementation & prepare minimal context**
+1. `semantic_search query="{domain phrase}"` → hits + suggestions  
+2. Follow suggested `context_bundle` with `file="..." symbol?` → focused snippets  
+3. If incomplete: refine `semantic_search query`; use `code_lookup mode="search"` for routing  
+4. Final bundle with line‑precise citations
+
+**C) Post‑change refresh**
+1. Re‑run `ingest_codebase` or rely on `--watch`  
+2. `index_status` must be green  
+3. Resume at **Step 4** for the next task
+
+---
+
+### Budget & Precision Heuristics
+- Start bundles at **3–4k tokens**; raise only when strictly necessary.  
+- Prefer multiple **small** bundles over one giant context.  
+- De‑duplicate overlapping snippets and collapse near‑adjacent ranges.  
+- Prefer files touched in the **recent timeline** when ranking equal options.  
+- If a query is noisy, tighten terms or add an expected symbol/type.
+- Let `semantic_search` suggestions guide the next tool hop instead of immediately fetching large bundles.
+
+---
+
+### Strict Prohibitions
+- Do **not** bypass `semantic_search` discovery; always scout before assembling context.  
+- Do **not** dump entire files.  
+- Do **not** ignore token budgets or warnings.  
+- Do **not** proceed with stale indexes.  
+- Do **not** use external shells/interactive editors in place of MCP tools.
+- Do **not** skip the suggested follow‑ups from `semantic_search` results.
+
+---
+
+### Compliance
+All agents must follow this chain. Deviations reduce accuracy and waste tokens. When uncertain, **start with `semantic_search`**, follow its suggestions, keep context compact, and re‑check freshness.
+

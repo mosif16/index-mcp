@@ -2,11 +2,12 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
+use std::io::ErrorKind;
 use std::sync::{Arc, RwLock};
 
 use crate::bundle::{
-    context_bundle, ContextBundleError, ContextBundleParams, ContextBundleResponse, QuickLinkType,
-    SnippetSource,
+    context_bundle, ContextBundleError, ContextBundleParams, ContextBundleResponse, LineRange,
+    QuickLinkType, SnippetSource, SymbolSelector,
 };
 use crate::git_timeline::{
     repository_timeline, repository_timeline_entry_detail, RepositoryTimelineEntryLookupParams,
@@ -42,6 +43,7 @@ const DEFAULT_BUNDLE_BUDGET: usize = 2_000;
 const MIN_BUNDLE_BUDGET: usize = 600;
 const DEFAULT_SNIPPET_LIMIT_HINT: u32 = 2;
 const DEFAULT_SEARCH_LIMIT_HINT: u32 = 6;
+const SUGGESTED_RANGE_PADDING: u32 = 2;
 
 #[derive(Debug, Clone, Default)]
 struct EnvironmentSnapshot {
@@ -185,9 +187,6 @@ impl EnvironmentState {
             if let Some(cwd) = self.snapshot().cwd {
                 params.root = Some(cwd);
             }
-        }
-        if params.mode.is_none() {
-            params.mode = Some("search".to_string());
         }
         if params.summary_mode.is_none() {
             params.summary_mode = Some(SummaryMode::Brief);
@@ -335,7 +334,11 @@ struct CodeLookupParams {
     #[serde(default)]
     file: Option<String>,
     #[serde(default)]
-    symbol: Option<crate::bundle::SymbolSelector>,
+    symbol: Option<SymbolSelector>,
+    #[serde(default)]
+    ranges: Option<Vec<LineRange>>,
+    #[serde(default)]
+    focus_line: Option<u32>,
     #[serde(default)]
     max_snippets: Option<u32>,
     #[serde(default)]
@@ -611,6 +614,8 @@ impl IndexMcpService {
             query,
             file,
             symbol,
+            ranges,
+            focus_line,
             max_snippets,
             max_neighbors,
             budget_tokens,
@@ -691,8 +696,8 @@ impl IndexMcpService {
                     max_snippets: max_snippets.or(limit),
                     max_neighbors,
                     budget_tokens,
-                    ranges: None,
-                    focus_line: None,
+                    ranges,
+                    focus_line,
                 };
                 self.environment.apply_bundle_defaults(&mut bundle_params);
 
@@ -1036,24 +1041,34 @@ fn build_search_suggestions(
 
             let mut description = result.path.clone();
 
-            if let Some(start_line) = result
+            if let Some(start_line_raw) = result
                 .line_start
                 .and_then(|line| (line > 0).then_some(line as u32))
             {
-                params.insert("focusLine".to_string(), json!(start_line));
-
-                if let Some(end_line) = result
+                let end_line_raw = result
                     .line_end
                     .and_then(|line| (line > 0).then_some(line as u32))
-                {
-                    let range_end = end_line.max(start_line);
-                    params.insert(
-                        "ranges".to_string(),
-                        json!([{"startLine": start_line, "endLine": range_end}]),
-                    );
-                    description = format!("{}:{}-{}", result.path, start_line, range_end);
+                    .unwrap_or(start_line_raw);
+                let (min_line, max_line) = if end_line_raw < start_line_raw {
+                    (end_line_raw, start_line_raw)
                 } else {
-                    description = format!("{}#L{}", result.path, start_line);
+                    (start_line_raw, end_line_raw)
+                };
+
+                let padded_start = min_line.saturating_sub(SUGGESTED_RANGE_PADDING).max(1);
+                let padded_end = max_line.saturating_add(SUGGESTED_RANGE_PADDING);
+                let focus_line = min_line + (max_line.saturating_sub(min_line)) / 2;
+
+                params.insert("focusLine".to_string(), json!(focus_line));
+                params.insert(
+                    "ranges".to_string(),
+                    json!([{"startLine": padded_start, "endLine": padded_end}]),
+                );
+
+                if padded_start == padded_end {
+                    description = format!("{}#L{}", result.path, padded_start);
+                } else {
+                    description = format!("{}:{}-{}", result.path, padded_start, padded_end);
                 }
             }
 
@@ -1382,7 +1397,16 @@ fn convert_context_bundle_error(error: ContextBundleError) -> McpError {
             McpError::internal_error(format!("SQLite error: {source}"), None)
         }
         ContextBundleError::Io { path, source } => {
-            McpError::internal_error(format!("Failed to access '{path}': {source}"), None)
+            if source.kind() == ErrorKind::NotFound {
+                McpError::invalid_params(
+                    format!(
+                        "File '{path}' is not cached; run ingest_codebase to refresh the index."
+                    ),
+                    None,
+                )
+            } else {
+                McpError::internal_error(format!("Failed to access '{path}': {source}"), None)
+            }
         }
         ContextBundleError::Join(source) => {
             McpError::internal_error(format!("Background task failed: {source}"), None)
@@ -1545,6 +1569,7 @@ mod tests {
     use crate::index_status::{IndexStatusIngestion, IndexStatusResponse};
     use crate::ingest::IngestResponse;
     use crate::search::{Classification, SemanticSearchMatch, SemanticSearchResponse};
+    use serde_json::json;
 
     #[test]
     fn summarize_ingest_reports_key_metrics() {
@@ -1713,5 +1738,109 @@ mod tests {
             "Semantic search scanned 250 chunk(s) and returned 1 match(es) (model custom-model)."
         ));
         assert!(summary.contains("Top hit: src/main.rs#L42 (score 0.87)."));
+    }
+
+    #[test]
+    fn build_search_suggestions_embed_ranges_and_focus_line() {
+        let snapshot = EnvironmentSnapshot {
+            cwd: Some("/workspace".into()),
+            bundle_budget_override: Some(1_600),
+            remaining_context_tokens: Some(3_200),
+            recent_hits: Vec::new(),
+        };
+
+        let response = SemanticSearchResponse {
+            database_path: "db.sqlite".into(),
+            database_name: Some("db.sqlite".into()),
+            embedding_model: Some("model".into()),
+            total_chunks: 100,
+            evaluated_chunks: 50,
+            results: vec![SemanticSearchMatch {
+                path: "src/lib.rs".into(),
+                chunk_index: 7,
+                score: 0.91,
+                normalized_score: 0.82,
+                language: Some("Rust".into()),
+                classification: Classification::Function,
+                content: "fn sample() { /* ... */ }".into(),
+                embedding_model: "model".into(),
+                byte_start: None,
+                byte_end: None,
+                line_start: Some(40),
+                line_end: Some(44),
+                context_before: None,
+                context_after: None,
+            }],
+            summary_mode: SummaryMode::Brief,
+            suggested_tools: Vec::new(),
+        };
+
+        let suggestions = build_search_suggestions(&snapshot, &response);
+        assert_eq!(suggestions.len(), 1);
+        let suggestion = &suggestions[0];
+        assert_eq!(suggestion.tool, "context_bundle");
+        let params = suggestion
+            .parameters
+            .as_object()
+            .expect("parameters object");
+        assert_eq!(params.get("focusLine"), Some(&json!(42)));
+
+        let ranges = params
+            .get("ranges")
+            .and_then(|value| value.as_array())
+            .expect("ranges array");
+        assert_eq!(ranges.len(), 1);
+        let range = ranges[0].as_object().expect("range object");
+        assert_eq!(range.get("startLine"), Some(&json!(38)));
+        assert_eq!(range.get("endLine"), Some(&json!(46)));
+    }
+
+    #[test]
+    fn code_lookup_infers_bundle_mode_from_file_path_when_mode_missing() {
+        let env = EnvironmentState::new();
+        let mut params = CodeLookupParams {
+            root: None,
+            database_name: None,
+            mode: None,
+            query: None,
+            file: Some("src/lib.rs".into()),
+            symbol: None,
+            ranges: None,
+            focus_line: None,
+            max_snippets: None,
+            max_neighbors: None,
+            budget_tokens: None,
+            limit: None,
+            model: None,
+            language: None,
+            path_prefix: None,
+            path_contains: None,
+            classification: None,
+            summary_mode: None,
+            max_context_before: None,
+            max_context_after: None,
+        };
+
+        env.apply_code_lookup_defaults(&mut params);
+
+        let resolved_mode = params.mode.clone().unwrap_or_else(|| {
+            if params
+                .query
+                .as_ref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                "search".to_string()
+            } else if params
+                .file
+                .as_ref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                "bundle".to_string()
+            } else {
+                "search".to_string()
+            }
+        });
+
+        assert_eq!(resolved_mode, "bundle");
     }
 }

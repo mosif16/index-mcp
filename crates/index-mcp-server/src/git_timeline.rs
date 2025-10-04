@@ -16,6 +16,7 @@ const GIT_LOG_FIELD_SEPARATOR: &str = "\u{001f}";
 const GIT_LOG_RECORD_SEPARATOR: &str = "\u{001e}";
 const DIFF_PREVIEW_MAX_LINES: usize = 200;
 const DIFF_PREVIEW_MAX_CHARS: usize = 4_000;
+const MAX_REPOSITORY_TIMELINE_LIMIT: u32 = 200;
 
 static RELATIVE_SINCE_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^(\d+)\s*(d|w|m|y)$").expect("valid regex"));
@@ -236,11 +237,14 @@ fn perform_repository_timeline(
 
     let branch_name = branch.unwrap_or_else(|| "HEAD".to_string());
 
+    let requested_limit = limit.unwrap_or(20);
+    let limit_value = requested_limit.clamp(1, MAX_REPOSITORY_TIMELINE_LIMIT);
+
     let log_output = run_git_log(
         &repo_root,
         GitLogOptions {
             branch: &branch_name,
-            limit: limit.unwrap_or(20),
+            limit: limit_value,
             since: since.as_deref(),
             include_merges: include_merges.unwrap_or(true),
             include_file_stats: include_file_stats.unwrap_or(true),
@@ -302,7 +306,7 @@ fn perform_repository_timeline(
     Ok(RepositoryTimelineResponse {
         repository_root: repo_root,
         branch: branch_name,
-        limit: limit.unwrap_or(20),
+        limit: limit_value,
         since,
         include_merges: include_merges.unwrap_or(true),
         include_file_stats: include_file_stats.unwrap_or(true),
