@@ -52,3 +52,13 @@ Update both documents together when workflows change so global expectations and 
 8. **Keep the index current** — After editing files, re-run `ingest_codebase` (or rely on watch mode) and confirm with `index_status` so subsequent operations work with updated information.
 
 **Smart Tool Usage:** When index-mcp tools are available, they typically provide the most efficient and accurate way to search, navigate, and understand codebases. Use them intelligently as your primary approach, but apply judgment about when direct file access or other methods might be more appropriate for specific tasks.
+
+## Required Local Testing
+
+With the GitHub workflows removed, agents must run these checks before handing work back to the user:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all --all-targets`
+
+If any command cannot be executed, explain why in the final response and highlight follow-up steps for the user.
