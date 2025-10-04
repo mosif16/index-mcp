@@ -190,14 +190,7 @@ fn query_embedding_models(conn: &Connection) -> Result<Vec<String>, rusqlite::Er
     )?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
 
-    let mut models = Vec::new();
-    for row in rows {
-        if let Ok(model) = row {
-            if !model.is_empty() {
-                models.push(model);
-            }
-        }
-    }
+    let models = rows.flatten().filter(|model| !model.is_empty()).collect();
     Ok(models)
 }
 
@@ -259,18 +252,14 @@ fn get_current_commit_sha(root: &Path) -> Result<String, std::io::Error> {
         .output()?;
 
     if !output.status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             "git rev-parse returned non-zero status",
         ));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if stdout.is_empty() {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "git rev-parse returned empty output",
-        ))
+        Err(std::io::Error::other("git rev-parse returned empty output"))
     } else {
         Ok(stdout)
     }

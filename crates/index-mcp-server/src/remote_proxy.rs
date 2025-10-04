@@ -247,7 +247,7 @@ impl RemoteServerProxy {
 
         let running = serve_client(handler, transport)
             .await
-            .map_err(RemoteProxyError::ClientInit)?;
+            .map_err(|error| RemoteProxyError::ClientInit(Box::new(error)))?;
         let peer = running.peer().clone();
 
         Ok(RemoteClientState {
@@ -417,6 +417,7 @@ impl RetryPolicy {
 }
 
 impl Service<RoleClient> for RemoteClientHandler {
+    #[allow(clippy::manual_async_fn)]
     fn handle_request(
         &self,
         _request: ServerRequest,
@@ -523,7 +524,7 @@ fn resolve_auth_headers(
 pub enum RemoteProxyError {
     Transport(rmcp::transport::sse_client::SseTransportError<reqwest::Error>),
     Service(ServiceError),
-    ClientInit(service::ClientInitializeError),
+    ClientInit(Box<service::ClientInitializeError>),
     Config(String),
     Auth(String),
 }

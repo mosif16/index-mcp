@@ -238,14 +238,16 @@ fn perform_repository_timeline(
 
     let log_output = run_git_log(
         &repo_root,
-        &branch_name,
-        limit.unwrap_or(20),
-        since.as_deref(),
-        include_merges.unwrap_or(true),
-        include_file_stats.unwrap_or(true),
-        include_diffs.unwrap_or(false),
-        paths.clone(),
-        diff_pattern.clone(),
+        GitLogOptions {
+            branch: &branch_name,
+            limit: limit.unwrap_or(20),
+            since: since.as_deref(),
+            include_merges: include_merges.unwrap_or(true),
+            include_file_stats: include_file_stats.unwrap_or(true),
+            include_diffs: include_diffs.unwrap_or(false),
+            paths: paths.clone(),
+            diff_pattern: diff_pattern.clone(),
+        },
     )?;
 
     let mut entries = parse_git_log(
@@ -412,7 +414,7 @@ fn verify_git_repository(root: &PathBuf) -> Result<String, RepositoryTimelineErr
     if !status.is_dir() {
         return Err(RepositoryTimelineError::InvalidRoot {
             path: root.to_string_lossy().to_string(),
-            source: std::io::Error::new(std::io::ErrorKind::Other, "path is not a directory"),
+            source: std::io::Error::other("path is not a directory"),
         });
     }
 
@@ -434,17 +436,32 @@ fn verify_git_repository(root: &PathBuf) -> Result<String, RepositoryTimelineErr
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn run_git_log(
-    repo_root: &str,
-    branch: &str,
+struct GitLogOptions<'a> {
+    branch: &'a str,
     limit: u32,
-    since: Option<&str>,
+    since: Option<&'a str>,
     include_merges: bool,
     include_file_stats: bool,
     include_diffs: bool,
     paths: Option<Vec<String>>,
     diff_pattern: Option<String>,
+}
+
+fn run_git_log(
+    repo_root: &str,
+    options: GitLogOptions<'_>,
 ) -> Result<String, RepositoryTimelineError> {
+    let GitLogOptions {
+        branch,
+        limit,
+        since,
+        include_merges,
+        include_file_stats,
+        include_diffs,
+        paths,
+        diff_pattern,
+    } = options;
+
     let mut args = Vec::new();
     args.push("log".to_string());
     args.push("--no-color".to_string());
@@ -479,7 +496,7 @@ fn run_git_log(
         args.push(pattern.to_string());
     }
 
-    if let Some(since) = since.and_then(|value| Some(normalize_since_input(value))) {
+    if let Some(since) = since.map(normalize_since_input) {
         args.push(format!("--since={since}"));
     }
 
@@ -609,17 +626,14 @@ fn parse_git_log(
                     .iter()
                     .position(|line| line.starts_with("diff --git "))
             });
-            start_index
-                .map(|index| {
-                    let patch_lines = &stat_lines[index..];
-                    let patch_text = patch_lines.join("\n").trim().to_string();
-                    if patch_text.is_empty() {
-                        None
-                    } else {
-                        Some(patch_text)
-                    }
-                })
-                .flatten()
+            start_index.and_then(|index| {
+                let patch_text = stat_lines[index..].join("\n").trim().to_string();
+                if patch_text.is_empty() {
+                    None
+                } else {
+                    Some(patch_text)
+                }
+            })
         } else {
             None
         };

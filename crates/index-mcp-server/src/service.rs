@@ -305,7 +305,7 @@ impl EnvironmentState {
         }
     }
 
-    fn extract_environment_value<'a>(value: &'a Value) -> Option<&'a Value> {
+    fn extract_environment_value(value: &Value) -> Option<&Value> {
         value
             .get("environment")
             .or_else(|| value.get("environmentContext"))
@@ -1038,13 +1038,13 @@ fn build_search_suggestions(
 
             if let Some(start_line) = result
                 .line_start
-                .and_then(|line| (line > 0).then(|| line as u32))
+                .and_then(|line| (line > 0).then_some(line as u32))
             {
                 params.insert("focusLine".to_string(), json!(start_line));
 
                 if let Some(end_line) = result
                     .line_end
-                    .and_then(|line| (line > 0).then(|| line as u32))
+                    .and_then(|line| (line > 0).then_some(line as u32))
                 {
                     let range_end = end_line.max(start_line);
                     params.insert(
@@ -1216,7 +1216,7 @@ fn summarize_bundle(bundle: &ContextBundleResponse) -> String {
     if !bundle.warnings.is_empty() {
         let warning_excerpt = bundle
             .warnings
-            .get(0)
+            .first()
             .map(|first| first.as_str())
             .unwrap_or_default();
         let warning_note = if bundle.warnings.len() > 1 {

@@ -412,9 +412,7 @@ fn build_bundle(params: ContextBundleParams) -> Result<ContextBundleResponse, Co
         focus_definition.as_ref(),
     );
 
-    let brief = file_content
-        .as_deref()
-        .and_then(|content| build_file_brief(content));
+    let brief = file_content.as_deref().and_then(build_file_brief);
 
     let response = ContextBundleResponse {
         database_path: db_path_string,
@@ -1383,67 +1381,6 @@ fn estimate_tokens(text: &str) -> usize {
     ((text.len() as f64 / 4.0).ceil()) as usize
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn build_snippet(content: &str) -> BundleSnippet {
-        BundleSnippet {
-            source: SnippetSource::Content,
-            chunk_index: Some(0),
-            content: content.to_string(),
-            byte_start: Some(0),
-            byte_end: Some(content.len() as i64),
-            line_start: Some(1),
-            line_end: Some(content.lines().count() as i64),
-            served_count: None,
-        }
-    }
-
-    #[test]
-    fn trims_to_summary_when_budget_is_tight() {
-        let long_content = "fn example() {\n    println!(\"hello world\");\n}\n".repeat(40);
-        let snippets = vec![build_snippet(&long_content)];
-
-        let (result, usage, warnings) =
-            trim_snippets_to_budget(snippets, &[], /* budget_tokens */ 60);
-
-        assert_eq!(result.len(), 1);
-        let content = &result[0].content;
-        assert!(content.starts_with("Summary:"), "content: {content}");
-        assert!(warnings.iter().any(|warning| warning.contains("summaries")));
-        assert!(warnings
-            .iter()
-            .any(|warning| warning.contains("Token usage")));
-        assert_eq!(usage.summary_snippets, 1);
-        assert!(usage.snippet_tokens > 0);
-    }
-
-    #[test]
-    fn upgrades_to_excerpt_when_budget_allows() {
-        let long_content = (0..500)
-            .map(|idx| format!("println!(\"line {idx}\");"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let snippets = vec![build_snippet(&long_content)];
-
-        let (result, usage, warnings) =
-            trim_snippets_to_budget(snippets, &[], /* budget_tokens */ 360);
-
-        assert_eq!(result.len(), 1);
-        let content = &result[0].content;
-        assert!(
-            content.contains("... (excerpt truncated)"),
-            "content: {content}"
-        );
-        assert!(warnings
-            .iter()
-            .any(|warning| warning.contains("focused excerpts")));
-        assert_eq!(usage.excerpt_snippets, 1);
-        assert!(usage.snippet_tokens > 0);
-    }
-}
-
 fn load_latest_ingestion(
     conn: &Connection,
 ) -> Result<Option<BundleIngestionSummary>, ContextBundleError> {
@@ -1549,4 +1486,65 @@ fn find_focus_definition(
                     .unwrap_or(true)
         })
         .cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_snippet(content: &str) -> BundleSnippet {
+        BundleSnippet {
+            source: SnippetSource::Content,
+            chunk_index: Some(0),
+            content: content.to_string(),
+            byte_start: Some(0),
+            byte_end: Some(content.len() as i64),
+            line_start: Some(1),
+            line_end: Some(content.lines().count() as i64),
+            served_count: None,
+        }
+    }
+
+    #[test]
+    fn trims_to_summary_when_budget_is_tight() {
+        let long_content = "fn example() {\n    println!(\"hello world\");\n}\n".repeat(40);
+        let snippets = vec![build_snippet(&long_content)];
+
+        let (result, usage, warnings) =
+            trim_snippets_to_budget(snippets, &[], /* budget_tokens */ 60);
+
+        assert_eq!(result.len(), 1);
+        let content = &result[0].content;
+        assert!(content.starts_with("Summary:"), "content: {content}");
+        assert!(warnings.iter().any(|warning| warning.contains("summaries")));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("Token usage")));
+        assert_eq!(usage.summary_snippets, 1);
+        assert!(usage.snippet_tokens > 0);
+    }
+
+    #[test]
+    fn upgrades_to_excerpt_when_budget_allows() {
+        let long_content = (0..500)
+            .map(|idx| format!("println!(\"line {idx}\");"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let snippets = vec![build_snippet(&long_content)];
+
+        let (result, usage, warnings) =
+            trim_snippets_to_budget(snippets, &[], /* budget_tokens */ 360);
+
+        assert_eq!(result.len(), 1);
+        let content = &result[0].content;
+        assert!(
+            content.contains("... (excerpt truncated)"),
+            "content: {content}"
+        );
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("focused excerpts")));
+        assert_eq!(usage.excerpt_snippets, 1);
+        assert!(usage.snippet_tokens > 0);
+    }
 }

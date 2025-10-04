@@ -210,7 +210,7 @@ impl Visit for GraphExtractor {
             return;
         }
         let fn_id = self.create_function_node(
-            &node.ident.sym.to_string(),
+            node.ident.sym.as_ref(),
             "function",
             node.function.params.len(),
             node.function.is_async,
@@ -228,7 +228,7 @@ impl Visit for GraphExtractor {
         }
         if let PropName::Ident(name) = &node.key {
             let fn_id = self.create_function_node(
-                &name.sym.to_string(),
+                name.sym.as_ref(),
                 "method",
                 node.function.params.len(),
                 node.function.is_async,
@@ -276,9 +276,8 @@ impl Visit for GraphExtractor {
     }
 
     fn visit_call_expr(&mut self, node: &CallExpr) {
-        match &node.callee {
-            Callee::Expr(expr) => self.record_call(expr, node.span),
-            _ => {}
+        if let Callee::Expr(expr) = &node.callee {
+            self.record_call(expr, node.span);
         }
         node.visit_children_with(self);
     }
@@ -292,7 +291,7 @@ fn stable_id(inputs: &[&str]) -> String {
     let mut hasher = Sha256::new();
     for input in inputs {
         hasher.update(input.as_bytes());
-        hasher.update(&[0xff]);
+        hasher.update([0xff]);
     }
     format!("{:x}", hasher.finalize())
 }

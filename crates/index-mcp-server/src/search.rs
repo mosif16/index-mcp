@@ -59,17 +59,12 @@ pub enum Classification {
     Code,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum SummaryMode {
+    #[default]
     Brief,
     Full,
-}
-
-impl Default for SummaryMode {
-    fn default() -> Self {
-        SummaryMode::Brief
-    }
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -440,13 +435,7 @@ fn resolve_root(root: &str) -> Result<PathBuf, SemanticSearchError> {
 fn available_embedding_models(conn: &Connection) -> Result<Vec<String>, SemanticSearchError> {
     let mut stmt = conn.prepare("SELECT DISTINCT embedding_model FROM file_chunks")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    let mut models = Vec::new();
-    for row in rows {
-        if let Ok(model) = row {
-            models.push(model);
-        }
-    }
-    Ok(models)
+    Ok(rows.flatten().collect())
 }
 
 fn resolve_requested_model(
@@ -473,14 +462,14 @@ fn resolve_requested_model(
 
 fn normalize_limit(limit: Option<u32>) -> usize {
     match limit {
-        Some(value) if value == 0 => 0,
+        Some(0) => 0,
         Some(value) => value.min(MAX_RESULT_LIMIT as u32) as usize,
         None => DEFAULT_RESULT_LIMIT,
     }
 }
 
 fn blob_to_vec(blob: &[u8]) -> Vec<f32> {
-    if blob.len() % 4 != 0 {
+    if !blob.len().is_multiple_of(4) {
         return Vec::new();
     }
     let count = blob.len() / 4;
@@ -616,13 +605,11 @@ fn trim_with_ellipsis(text: &str, max_chars: usize) -> String {
     }
 
     let mut truncated = String::new();
-    let mut count = 0;
-    for c in text.chars() {
-        if count >= max_chars.saturating_sub(1) {
+    for (idx, c) in text.chars().enumerate() {
+        if idx >= max_chars.saturating_sub(1) {
             break;
         }
         truncated.push(c);
-        count += 1;
     }
     truncated.push('…');
     truncated

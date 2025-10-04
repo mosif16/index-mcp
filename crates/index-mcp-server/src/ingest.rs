@@ -12,7 +12,6 @@ use once_cell::sync::{Lazy, OnceCell};
 use rmcp::schemars::{self, JsonSchema};
 use rusqlite::{params, Connection, OpenFlags, Transaction};
 use serde::{Deserialize, Serialize};
-use serde_json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -270,7 +269,7 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
     if !root_metadata.is_dir() {
         return Err(IngestError::InvalidRoot {
             path: absolute_root.to_string_lossy().to_string(),
-            source: std::io::Error::new(std::io::ErrorKind::Other, "path is not a directory"),
+            source: std::io::Error::other("path is not a directory"),
         });
     }
 
@@ -440,7 +439,7 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
         deleted_count,
     )?;
 
-    if let Some(commit) = get_current_commit_sha(&absolute_root).ok() {
+    if let Ok(commit) = get_current_commit_sha(&absolute_root) {
         upsert_meta(&transaction, "commit_sha", &commit, finished_ms)?;
     }
     upsert_meta(
@@ -654,7 +653,7 @@ fn resolve_embedding_config(
 
     let chunk_overlap_tokens = params
         .chunk_overlap_tokens
-        .map(|value| value.max(0) as usize)
+        .map(|value| value as usize)
         .unwrap_or(DEFAULT_CHUNK_OVERLAP_TOKENS)
         .min(chunk_size_tokens);
 
@@ -914,6 +913,7 @@ fn build_ignore_walk(path: &Path, is_dir: bool) -> ignore::Walk {
     builder.build()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_files_from_walk(
     root: &Path,
     walker: ignore::Walk,
@@ -1155,10 +1155,8 @@ fn load_existing_files(
     })?;
 
     let mut map = HashMap::new();
-    for row in rows {
-        if let Ok((path, metadata)) = row {
-            map.insert(path, metadata);
-        }
+    for (path, metadata) in rows.flatten() {
+        map.insert(path, metadata);
     }
     Ok(map)
 }
@@ -1174,10 +1172,8 @@ fn load_existing_embedding_models(
     })?;
 
     let mut map = HashMap::new();
-    for row in rows {
-        if let Ok((path, model)) = row {
-            map.insert(path, model);
-        }
+    for (path, model) in rows.flatten() {
+        map.insert(path, model);
     }
 
     Ok(map)
@@ -1227,6 +1223,7 @@ fn remove_deleted(conn: &Transaction<'_>, deleted: &[String]) -> Result<(), rusq
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_ingestion_record(
     conn: &Transaction<'_>,
     ingestion_id: &str,
@@ -1314,18 +1311,14 @@ fn get_current_commit_sha(root: &Path) -> Result<String, std::io::Error> {
         .output()?;
 
     if !output.status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             "git rev-parse returned non-zero status",
         ));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if stdout.is_empty() {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "git rev-parse returned empty output",
-        ))
+        Err(std::io::Error::other("git rev-parse returned empty output"))
     } else {
         Ok(stdout)
     }
@@ -1355,7 +1348,7 @@ fn file_modified_to_ms(metadata: &fs::Metadata) -> i64 {
 }
 
 fn is_binary(bytes: &[u8]) -> bool {
-    bytes.iter().any(|&byte| byte == 0)
+    bytes.contains(&0)
 }
 
 fn chunk_content(
@@ -1470,7 +1463,7 @@ fn fallback_fragment(content: &str) -> ChunkFragment {
         };
     }
 
-    let byte_length = snippet.as_bytes().len() as u32;
+    let byte_length = snippet.len() as u32;
     let line_count = snippet.lines().count().max(1) as u32;
 
     ChunkFragment {

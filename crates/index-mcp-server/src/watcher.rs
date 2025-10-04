@@ -354,7 +354,7 @@ fn resolve_root(root: &Path) -> Result<PathBuf, WatcherError> {
     if !metadata.is_dir() {
         return Err(WatcherError::InvalidRoot {
             path: candidate.to_string_lossy().to_string(),
-            source: std::io::Error::new(std::io::ErrorKind::Other, "path is not a directory"),
+            source: std::io::Error::other("path is not a directory"),
         });
     }
 

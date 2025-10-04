@@ -439,8 +439,7 @@ fn write_json_report(path: &Path, summaries: &[SectionSummary]) -> io::Result<()
         }
     }
 
-    let payload = serde_json::to_string_pretty(summaries)
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    let payload = serde_json::to_string_pretty(summaries).map_err(io::Error::other)?;
     fs::write(path, payload)
 }
 
@@ -734,9 +733,7 @@ fn normalize_candidate(root: &Path, candidate: &str) -> Option<String> {
         return None;
     }
 
-    let relative = absolute
-        .strip_prefix(root)
-        .unwrap_or_else(|_| absolute.as_path());
+    let relative = absolute.strip_prefix(root).unwrap_or(absolute.as_path());
     Some(relative.to_string_lossy().replace('\\', "/"))
 }
 
