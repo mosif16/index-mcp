@@ -20,8 +20,9 @@ use crate::index_status::{
 use crate::ingest::{ingest_codebase, warm_up_embedder, IngestError, IngestParams, IngestResponse};
 use crate::remote_proxy::RemoteProxyRegistry;
 use crate::search::{
-    semantic_search, summarize_semantic_search, Classification, SemanticSearchError,
-    SemanticSearchMatch, SemanticSearchParams, SemanticSearchResponse, SuggestedTool, SummaryMode,
+    adaptive_search, classify_query, semantic_search, summarize_semantic_search, Classification,
+    QueryIntent, SearchSource, SemanticSearchError, SemanticSearchMatch, SemanticSearchParams,
+    SemanticSearchResponse, SuggestedTool, SummaryMode,
 };
 use tracing::warn;
 
@@ -280,8 +281,22 @@ impl EnvironmentState {
             "resultCount": response.results.len(),
             "summaryMode": response.summary_mode,
             "estimatedTokenCost": estimate_token_cost(&response.results),
-            "duplicatesFiltered": duplicates_filtered,
         });
+        if let Some(diagnostics) = &response.diagnostics {
+            info["strategy"] = json!(diagnostics.strategy);
+            info["duplicatesFiltered"] = json!(diagnostics.duplicates_removed);
+            if let Some(latency) = diagnostics.embedding_latency_ms {
+                info["embeddingLatencyMs"] = json!(latency);
+            }
+            if let Some(latency) = diagnostics.lexical_latency_ms {
+                info["lexicalLatencyMs"] = json!(latency);
+            }
+            if let Some(model) = &diagnostics.embedding_model {
+                info["embeddingModel"] = json!(model);
+            }
+        } else {
+            info["duplicatesFiltered"] = json!(duplicates_filtered);
+        }
         if let Some(filters) = filters {
             info["filters"] = filters;
         }
@@ -646,6 +661,7 @@ impl IndexMcpService {
                     McpError::invalid_params("code_lookup search mode requires a query.", None)
                 })?;
 
+                let intent = classify_query(&query);
                 let search_params = SemanticSearchParams {
                     root,
                     query,
@@ -661,13 +677,16 @@ impl IndexMcpService {
                     max_context_after,
                 };
 
-                let mut response = semantic_search(search_params)
+                let mut response = adaptive_search(search_params, intent)
                     .await
                     .map_err(convert_semantic_search_error)?;
                 let (deduplicated, duplicates_filtered) = self
                     .environment
                     .deduplicate_search_results(response.results);
                 response.results = deduplicated;
+                if let Some(diagnostics) = response.diagnostics.as_mut() {
+                    diagnostics.duplicates_removed += duplicates_filtered;
+                }
                 let snapshot = self.environment.snapshot();
                 response.suggested_tools = build_search_suggestions(&snapshot, &response);
                 let filter_summary = build_lookup_filter_summary(
@@ -1717,10 +1736,14 @@ mod tests {
                 chunk_index: 0,
                 score: 0.92,
                 normalized_score: 0.87,
+                confidence: 0.87,
                 language: Some("Rust".into()),
                 classification: Classification::Function,
                 content: "fn main() {}".into(),
-                embedding_model: "custom-model".into(),
+                embedding_model: Some("custom-model".into()),
+                symbol: Some("main".into()),
+                metadata: None,
+                source: SearchSource::Semantic,
                 byte_start: None,
                 byte_end: None,
                 line_start: Some(42),
@@ -1730,6 +1753,7 @@ mod tests {
             }],
             summary_mode: SummaryMode::Brief,
             suggested_tools: Vec::new(),
+            diagnostics: None,
         };
 
         let summary = crate::search::summarize_semantic_search(&response);
@@ -1760,10 +1784,14 @@ mod tests {
                 chunk_index: 7,
                 score: 0.91,
                 normalized_score: 0.82,
+                confidence: 0.82,
                 language: Some("Rust".into()),
                 classification: Classification::Function,
                 content: "fn sample() { /* ... */ }".into(),
-                embedding_model: "model".into(),
+                embedding_model: Some("model".into()),
+                symbol: Some("sample".into()),
+                metadata: None,
+                source: SearchSource::Semantic,
                 byte_start: None,
                 byte_end: None,
                 line_start: Some(40),
@@ -1773,6 +1801,7 @@ mod tests {
             }],
             summary_mode: SummaryMode::Brief,
             suggested_tools: Vec::new(),
+            diagnostics: None,
         };
 
         let suggestions = build_search_suggestions(&snapshot, &response);

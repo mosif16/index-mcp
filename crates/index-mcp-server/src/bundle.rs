@@ -739,7 +739,7 @@ fn load_snippets(conn: &Connection, path: &str, max_snippets: usize) -> Vec<Bund
     let mut stmt = match conn.prepare(
         "SELECT chunk_index, content, byte_start, byte_end, line_start, line_end, hits \
          FROM file_chunks \
-         WHERE path = ?1 \
+         WHERE path = ?1 AND chunk_index >= 0 \
          ORDER BY hits ASC, chunk_index ASC \
          LIMIT ?2",
     ) {

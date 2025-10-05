@@ -12,8 +12,10 @@ use once_cell::sync::{Lazy, OnceCell};
 use rmcp::schemars::{self, JsonSchema};
 use rusqlite::{params, Connection, OpenFlags, Transaction};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tracing::info;
 use uuid::Uuid;
 
 use crate::{
@@ -172,6 +174,8 @@ struct ChunkRecord {
     line_start: Option<i64>,
     line_end: Option<i64>,
     embedding: Option<Vec<f32>>,
+    symbol: Option<String>,
+    metadata: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -319,6 +323,8 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
 
     let transaction = conn.transaction()?;
 
+    ensure_chunk_metadata_columns(&transaction)?;
+
     let existing_files = load_existing_files(&transaction)?;
     let existing_models = load_existing_embedding_models(&transaction)?;
     let existing_paths: HashSet<String> = existing_files.keys().cloned().collect();
@@ -389,6 +395,10 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
                 if !fragments.is_empty() {
                     let entry = chunk_records_by_path.entry(path.clone()).or_default();
                     for (index, fragment) in fragments.into_iter().enumerate() {
+                        let symbol = infer_symbol_from_content(&fragment.content);
+                        let docstring = extract_docstring(&fragment.content);
+                        let metadata =
+                            build_chunk_metadata(symbol.as_deref(), docstring.as_deref(), "code");
                         entry.push(ChunkRecord {
                             id: format!("{}:{}", path, index),
                             path: path.clone(),
@@ -399,6 +409,8 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
                             line_start: Some(fragment.line_start as i64),
                             line_end: Some(fragment.line_end as i64),
                             embedding: None,
+                            symbol,
+                            metadata,
                         });
                         chunk_locations.push((path.clone(), entry.len() - 1));
                     }
@@ -407,6 +419,31 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
 
             if let Some(extraction) = extract_graph(&path, text) {
                 graph_records.insert(path.clone(), extraction);
+            }
+
+            if embedding_config.enabled {
+                if let Some(summary) = build_file_summary(&path, text) {
+                    let entry = chunk_records_by_path.entry(path.clone()).or_default();
+                    let metadata = build_chunk_metadata(
+                        Some("__file__"),
+                        extract_docstring(text).as_deref(),
+                        "filename",
+                    );
+                    entry.push(ChunkRecord {
+                        id: format!("{}:file", path),
+                        path: path.clone(),
+                        chunk_index: -1,
+                        content: summary,
+                        byte_start: None,
+                        byte_end: None,
+                        line_start: None,
+                        line_end: None,
+                        embedding: None,
+                        symbol: Some("__file__".to_string()),
+                        metadata,
+                    });
+                    chunk_locations.push((path.clone(), entry.len() - 1));
+                }
             }
         }
     }
@@ -464,14 +501,14 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
     let mut graph_edge_count = 0usize;
 
     if !graph_records.is_empty() {
-        let mut insert_node_stmt = transaction.prepare(
-            "INSERT OR REPLACE INTO code_graph_nodes (id, path, kind, name, signature, range_start, range_end, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        )?;
-        let mut insert_edge_stmt = transaction.prepare(
-            "INSERT OR REPLACE INTO code_graph_edges (id, source_id, target_id, type, source_path, target_path, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        )?;
+        let mut insert_node_stmt = transaction.prepare(concat!(
+            "INSERT OR REPLACE INTO code_graph_nodes (id, path, kind, name, signature, range_start, range_end, metadata) ",
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        ))?;
+        let mut insert_edge_stmt = transaction.prepare(concat!(
+            "INSERT OR REPLACE INTO code_graph_edges (id, source_id, target_id, type, source_path, target_path, metadata) ",
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        ))?;
 
         for (path, extraction) in &graph_records {
             if !paths_to_clear.contains(path) {
@@ -529,6 +566,7 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
             .unwrap_or(DEFAULT_EMBEDDING_BATCH_SIZE)
             .max(1);
 
+        let mut logged_model_info = false;
         let mut batch_start = 0usize;
         while batch_start < chunk_locations.len() {
             let batch_end = (batch_start + stream_batch_size).min(chunk_locations.len());
@@ -551,6 +589,17 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
                 let (path, record_index) = &chunk_locations[batch_start + offset];
                 if let Some(records) = chunk_records_by_path.get_mut(path) {
                     if let Some(record) = records.get_mut(*record_index) {
+                        let dimension = embedding_vec.len();
+                        if !logged_model_info {
+                            info!(
+                                model = %embedding_config.model,
+                                dimension = dimension,
+                                backend = "fastembed (ONNX)",
+                                quantized = is_quantized_model(&embedding_config.model_variant),
+                                "Embedding mode activated"
+                            );
+                            logged_model_info = true;
+                        }
                         record.embedding = Some(embedding_vec);
                     }
                 }
@@ -559,15 +608,20 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
             batch_start = batch_end;
         }
 
-        let mut insert_stmt = transaction.prepare(
-            "INSERT INTO file_chunks (id, path, chunk_index, content, embedding, embedding_model, byte_start, byte_end, line_start, line_end)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
-        )?;
+        let mut insert_stmt = transaction.prepare(concat!(
+            "INSERT INTO file_chunks (id, path, chunk_index, content, embedding, embedding_model, ",
+            "byte_start, byte_end, line_start, line_end, symbol, metadata) ",
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        ))?;
 
         for records in chunk_records_by_path.values() {
             for record in records {
                 if let Some(embedding_vec) = &record.embedding {
                     let blob = embedding_to_bytes(embedding_vec);
+                    let metadata_string = record
+                        .metadata
+                        .as_ref()
+                        .and_then(|value| serde_json::to_string(value).ok());
                     insert_stmt.execute(params![
                         &record.id,
                         &record.path,
@@ -578,13 +632,14 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
                         record.byte_start,
                         record.byte_end,
                         record.line_start,
-                        record.line_end
+                        record.line_end,
+                        record.symbol.as_deref(),
+                        metadata_string.as_deref()
                     ])?;
                     embedded_chunk_count += 1;
                 }
             }
         }
-
         if embedded_chunk_count > 0 {
             embedding_model_output = Some(embedding_config.model.clone());
         }
@@ -1090,6 +1145,8 @@ fn ensure_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             byte_end INTEGER,
             line_start INTEGER,
             line_end INTEGER,
+            symbol TEXT,
+            metadata TEXT,
             hits INTEGER DEFAULT 0,
             FOREIGN KEY (path) REFERENCES files(path) ON DELETE CASCADE
         );
@@ -1303,6 +1360,33 @@ fn embedding_to_bytes(vector: &[f32]) -> Vec<u8> {
     bytes
 }
 
+fn ensure_chunk_metadata_columns(transaction: &Transaction) -> Result<(), IngestError> {
+    let mut stmt = transaction
+        .prepare("PRAGMA table_info(file_chunks)")
+        .map_err(IngestError::Sqlite)?;
+    let mut existing = HashSet::new();
+    let mut rows = stmt.query([]).map_err(IngestError::Sqlite)?;
+    while let Some(row) = rows.next().transpose().map_err(IngestError::Sqlite)? {
+        let name: String = row.get(1).map_err(IngestError::Sqlite)?;
+        existing.insert(name);
+    }
+
+    drop(stmt);
+
+    if !existing.contains("symbol") {
+        transaction
+            .execute("ALTER TABLE file_chunks ADD COLUMN symbol TEXT", [])
+            .map_err(IngestError::Sqlite)?;
+    }
+    if !existing.contains("metadata") {
+        transaction
+            .execute("ALTER TABLE file_chunks ADD COLUMN metadata TEXT", [])
+            .map_err(IngestError::Sqlite)?;
+    }
+
+    Ok(())
+}
+
 fn get_current_commit_sha(root: &Path) -> Result<String, std::io::Error> {
     let output = std::process::Command::new("git")
         .arg("rev-parse")
@@ -1449,6 +1533,201 @@ fn chunk_content(
     }
 
     fragments
+}
+
+fn infer_symbol_from_content(content: &str) -> Option<String> {
+    const KEYWORDS: [&str; 10] = [
+        "fn ",
+        "async fn ",
+        "def ",
+        "class ",
+        "struct ",
+        "enum ",
+        "interface ",
+        "function ",
+        "impl ",
+        "trait ",
+    ];
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if strip_comment_prefix(trimmed).is_some() {
+            continue;
+        }
+
+        let mut candidate = trimmed;
+        if let Some(stripped) = candidate.strip_prefix("pub ") {
+            candidate = stripped.trim_start();
+        }
+
+        for keyword in KEYWORDS.iter() {
+            if let Some(rest) = candidate.strip_prefix(keyword) {
+                return extract_symbol_name(rest);
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_symbol_name(tail: &str) -> Option<String> {
+    let mut name = String::new();
+    for ch in tail.chars() {
+        if ch.is_alphanumeric() || matches!(ch, '_' | ':' | '.' | '#') {
+            name.push(ch);
+        } else {
+            break;
+        }
+    }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+fn extract_docstring(content: &str) -> Option<String> {
+    let mut lines = Vec::new();
+    let mut in_block = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if in_block {
+                continue;
+            }
+            if lines.is_empty() {
+                continue;
+            }
+            break;
+        }
+
+        if trimmed.starts_with("/*") {
+            in_block = true;
+            let mut stripped = trimmed.trim_start_matches("/*").trim();
+            if let Some(end) = stripped.strip_suffix("*/") {
+                stripped = end.trim();
+                in_block = false;
+            }
+            if !stripped.is_empty() {
+                lines.push(stripped.trim_matches('*').trim().to_string());
+            }
+            continue;
+        }
+
+        if trimmed.starts_with("*/") {
+            in_block = false;
+            continue;
+        }
+
+        if in_block {
+            let stripped = trimmed
+                .trim_start_matches('*')
+                .trim_end_matches("*/")
+                .trim();
+            if !stripped.is_empty() {
+                lines.push(stripped.to_string());
+            }
+            if trimmed.ends_with("*/") {
+                in_block = false;
+            }
+            continue;
+        }
+
+        if let Some(stripped) = strip_comment_prefix(trimmed) {
+            let cleaned = stripped.trim();
+            if !cleaned.is_empty() {
+                lines.push(cleaned.to_string());
+            }
+            continue;
+        }
+
+        break;
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+fn strip_comment_prefix(line: &str) -> Option<&str> {
+    if let Some(rest) = line.strip_prefix("///") {
+        Some(rest)
+    } else if let Some(rest) = line.strip_prefix("//!") {
+        Some(rest)
+    } else if let Some(rest) = line.strip_prefix("//") {
+        Some(rest)
+    } else if let Some(rest) = line.strip_prefix('#') {
+        Some(rest)
+    } else if let Some(rest) = line.strip_prefix("--") {
+        Some(rest)
+    } else if let Some(rest) = line.strip_prefix('*') {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn build_chunk_metadata(
+    symbol: Option<&str>,
+    docstring: Option<&str>,
+    source: &str,
+) -> Option<Value> {
+    let mut map = serde_json::Map::new();
+    map.insert("source".to_string(), Value::String(source.to_string()));
+    if let Some(symbol) = symbol {
+        if !symbol.is_empty() {
+            map.insert("symbol".to_string(), Value::String(symbol.to_string()));
+        }
+    }
+    if let Some(doc) = docstring {
+        if !doc.is_empty() {
+            map.insert("docstring".to_string(), Value::String(doc.to_string()));
+        }
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(Value::Object(map))
+    }
+}
+
+fn build_file_summary(path: &str, text: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    parts.push(format!("File {path}"));
+    if let Some(doc) = extract_docstring(text) {
+        parts.push(doc);
+    } else if let Some(first_line) = text.lines().find(|line| !line.trim().is_empty()) {
+        parts.push(first_line.trim().to_string());
+    }
+
+    let summary = parts.join("\n");
+    if summary.trim().is_empty() {
+        None
+    } else {
+        Some(truncate_summary(&summary, 240))
+    }
+}
+
+fn truncate_summary(text: &str, max_len: usize) -> String {
+    if text.chars().count() <= max_len {
+        text.to_string()
+    } else {
+        let mut truncated = String::new();
+        for (idx, ch) in text.chars().enumerate() {
+            if idx >= max_len.saturating_sub(1) {
+                break;
+            }
+            truncated.push(ch);
+        }
+        truncated.push('…');
+        truncated
+    }
 }
 
 fn fallback_fragment(content: &str) -> ChunkFragment {
