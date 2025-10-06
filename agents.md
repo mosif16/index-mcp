@@ -21,3 +21,14 @@ With the GitHub workflows removed, agents must run these checks before handing w
 - `cargo test --all --all-targets`
 
 If any command cannot be executed, explain why in the final response and highlight follow-up steps for the user.
+## Binary packaging
+
+When a user asks for a runnable binary or release artifact:
+
+- Run `cargo build --release -p index-mcp-server` to refresh `target/release/index-mcp-server`.
+- Point MCP configs at that binary (for example `command = "/path/to/target/release/index-mcp-server"`) unless the user prefers `start.sh`.
+- Mention that GitHub Releases require manually uploading the binary or wiring an automation workflow; cargo does not publish binaries automatically.
+- Remind the user to create the `logs/` directory if logging is enabled in their config.
+
+Keep these notes aligned with `agents_repo.md` when workflows change.
+

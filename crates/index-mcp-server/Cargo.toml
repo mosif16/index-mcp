@@ -1,8 +1,13 @@
 [package]
 name = "index-mcp-server"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
+description = "Rust MCP server that indexes workspaces into SQLite for semantic search."
+readme = "README.md"
+repository = "https://github.com/mosif16/index-mcp"
+keywords = ["mcp", "indexing", "search", "sqlite"]
+categories = ["command-line-utilities", "development-tools::build-helpers"]
 
 [dependencies]
 anyhow = { workspace = true }
