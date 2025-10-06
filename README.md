@@ -8,6 +8,7 @@ The project previously shipped a Node/TypeScript runtime. That implementation ha
 
 - **Fast ingestion** – Parallel filesystem walker with `.gitignore` support, hashing, chunking, embeddings, and optional auto-eviction based on database size targets. Each chunk now persists summary, symbol, identifier, language, and graph metadata alongside the embedding payload.
 - **Hybrid lookups** – `semantic_search`, `code_lookup`, and `context_bundle` blend lexical sieves with embedding-backed similarity. Results ship with `source` (`embedding` vs `lexical`), `confidence`, and symbol metadata so agents understand why a match was promoted.
+- **Cross-file awareness** – `context_bundle` automatically pulls in graph-linked snippets from neighboring files, annotating each excerpt with edge metadata so downstream prompts can cite related definitions without extra calls.
 - **Git awareness** – `repository_timeline` and `repository_timeline_entry` summarise recent commits and cached diffs so agents can reason about repo history.
 - **Watch mode** – Optional filesystem watcher re-ingests changed paths automatically for long-running agent sessions.
 - **Remote proxies** – Mount additional MCP servers behind the same process by declaring JSON descriptors in `INDEX_MCP_REMOTE_SERVERS`.

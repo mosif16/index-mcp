@@ -62,6 +62,7 @@ Meta table additions record `embedding_model`, `embedding_backend`, `embedding_d
 - Optional `query` parameter embeds natural language or task prompts.
 - Snippets carry similarity scores and are re-ranked before trimming to the token budget.
 - Bundle diagnostics report which model/backends were used, optional latency, and similarity range to help tune downstream prompting.
+- Graph-linked neighbors are expanded automatically: when a focused symbol references other files the bundle appends ranked snippets from those targets, with edge metadata attached so agents can cite the cross-file hop without extra lookups.
 
 ## Diagnostics Surface
 
@@ -91,5 +92,3 @@ The SQLite schema self-migrates: missing columns are added via `ALTER TABLE file
 
 - Pluggable Candle backends once lightweight sentence transformer weights are packaged.
 - On-disk ANN acceleration for large repos; today’s approach uses brute-force cosine with cache assistance.
-- Cross-file semantic neighbor expansion using stored `similarity` + graph edges.
-

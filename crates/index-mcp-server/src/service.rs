@@ -410,18 +410,18 @@ const SERVER_INSTRUCTIONS_TEMPLATE: &str = r#"Rust rewrite is production-ready. 
 1. Prime the index at session start with ingest_codebase {"root": "{ABSOLUTE_ROOT}"} or --watch. Honor .gitignore, skip files larger than 8 MiB, and tune autoEvict/maxDatabaseSizeBytes before the SQLite file balloons. Always pass the absolute workspace root; relative paths often target the wrong codebase.
 2. Check index_status before planning or answering. If HEAD moved or isStale is true, ingest again before proceeding.
 3. Brief yourself with repository_timeline (and repository_timeline_entry for deep dives) so your plan reflects the latest commits.
-4. Use code_lookup in auto mode to assemble payloads: start with query="..." to explore, then request file/symbol bundles for snippets you will cite. The server tracks recently delivered chunks—subsequent searches automatically suppress duplicates, and clients can pass recent_hits when chaining custom workflows.
-5. Deliver compact payloads—semantic_search now prioritizes the precise focus span for each hit. Prefer context_bundle with budgetTokens or INDEX_MCP_BUDGET_TOKENS when you need broader context, include citations, and avoid dumping whole files.
-6. When you need additional detail, follow up with semantic_search or focused context_bundle calls instead of broad re-ingests; if dedupe hides something you truly need, request a different chunk index or reset your recent_hits list.
+4. Locate targets with semantic_search or code_lookup (query mode), then request the precise snippet with code_lookup ranges or file+symbol. Set summaryMode (brief/compressed), focusDefinition, and maxSnippets/maxNeighbors to keep the response limited to what you intend to cite. The server tracks recently delivered chunks—pass recent_hits to suppress repeats or reset it when you need fresh spans.
+5. Shape bundles to your window: supply budgetTokens (or INDEX_MCP_BUDGET_TOKENS), trim snippet limits, and only escalate to context_bundle when you truly need neighboring lines. semantic_search already highlights the focus span, so avoid whole-file dumps unless explicitly required.
+6. Add detail iteratively: chain additional semantic_search or narrowly scoped context_bundle calls instead of broad re-ingests. If dedupe hides something important, request a different chunk index or clear recent_hits rather than re-requesting the entire file.
 7. After modifying files, re-run ingest_codebase or rely on watch mode, then confirm freshness with index_status/info so the next task sees the updated payload.
 
 Available tools: ingest_codebase, index_status, code_lookup (search/bundle), semantic_search, context_bundle, repository_timeline, repository_timeline_entry, indexing_guidance, indexing_guidance_tool, info."#;
 const INDEXING_GUIDANCE_PROMPT_TEMPLATE: &str = r#"Workflow reminder:
 1. Prime the index after a checkout, pull, or edit by running ingest_codebase {"root": "{ABSOLUTE_ROOT}"} (or enabling watch mode); respect .gitignore, skip files >8 MiB, and configure autoEvict/maxDatabaseSizeBytes when needed. Always provide the absolute workspace root to avoid indexing the wrong project.
 2. Call index_status before reasoning. If it reports staleness or a HEAD mismatch, ingest before continuing.
-3. code_lookup first (query="..." for search, file="..." + symbol for bundles), then semantic_search/context_bundle for refinements.
+3. Start with semantic_search or code_lookup query mode to pinpoint targets, then request precise snippets with code_lookup ranges or file+symbol. Set summaryMode and snippet limits to keep responses focused, escalating to context_bundle only when you need neighboring lines.
 4. repository_timeline and repository_timeline_entry before planning or applying changes.
-5. Keep answers tight: set INDEX_MCP_BUDGET_TOKENS or pass budgetTokens, trim limits, and prefer info/indexing_guidance_tool for diagnostics."#;
+5. Keep answers tight: set INDEX_MCP_BUDGET_TOKENS or pass budgetTokens, trim maxSnippets/maxNeighbors, and prefer info/indexing_guidance_tool for diagnostics."#;
 
 fn workspace_root_for_instructions() -> String {
     std::env::current_dir()
@@ -1699,6 +1699,7 @@ mod tests {
             focus_definition: None,
             related: Vec::new(),
             snippets: vec![BundleSnippet {
+                path: None,
                 source: SnippetSource::Chunk,
                 chunk_index: Some(0),
                 content: "fn foo() {}".into(),

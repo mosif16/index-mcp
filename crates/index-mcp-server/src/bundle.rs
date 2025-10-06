@@ -204,6 +204,10 @@ pub struct BundleEdgeNeighbor {
     pub r#type: String,
     pub direction: NeighborDirection,
     pub metadata: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
     pub neighbor: NeighborNode,
 }
 
@@ -215,12 +219,16 @@ pub struct NeighborNode {
     pub kind: String,
     pub name: String,
     pub signature: Option<String>,
+    pub range_start: Option<i64>,
+    pub range_end: Option<i64>,
     pub metadata: Option<Value>,
 }
 
 #[derive(Debug, Serialize, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct BundleSnippet {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     pub source: SnippetSource,
     pub chunk_index: Option<i32>,
     pub content: String,
@@ -472,7 +480,30 @@ fn build_bundle(params: ContextBundleParams) -> Result<ContextBundleResponse, Co
         query_model: embedding_model_name.as_deref(),
     };
 
-    let (snippets, mut snippet_warnings) = collect_snippets(&conn, snippet_request);
+    let (mut snippets, mut snippet_warnings) = collect_snippets(&conn, snippet_request);
+
+    let mut existing_keys: HashSet<String> = snippets
+        .iter()
+        .map(|snippet| snippet_key(snippet, &target_file))
+        .collect();
+
+    let (neighbor_snippets, mut neighbor_warnings) = collect_neighbor_snippets(
+        &conn,
+        &target_file,
+        &related,
+        query_vector_ref,
+        embedding_model_name.as_deref(),
+    );
+
+    for snippet in neighbor_snippets {
+        let key = snippet_key(&snippet, &target_file);
+        if existing_keys.insert(key) {
+            snippets.push(snippet);
+        }
+    }
+
+    snippet_warnings.append(&mut neighbor_warnings);
+
     let (trimmed_snippets, usage_stats, mut trimming_warnings) =
         trim_snippets_to_budget(snippets, &definitions, budget_tokens);
 
@@ -810,7 +841,9 @@ fn load_related_neighbors(
 
     let mut neighbors = Vec::new();
     let mut stmt = match conn.prepare(
-        "SELECT id, type, source_id, target_id, metadata FROM code_graph_edges WHERE source_id = ?1 OR target_id = ?1",
+        "SELECT id, type, source_id, target_id, source_path, target_path, metadata \
+         FROM code_graph_edges \
+         WHERE source_id = ?1 OR target_id = ?1",
     ) {
         Ok(stmt) => stmt,
         Err(_) => return neighbors,
@@ -829,13 +862,23 @@ fn load_related_neighbors(
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             })
             .ok();
 
         if let Some(rows) = rows {
             for row in rows.flatten() {
-                let (edge_id, edge_type, source_id, target_id, metadata_raw) = row;
+                let (
+                    edge_id,
+                    edge_type,
+                    source_id,
+                    target_id,
+                    source_path,
+                    target_path,
+                    metadata_raw,
+                ) = row;
                 let direction = if source_id == definition.id {
                     NeighborDirection::Outgoing
                 } else {
@@ -857,6 +900,8 @@ fn load_related_neighbors(
                         r#type: edge_type,
                         direction,
                         metadata,
+                        source_path,
+                        target_path,
                         neighbor: node,
                     });
                 }
@@ -874,17 +919,20 @@ fn load_related_neighbors(
 fn load_neighbor_node(conn: &Connection, node_id: &str) -> Option<NeighborNode> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, path, kind, name, signature, metadata FROM code_graph_nodes WHERE id = ?1",
+            "SELECT id, path, kind, name, signature, range_start, range_end, metadata \
+             FROM code_graph_nodes WHERE id = ?1",
         )
         .ok()?;
     stmt.query_row(params![node_id], |row| {
-        let metadata_raw: Option<String> = row.get(5)?;
+        let metadata_raw: Option<String> = row.get(7)?;
         Ok(NeighborNode {
             id: row.get(0)?,
             path: row.get(1)?,
             kind: row.get(2)?,
             name: row.get(3)?,
             signature: row.get(4)?,
+            range_start: row.get(5)?,
+            range_end: row.get(6)?,
             metadata: metadata_raw
                 .as_deref()
                 .and_then(|payload| serde_json::from_str::<Value>(payload).ok()),
@@ -893,7 +941,228 @@ fn load_neighbor_node(conn: &Connection, node_id: &str) -> Option<NeighborNode> 
     .ok()
 }
 
-fn load_snippets(conn: &Connection, path: &str, max_snippets: usize) -> Vec<BundleSnippet> {
+fn neighbor_file_path(neighbor: &BundleEdgeNeighbor) -> Option<&str> {
+    neighbor
+        .neighbor
+        .path
+        .as_deref()
+        .or(match neighbor.direction {
+            NeighborDirection::Outgoing => neighbor.target_path.as_deref(),
+            NeighborDirection::Incoming => neighbor.source_path.as_deref(),
+        })
+}
+
+fn collect_neighbor_snippets(
+    conn: &Connection,
+    primary_path: &str,
+    neighbors: &[BundleEdgeNeighbor],
+    query_embedding: Option<&[f32]>,
+    query_model: Option<&str>,
+) -> (Vec<BundleSnippet>, Vec<String>) {
+    let mut snippets = Vec::new();
+    let mut warnings = Vec::new();
+    let mut seen_keys: HashSet<String> = HashSet::new();
+
+    for neighbor in neighbors {
+        match load_neighbor_snippet(conn, neighbor) {
+            Ok(Some(snippet)) => {
+                let key = snippet_key(&snippet, primary_path);
+                if seen_keys.insert(key) {
+                    snippets.push(decorate_neighbor_snippet(
+                        snippet,
+                        neighbor,
+                        query_embedding,
+                        query_model,
+                    ));
+                }
+            }
+            Ok(None) => {}
+            Err(message) => warnings.push(message),
+        }
+    }
+
+    (snippets, warnings)
+}
+
+fn load_neighbor_snippet(
+    conn: &Connection,
+    neighbor: &BundleEdgeNeighbor,
+) -> Result<Option<BundleSnippet>, String> {
+    let path = match neighbor_file_path(neighbor) {
+        Some(path) => path,
+        None => {
+            return Err(format!(
+                "Skipping neighbor '{}' because no file path was recorded.",
+                neighbor.neighbor.name
+            ))
+        }
+    };
+
+    if let Some(range_start) = neighbor.neighbor.range_start {
+        let range_end = neighbor.neighbor.range_end.unwrap_or(range_start);
+        let mut stmt = conn
+            .prepare(
+                "SELECT chunk_index, content, summary, symbol, identifier, source_type, metadata, embedding_model, embedding, byte_start, byte_end, line_start, line_end, hits \
+                 FROM file_chunks \
+                 WHERE path = ?1 AND byte_start IS NOT NULL AND byte_end IS NOT NULL AND byte_start <= ?2 AND byte_end >= ?3 \
+                 ORDER BY hits ASC \
+                 LIMIT 1",
+            )
+            .map_err(|error| error.to_string())?;
+
+        match stmt.query_row(params![path, range_start, range_end], |row| {
+            snippet_from_row(row, true, path)
+        }) {
+            Ok(snippet) => return Ok(Some(snippet)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+
+    let mut identifier_attempts: HashSet<&str> = HashSet::new();
+    for candidate in [
+        extract_identifier(&neighbor.neighbor.metadata),
+        Some(neighbor.neighbor.id.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !identifier_attempts.insert(candidate) {
+            continue;
+        }
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT chunk_index, content, summary, symbol, identifier, source_type, metadata, embedding_model, embedding, byte_start, byte_end, line_start, line_end, hits \
+                 FROM file_chunks \
+                 WHERE path = ?1 AND identifier = ?2 \
+                 ORDER BY hits ASC \
+                 LIMIT 1",
+            )
+            .map_err(|error| error.to_string())?;
+
+        match stmt.query_row(params![path, candidate], |row| {
+            snippet_from_row(row, true, path)
+        }) {
+            Ok(snippet) => return Ok(Some(snippet)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT chunk_index, content, summary, symbol, identifier, source_type, metadata, embedding_model, embedding, byte_start, byte_end, line_start, line_end, hits \
+             FROM file_chunks \
+             WHERE path = ?1 AND symbol = ?2 \
+             ORDER BY hits ASC \
+             LIMIT 1",
+        )
+        .map_err(|error| error.to_string())?;
+
+    match stmt.query_row(params![path, neighbor.neighbor.name.as_str()], |row| {
+        snippet_from_row(row, true, path)
+    }) {
+        Ok(snippet) => return Ok(Some(snippet)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {}
+        Err(error) => return Err(error.to_string()),
+    }
+
+    let mut fallback = load_snippets(conn, path, 1, true);
+    Ok(fallback.pop())
+}
+
+fn decorate_neighbor_snippet(
+    mut snippet: BundleSnippet,
+    neighbor: &BundleEdgeNeighbor,
+    query_embedding: Option<&[f32]>,
+    query_model: Option<&str>,
+) -> BundleSnippet {
+    if snippet.path.is_none() {
+        snippet.path = neighbor_file_path(neighbor).map(|path| path.to_string());
+    }
+
+    let mut score = snippet.score.unwrap_or(0.0) + 48.0;
+    if let (Some(query_vec), Some(embed_vec), Some(model_name)) = (
+        query_embedding,
+        snippet.embedding.as_ref(),
+        snippet.embedding_model.as_deref(),
+    ) {
+        if query_model
+            .map(|expected| expected == model_name)
+            .unwrap_or(true)
+        {
+            let similarity = dot_product(query_vec, embed_vec);
+            snippet.similarity = Some(similarity);
+            score += similarity * 12.0;
+        }
+    }
+    snippet.score = Some(score);
+    snippet.metadata = merge_neighbor_metadata(snippet.metadata.take(), neighbor);
+    snippet
+}
+
+fn merge_neighbor_metadata(
+    existing: Option<Value>,
+    neighbor: &BundleEdgeNeighbor,
+) -> Option<Value> {
+    let mut map = match existing {
+        Some(Value::Object(map)) => map,
+        Some(other) => {
+            let mut wrapper = serde_json::Map::new();
+            wrapper.insert("snippet".to_string(), other);
+            wrapper
+        }
+        None => serde_json::Map::new(),
+    };
+
+    map.entry("neighborEdgeId".to_string())
+        .or_insert(Value::String(neighbor.id.clone()));
+    map.entry("neighborType".to_string())
+        .or_insert(Value::String(neighbor.r#type.clone()));
+    map.entry("neighborDirection".to_string())
+        .or_insert(Value::String(
+            match neighbor.direction {
+                NeighborDirection::Incoming => "incoming",
+                NeighborDirection::Outgoing => "outgoing",
+            }
+            .to_string(),
+        ));
+    if let Some(path) = neighbor_file_path(neighbor) {
+        map.entry("neighborPath".to_string())
+            .or_insert(Value::String(path.to_string()));
+    }
+    if let Some(source_path) = neighbor.source_path.as_deref() {
+        map.entry("neighborSourcePath".to_string())
+            .or_insert(Value::String(source_path.to_string()));
+    }
+    if let Some(target_path) = neighbor.target_path.as_deref() {
+        map.entry("neighborTargetPath".to_string())
+            .or_insert(Value::String(target_path.to_string()));
+    }
+    map.entry("neighborSymbolId".to_string())
+        .or_insert(Value::String(neighbor.neighbor.id.clone()));
+    map.entry("neighborSymbolName".to_string())
+        .or_insert(Value::String(neighbor.neighbor.name.clone()));
+    map.entry("neighborSymbolKind".to_string())
+        .or_insert(Value::String(neighbor.neighbor.kind.clone()));
+
+    Some(Value::Object(map))
+}
+
+fn extract_identifier(metadata: &Option<Value>) -> Option<&str> {
+    metadata
+        .as_ref()
+        .and_then(|value| value.get("identifier"))
+        .and_then(Value::as_str)
+}
+
+fn load_snippets(
+    conn: &Connection,
+    path: &str,
+    max_snippets: usize,
+    include_path: bool,
+) -> Vec<BundleSnippet> {
     let mut stmt = match conn.prepare(
         "SELECT chunk_index, content, summary, symbol, identifier, source_type, metadata, embedding_model, embedding, byte_start, byte_end, line_start, line_end, hits \
          FROM file_chunks \
@@ -906,37 +1175,46 @@ fn load_snippets(conn: &Connection, path: &str, max_snippets: usize) -> Vec<Bund
     };
 
     stmt.query_map(params![path, max_snippets as i64], |row| {
-        let metadata_raw: Option<String> = row.get(6)?;
-        let embedding_blob: Vec<u8> = row.get(8)?;
-        let embedding = blob_to_vec(&embedding_blob);
-        Ok(BundleSnippet {
-            source: SnippetSource::Chunk,
-            chunk_index: Some(row.get(0)?),
-            content: row.get(1)?,
-            byte_start: row.get(9)?,
-            byte_end: row.get(10)?,
-            line_start: row.get(11)?,
-            line_end: row.get(12)?,
-            served_count: Some(row.get::<_, i64>(13)?),
-            summary: row.get(2)?,
-            symbol: row.get(3)?,
-            identifier: row.get(4)?,
-            source_type: row.get(5)?,
-            metadata: metadata_raw
-                .as_ref()
-                .and_then(|raw| serde_json::from_str::<Value>(raw).ok()),
-            score: None,
-            similarity: None,
-            embedding_model: row.get(7)?,
-            embedding: if embedding.is_empty() {
-                None
-            } else {
-                Some(embedding)
-            },
-        })
+        snippet_from_row(row, include_path, path)
     })
     .map(|rows| rows.flatten().collect())
     .unwrap_or_default()
+}
+
+fn snippet_from_row(
+    row: &rusqlite::Row<'_>,
+    include_path: bool,
+    path: &str,
+) -> rusqlite::Result<BundleSnippet> {
+    let metadata_raw: Option<String> = row.get(6)?;
+    let embedding_blob: Vec<u8> = row.get(8)?;
+    let embedding = blob_to_vec(&embedding_blob);
+    Ok(BundleSnippet {
+        path: include_path.then(|| path.to_string()),
+        source: SnippetSource::Chunk,
+        chunk_index: Some(row.get(0)?),
+        content: row.get(1)?,
+        byte_start: row.get(9)?,
+        byte_end: row.get(10)?,
+        line_start: row.get(11)?,
+        line_end: row.get(12)?,
+        served_count: row.get(13)?,
+        summary: row.get(2)?,
+        symbol: row.get(3)?,
+        identifier: row.get(4)?,
+        source_type: row.get(5)?,
+        metadata: metadata_raw
+            .as_ref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok()),
+        score: None,
+        similarity: None,
+        embedding_model: row.get(7)?,
+        embedding: if embedding.is_empty() {
+            None
+        } else {
+            Some(embedding)
+        },
+    })
 }
 
 struct CollectSnippetsRequest<'a> {
@@ -976,7 +1254,7 @@ fn collect_snippets(
     let mut seen = HashSet::new();
     let mut order = 0usize;
     let mut push_candidate = |snippet: BundleSnippet, score: f32| {
-        let key = snippet_key(&snippet);
+        let key = snippet_key(&snippet, path);
         if seen.insert(key) {
             candidates.push(Candidate {
                 snippet,
@@ -994,7 +1272,7 @@ fn collect_snippets(
         if let (Some(content), Some(offsets)) = (file_content, line_offsets) {
             for range in ranges {
                 if let Some(snippet) =
-                    build_range_snippet(content, offsets, range.start_line, range.end_line)
+                    build_range_snippet(None, content, offsets, range.start_line, range.end_line)
                 {
                     let mut snippet = snippet;
                     let mut score = 120.0 + snippet_semantic_weight(&snippet.content);
@@ -1064,7 +1342,7 @@ fn collect_snippets(
     let fetch_limit = std::cmp::max(max_snippets, 1)
         .saturating_mul(3)
         .min(MAX_SNIPPET_LIMIT);
-    for mut snippet in load_snippets(conn, path, fetch_limit) {
+    for mut snippet in load_snippets(conn, path, fetch_limit, false) {
         let mut score = 30.0 + snippet_semantic_weight(&snippet.content);
         if let Some(line) = focus_line {
             score += proximity_bonus(&snippet, line);
@@ -1089,7 +1367,7 @@ fn collect_snippets(
     }
 
     if candidates.is_empty() {
-        let mut fallback = load_snippets(conn, path, max_snippets.max(1));
+        let mut fallback = load_snippets(conn, path, max_snippets.max(1), false);
         if fallback.is_empty() {
             warnings.push("No snippets available for the requested file.".to_string());
         } else if had_range_request || focus_line.is_some() {
@@ -1143,9 +1421,11 @@ fn collect_snippets(
     (selected, warnings)
 }
 
-fn snippet_key(snippet: &BundleSnippet) -> String {
+fn snippet_key(snippet: &BundleSnippet, fallback_path: &str) -> String {
+    let path = snippet.path.as_deref().unwrap_or(fallback_path).to_string();
     format!(
-        "{:?}:{:?}:{:?}:{:?}:{:?}",
+        "{}:{:?}:{:?}:{:?}:{:?}:{:?}",
+        path,
         snippet.source,
         snippet.chunk_index,
         snippet.line_start,
@@ -1238,6 +1518,7 @@ fn snippet_line_span(snippet: &BundleSnippet) -> Option<(u32, u32)> {
 }
 
 fn build_range_snippet(
+    path: Option<&str>,
     content: &str,
     offsets: &[usize],
     start_line: u32,
@@ -1274,6 +1555,7 @@ fn build_range_snippet(
     let snippet_content = content[start_byte..end_byte].to_string();
 
     Some(BundleSnippet {
+        path: path.map(|value| value.to_string()),
         source: SnippetSource::Content,
         chunk_index: None,
         content: snippet_content,
@@ -1311,7 +1593,7 @@ fn build_focus_snippet(content: &str, offsets: &[usize], focus_line: u32) -> Opt
         end_line = line_count;
     }
 
-    build_range_snippet(content, offsets, start_line, end_line)
+    build_range_snippet(None, content, offsets, start_line, end_line)
 }
 
 fn snippet_covers_line(snippet: &BundleSnippet, line: u32) -> bool {
@@ -1354,6 +1636,7 @@ fn trim_snippets_to_budget(
     }
 
     struct SnippetEntry {
+        path: Option<String>,
         source: SnippetSource,
         chunk_index: Option<i32>,
         byte_start: Option<i64>,
@@ -1389,6 +1672,7 @@ fn trim_snippets_to_budget(
             let full_tokens = estimate_tokens(&snippet.content);
 
             SnippetEntry {
+                path: snippet.path,
                 source: snippet.source,
                 chunk_index: snippet.chunk_index,
                 byte_start: snippet.byte_start,
@@ -1435,6 +1719,7 @@ fn trim_snippets_to_budget(
 
         fn finalize(self) -> Option<BundleSnippet> {
             let SnippetEntry {
+                path,
                 source,
                 chunk_index,
                 byte_start,
@@ -1465,6 +1750,7 @@ fn trim_snippets_to_budget(
             };
 
             Some(BundleSnippet {
+                path,
                 source,
                 chunk_index,
                 content,
@@ -1766,7 +2052,7 @@ fn build_quick_links(
         links.push(ContextBundleQuickLink {
             r#type: QuickLinkType::RelatedSymbol,
             label: neighbor.neighbor.name.clone(),
-            path: neighbor.neighbor.path.clone(),
+            path: neighbor_file_path(neighbor).map(|path| path.to_string()),
             direction: Some(neighbor.direction),
             symbol_id: Some(neighbor.neighbor.id.clone()),
             symbol_kind: Some(neighbor.neighbor.kind.clone()),
@@ -1801,6 +2087,7 @@ mod tests {
 
     fn build_snippet(content: &str) -> BundleSnippet {
         BundleSnippet {
+            path: None,
             source: SnippetSource::Content,
             chunk_index: Some(0),
             content: content.to_string(),

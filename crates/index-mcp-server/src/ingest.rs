@@ -1283,8 +1283,7 @@ fn ensure_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             range_start INTEGER,
             range_end INTEGER,
             metadata TEXT,
-            hits INTEGER DEFAULT 0,
-            UNIQUE(path, kind, name)
+            hits INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS code_graph_edges (
             id TEXT PRIMARY KEY,
@@ -1298,11 +1297,13 @@ fn ensure_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             FOREIGN KEY (target_id) REFERENCES code_graph_nodes(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS code_graph_nodes_path_idx ON code_graph_nodes(path);
+        CREATE INDEX IF NOT EXISTS code_graph_nodes_lookup_idx ON code_graph_nodes(path, kind, name, range_start, range_end);
         CREATE INDEX IF NOT EXISTS code_graph_edges_source_idx ON code_graph_edges(source_id);
         CREATE INDEX IF NOT EXISTS code_graph_edges_target_idx ON code_graph_edges(target_id);
         "#,
     )?;
     ensure_file_chunks_columns(conn)?;
+    ensure_code_graph_nodes_schema(conn)?;
     Ok(())
 }
 
@@ -1331,6 +1332,89 @@ fn ensure_file_chunks_columns(conn: &Connection) -> Result<(), rusqlite::Error> 
     }
 
     Ok(())
+}
+
+fn ensure_code_graph_nodes_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if !table_exists(conn, "code_graph_nodes")? {
+        return Ok(());
+    }
+
+    if has_unique_code_graph_nodes(conn)? {
+        // Temporarily disable FK enforcement so the table can be rebuilt.
+        conn.execute("PRAGMA foreign_keys = OFF", [])?;
+        let rebuild_result = conn.execute_batch(
+            r#"
+            BEGIN;
+            ALTER TABLE code_graph_nodes RENAME TO code_graph_nodes_backup;
+            CREATE TABLE code_graph_nodes (
+                id TEXT PRIMARY KEY,
+                path TEXT,
+                kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                signature TEXT,
+                range_start INTEGER,
+                range_end INTEGER,
+                metadata TEXT,
+                hits INTEGER DEFAULT 0
+            );
+            INSERT INTO code_graph_nodes (id, path, kind, name, signature, range_start, range_end, metadata, hits)
+            SELECT id, path, kind, name, signature, range_start, range_end, metadata, hits
+            FROM code_graph_nodes_backup;
+            DROP TABLE code_graph_nodes_backup;
+            COMMIT;
+            "#,
+        );
+        let fk_result = conn.execute("PRAGMA foreign_keys = ON", []);
+        if let Err(error) = rebuild_result {
+            let _ = fk_result;
+            return Err(error);
+        }
+        fk_result?;
+    }
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS code_graph_nodes_path_idx ON code_graph_nodes(path)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS code_graph_nodes_lookup_idx ON code_graph_nodes(path, kind, name, range_start, range_end)",
+        [],
+    )?;
+    Ok(())
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool, rusqlite::Error> {
+    let mut stmt =
+        conn.prepare("SELECT COUNT(1) FROM sqlite_master WHERE type = 'table' AND name = ?1")?;
+    let count: i64 = stmt.query_row(params![table], |row| row.get(0))?;
+    Ok(count > 0)
+}
+
+fn has_unique_code_graph_nodes(conn: &Connection) -> Result<bool, rusqlite::Error> {
+    let mut idx_stmt = conn.prepare("PRAGMA index_list('code_graph_nodes')")?;
+    let mut idx_rows = idx_stmt.query([])?;
+    while let Some(row) = idx_rows.next()? {
+        let unique: i64 = row.get(2)?;
+        if unique == 0 {
+            continue;
+        }
+        let origin: Option<String> = row.get(3)?;
+        if origin.as_deref() != Some("u") {
+            continue;
+        }
+        let index_name: String = row.get(1)?;
+        let mut column_stmt = conn.prepare(&format!("PRAGMA index_info('{index_name}')"))?;
+        let column_rows = column_stmt.query_map([], |row| row.get::<_, String>(2))?;
+        let mut columns = Vec::new();
+        for column in column_rows {
+            columns.push(column?);
+        }
+        if columns == ["path", "kind", "name"] {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn load_existing_files(
