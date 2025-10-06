@@ -1532,6 +1532,18 @@ fn build_repository_timeline_result(
             .push_str(" Diffs cached in SQLite; call repository_timeline_entry for full output.");
     }
 
+    if response
+        .entries
+        .iter()
+        .any(|entry| entry.file_changes_truncated)
+    {
+        summary.push_str(" File change lists truncated to protect token budgets.");
+    }
+
+    if response.entries.iter().any(|entry| entry.diff_truncated) {
+        summary.push_str(" Diff payloads truncated to protect token budgets.");
+    }
+
     let value: Value = serde_json::to_value(&response).map_err(|error| {
         McpError::internal_error(
             format!("Failed to serialize repository timeline result: {error}"),
@@ -1552,10 +1564,14 @@ fn build_repository_timeline_entry_result(
 ) -> Result<CallToolResult, McpError> {
     let diff_len = response.diff.as_ref().map(|diff| diff.len()).unwrap_or(0);
     let summary = if diff_len > 0 {
-        format!(
+        let mut text = format!(
             "repository_timeline_entry: retrieved diff for commit {} ({} bytes cached).",
             response.entry.sha, diff_len
-        )
+        );
+        if response.entry.diff_truncated {
+            text.push_str(" Diff truncated to protect token budgets.");
+        }
+        text
     } else {
         format!(
             "repository_timeline_entry: no diff stored for commit {}.",

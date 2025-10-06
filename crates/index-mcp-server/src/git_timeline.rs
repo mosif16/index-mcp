@@ -14,9 +14,18 @@ use crate::index_status::DEFAULT_DB_FILENAME;
 
 const GIT_LOG_FIELD_SEPARATOR: &str = "\u{001f}";
 const GIT_LOG_RECORD_SEPARATOR: &str = "\u{001e}";
-const DIFF_PREVIEW_MAX_LINES: usize = 200;
-const DIFF_PREVIEW_MAX_CHARS: usize = 4_000;
-const MAX_REPOSITORY_TIMELINE_LIMIT: u32 = 200;
+const DIFF_PREVIEW_MAX_LINES: usize = 60;
+const DIFF_PREVIEW_MAX_CHARS: usize = 1_600;
+const MAX_REPOSITORY_TIMELINE_LIMIT: u32 = 3;
+const MAX_FILE_CHANGES_PER_ENTRY: usize = 25;
+const STORED_DIFF_MAX_LINES: usize = 200;
+const STORED_DIFF_MAX_CHARS: usize = 8_000;
+const DIFF_TRUNCATION_SUFFIX: &str = "\n…\n[diff truncated due to repository_timeline limits]";
+
+#[inline]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 static RELATIVE_SINCE_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^(\d+)\s*(d|w|m|y)$").expect("valid regex"));
@@ -113,6 +122,10 @@ pub struct RepositoryTimelineEntry {
     pub diff_preview: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff_pointer: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub file_changes_truncated: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub diff_truncated: bool,
     pub top_files: Vec<RepositoryTimelineTopFile>,
     pub directory_churn: Vec<RepositoryTimelineDirectoryChurn>,
     pub diff_summary: RepositoryTimelineDiffSummary,
@@ -237,7 +250,7 @@ fn perform_repository_timeline(
 
     let branch_name = branch.unwrap_or_else(|| "HEAD".to_string());
 
-    let requested_limit = limit.unwrap_or(20);
+    let requested_limit = limit.unwrap_or(MAX_REPOSITORY_TIMELINE_LIMIT);
     let limit_value = requested_limit.clamp(1, MAX_REPOSITORY_TIMELINE_LIMIT);
 
     let log_output = run_git_log(
@@ -378,6 +391,15 @@ fn fetch_repository_timeline_entry(
     };
 
     let mut entry: RepositoryTimelineEntry = serde_json::from_str(&payload)?;
+
+    let (diff, truncated_on_load) = match diff {
+        Some(diff_text) => {
+            let (normalized, truncated) = enforce_diff_limits(&diff_text);
+            (Some(normalized), truncated)
+        }
+        None => (None, false),
+    };
+
     let diff_preview = diff.as_ref().map(|value| build_diff_preview(value));
     let diff_pointer = diff
         .as_ref()
@@ -387,6 +409,9 @@ fn fetch_repository_timeline_entry(
     entry.diff_preview = diff_preview;
     entry.diff_pointer = diff.as_ref().map(|_| commit_sha.clone());
     entry.captured_at = Some(captured_at);
+    if truncated_on_load {
+        entry.diff_truncated = true;
+    }
 
     Ok(RepositoryTimelineEntryLookupResponse {
         database_path: db_path_string,
@@ -578,6 +603,8 @@ fn parse_git_log(
         let mut deletions = 0i64;
         let mut file_changes = Vec::new();
         let mut diff_start_index: Option<usize> = None;
+        let mut file_changes_truncated = false;
+        let mut diff_truncated = false;
 
         if include_file_stats {
             for (index, raw_line) in stat_lines.iter().enumerate() {
@@ -624,18 +651,24 @@ fn parse_git_log(
             }
         }
 
+        let total_file_changes = file_changes.len();
+
         let diff = if include_diffs {
             let start_index = diff_start_index.or_else(|| {
                 stat_lines
                     .iter()
                     .position(|line| line.starts_with("diff --git "))
             });
+
             start_index.and_then(|index| {
-                let patch_text = stat_lines[index..].join("\n").trim().to_string();
-                if patch_text.is_empty() {
+                let patch_text = stat_lines[index..].join("\n");
+                let trimmed_patch = patch_text.trim();
+                if trimmed_patch.is_empty() {
                     None
                 } else {
-                    Some(patch_text)
+                    let (normalized, truncated) = enforce_diff_limits(trimmed_patch);
+                    diff_truncated = truncated;
+                    Some(normalized)
                 }
             })
         } else {
@@ -654,8 +687,13 @@ fn parse_git_log(
             Vec::new()
         };
 
+        if include_file_stats && file_changes.len() > MAX_FILE_CHANGES_PER_ENTRY {
+            file_changes_truncated = true;
+            file_changes.truncate(MAX_FILE_CHANGES_PER_ENTRY);
+        }
+
         let diff_summary = RepositoryTimelineDiffSummary {
-            files_changed: file_changes.len(),
+            files_changed: total_file_changes,
             insertions,
             deletions,
             net: insertions - deletions,
@@ -681,13 +719,15 @@ fn parse_git_log(
             parents,
             is_merge,
             pull_request_number,
-            files_changed: file_changes.len(),
+            files_changed: total_file_changes,
             insertions,
             deletions,
             file_changes,
             diff,
             diff_preview: None,
             diff_pointer: None,
+            file_changes_truncated,
+            diff_truncated,
             top_files,
             directory_churn,
             diff_summary,
@@ -697,6 +737,20 @@ fn parse_git_log(
         };
 
         entry.highlights = build_highlights(&entry);
+
+        if entry.file_changes_truncated {
+            entry.highlights.push(format!(
+                "File change list truncated to first {} entries.",
+                MAX_FILE_CHANGES_PER_ENTRY
+            ));
+        }
+
+        if entry.diff_truncated {
+            entry.highlights.push(format!(
+                "Diff truncated to {} lines / {} chars.",
+                STORED_DIFF_MAX_LINES, STORED_DIFF_MAX_CHARS
+            ));
+        }
 
         entries.push(entry);
     }
@@ -873,6 +927,53 @@ fn build_diff_preview(diff: &str) -> String {
     }
 
     preview
+}
+
+fn enforce_diff_limits(diff: &str) -> (String, bool) {
+    if diff.is_empty() {
+        return (String::new(), false);
+    }
+
+    let mut truncated = false;
+    let mut char_count = 0usize;
+    let mut result = String::new();
+
+    for (index, segment) in diff.split_inclusive('\n').enumerate() {
+        if index >= STORED_DIFF_MAX_LINES {
+            truncated = true;
+            break;
+        }
+
+        let segment_chars = segment.chars().count();
+        if char_count + segment_chars > STORED_DIFF_MAX_CHARS {
+            let remaining = STORED_DIFF_MAX_CHARS.saturating_sub(char_count);
+            if remaining > 0 {
+                let mut partial = String::new();
+                for ch in segment.chars().take(remaining) {
+                    partial.push(ch);
+                }
+                result.push_str(&partial);
+            }
+            truncated = true;
+            break;
+        }
+
+        result.push_str(segment);
+        char_count += segment_chars;
+    }
+
+    if !truncated && result.len() == diff.len() {
+        return (result, false);
+    }
+
+    if truncated {
+        if !result.ends_with('\n') {
+            result.push('\n');
+        }
+        result.push_str(DIFF_TRUNCATION_SUFFIX);
+    }
+
+    (result, truncated)
 }
 
 fn transform_entries_for_response(
