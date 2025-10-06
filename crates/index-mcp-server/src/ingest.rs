@@ -12,6 +12,7 @@ use once_cell::sync::{Lazy, OnceCell};
 use rmcp::schemars::{self, JsonSchema};
 use rusqlite::{params, Connection, OpenFlags, Transaction};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -19,6 +20,7 @@ use uuid::Uuid;
 use crate::{
     graph::{extract_graph, GraphExtraction},
     index_status::DEFAULT_DB_FILENAME,
+    search::detect_language,
 };
 
 pub(crate) const DEFAULT_INCLUDE_GLOBS: &[&str] = &["**/*"];
@@ -118,6 +120,14 @@ pub struct IngestResponse {
     pub duration_ms: u128,
     pub embedded_chunk_count: usize,
     pub embedding_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_dimension: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_latency_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_quantized: Option<bool>,
     pub graph_node_count: usize,
     pub graph_edge_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -161,12 +171,86 @@ struct ChunkFragment {
     line_end: u32,
 }
 
+fn annotate_chunks_with_graph(records: &mut [ChunkRecord], extraction: &GraphExtraction) {
+    for record in records.iter_mut() {
+        let (Some(chunk_start), Some(chunk_end)) = (record.byte_start, record.byte_end) else {
+            continue;
+        };
+
+        let best = extraction
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.range_start
+                    .zip(node.range_end)
+                    .map(|(start, end)| {
+                        start <= chunk_end
+                            && end >= chunk_start
+                            && !matches!(node.kind.as_str(), "file" | "symbol")
+                    })
+                    .unwrap_or(false)
+            })
+            .min_by(|a, b| {
+                let a_span = span_len(a.range_start, a.range_end);
+                let b_span = span_len(b.range_start, b.range_end);
+                a_span.cmp(&b_span)
+            });
+
+        let Some(node) = best else {
+            continue;
+        };
+
+        if record.symbol.is_none() {
+            record.symbol = Some(node.name.clone());
+        }
+        if record.identifier.is_none() {
+            record.identifier = Some(node.id.clone());
+        }
+        if record.summary.is_none() {
+            record.summary = node.signature.clone().or_else(|| Some(node.name.clone()));
+        }
+
+        let mut metadata = Map::new();
+        metadata.insert("kind".to_string(), json!(node.kind));
+        if let Some(signature) = node.signature.as_ref() {
+            metadata.insert("signature".to_string(), json!(signature));
+        }
+        if let Some(path) = node.path.as_ref() {
+            metadata.insert("path".to_string(), json!(path));
+        }
+        if let Some(range_start) = node.range_start {
+            metadata.insert("rangeStart".to_string(), json!(range_start));
+        }
+        if let Some(range_end) = node.range_end {
+            metadata.insert("rangeEnd".to_string(), json!(range_end));
+        }
+        if let Some(extra) = node.metadata.as_ref() {
+            metadata.insert("graphMetadata".to_string(), extra.clone());
+        }
+
+        record.metadata = Some(Value::Object(metadata));
+    }
+}
+
+fn span_len(start: Option<i64>, end: Option<i64>) -> i64 {
+    match (start, end) {
+        (Some(s), Some(e)) if e >= s => e - s,
+        _ => i64::MAX,
+    }
+}
+
 #[derive(Debug)]
 struct ChunkRecord {
     id: String,
     path: String,
     chunk_index: i32,
     content: String,
+    summary: Option<String>,
+    symbol: Option<String>,
+    identifier: Option<String>,
+    source_type: Option<String>,
+    language: Option<String>,
+    metadata: Option<Value>,
     byte_start: Option<i64>,
     byte_end: Option<i64>,
     line_start: Option<i64>,
@@ -389,11 +473,22 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
                 if !fragments.is_empty() {
                     let entry = chunk_records_by_path.entry(path.clone()).or_default();
                     for (index, fragment) in fragments.into_iter().enumerate() {
+                        let summary = fragment.content.lines().find_map(|line| {
+                            let trimmed = line.trim();
+                            (!trimmed.is_empty()).then(|| trimmed.to_string())
+                        });
+                        let language = detect_language(&path);
                         entry.push(ChunkRecord {
                             id: format!("{}:{}", path, index),
                             path: path.clone(),
                             chunk_index: index as i32,
                             content: fragment.content,
+                            summary,
+                            symbol: None,
+                            identifier: None,
+                            source_type: Some("code".to_string()),
+                            language,
+                            metadata: None,
                             byte_start: Some(fragment.byte_start as i64),
                             byte_end: Some(fragment.byte_end as i64),
                             line_start: Some(fragment.line_start as i64),
@@ -408,6 +503,12 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
             if let Some(extraction) = extract_graph(&path, text) {
                 graph_records.insert(path.clone(), extraction);
             }
+        }
+    }
+
+    for (path, records) in chunk_records_by_path.iter_mut() {
+        if let Some(extraction) = graph_records.get(path) {
+            annotate_chunks_with_graph(records, extraction);
         }
     }
 
@@ -449,6 +550,19 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
         finished_ms,
     )?;
 
+    let mut graph_node_count = 0usize;
+    let mut graph_edge_count = 0usize;
+    let mut embedded_chunk_count = 0usize;
+    let mut embedding_model_output: Option<String> = None;
+    let mut embedding_backend_output: Option<String> = None;
+    let mut embedding_dimension_output: Option<u32> = None;
+    let mut embedding_latency_ms: Option<u128> = None;
+    let embedding_quantized_flag = if embedding_config.enabled {
+        Some(is_quantized_model(&embedding_config.model_variant))
+    } else {
+        None
+    };
+
     if !paths_to_clear.is_empty() {
         let mut delete_chunks_stmt =
             transaction.prepare("DELETE FROM file_chunks WHERE path = ?1")?;
@@ -459,10 +573,6 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
             delete_nodes_stmt.execute(params![path])?;
         }
     }
-
-    let mut graph_node_count = 0usize;
-    let mut graph_edge_count = 0usize;
-
     if !graph_records.is_empty() {
         let mut insert_node_stmt = transaction.prepare(
             "INSERT OR REPLACE INTO code_graph_nodes (id, path, kind, name, signature, range_start, range_end, metadata)
@@ -515,14 +625,13 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
         }
     }
 
-    let mut embedded_chunk_count = 0usize;
-    let mut embedding_model_output: Option<String> = None;
-
     if embedding_config.enabled && !chunk_locations.is_empty() {
         let embedder = get_or_create_embedder(&embedding_config)?;
         let mut guard = embedder.lock().map_err(|error| {
             IngestError::Embedding(format!("failed to acquire embedder: {error}"))
         })?;
+
+        let embedding_start = Instant::now();
 
         let stream_batch_size = embedding_config
             .batch_size
@@ -548,6 +657,9 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
                 .map_err(|error| IngestError::Embedding(error.to_string()))?;
 
             for (offset, embedding_vec) in embeddings.into_iter().enumerate() {
+                if embedding_dimension_output.is_none() {
+                    embedding_dimension_output = Some(embedding_vec.len() as u32);
+                }
                 let (path, record_index) = &chunk_locations[batch_start + offset];
                 if let Some(records) = chunk_records_by_path.get_mut(path) {
                     if let Some(record) = records.get_mut(*record_index) {
@@ -559,9 +671,18 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
             batch_start = batch_end;
         }
 
+        if embedding_backend_output.is_none() {
+            let backend = if embedding_quantized_flag.unwrap_or(false) {
+                "onnx-quantized"
+            } else {
+                "onnx"
+            };
+            embedding_backend_output = Some(backend.to_string());
+        }
+
         let mut insert_stmt = transaction.prepare(
-            "INSERT INTO file_chunks (id, path, chunk_index, content, embedding, embedding_model, byte_start, byte_end, line_start, line_end)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+            "INSERT INTO file_chunks (id, path, chunk_index, content, summary, symbol, identifier, source_type, language, metadata, embedding, embedding_model, byte_start, byte_end, line_start, line_end)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
         )?;
 
         for records in chunk_records_by_path.values() {
@@ -573,6 +694,15 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
                         &record.path,
                         record.chunk_index,
                         &record.content,
+                        &record.summary,
+                        &record.symbol,
+                        &record.identifier,
+                        &record.source_type,
+                        &record.language,
+                        record
+                            .metadata
+                            .as_ref()
+                            .and_then(|value| serde_json::to_string(value).ok()),
                         blob,
                         &embedding_config.model,
                         record.byte_start,
@@ -588,6 +718,31 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
         if embedded_chunk_count > 0 {
             embedding_model_output = Some(embedding_config.model.clone());
         }
+
+        embedding_latency_ms = Some(embedding_start.elapsed().as_millis());
+    }
+
+    if let Some(model) = &embedding_model_output {
+        upsert_meta(&transaction, "embedding_model", model, finished_ms)?;
+    }
+    if let Some(backend) = &embedding_backend_output {
+        upsert_meta(&transaction, "embedding_backend", backend, finished_ms)?;
+    }
+    if let Some(dimension) = embedding_dimension_output {
+        upsert_meta(
+            &transaction,
+            "embedding_dimension",
+            &dimension.to_string(),
+            finished_ms,
+        )?;
+    }
+    if let Some(quantized) = embedding_quantized_flag {
+        upsert_meta(
+            &transaction,
+            "embedding_quantized",
+            if quantized { "true" } else { "false" },
+            finished_ms,
+        )?;
     }
 
     transaction.commit()?;
@@ -621,6 +776,10 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
         duration_ms,
         embedded_chunk_count,
         embedding_model: embedding_model_output,
+        embedding_backend: embedding_backend_output,
+        embedding_dimension: embedding_dimension_output,
+        embedding_latency_ms,
+        embedding_quantized: embedding_quantized_flag,
         graph_node_count,
         graph_edge_count,
         evicted: eviction_report,
@@ -1084,6 +1243,12 @@ fn ensure_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             path TEXT NOT NULL,
             chunk_index INTEGER NOT NULL,
             content TEXT NOT NULL,
+            summary TEXT,
+            symbol TEXT,
+            identifier TEXT,
+            source_type TEXT,
+            language TEXT,
+            metadata TEXT,
             embedding BLOB NOT NULL,
             embedding_model TEXT NOT NULL,
             byte_start INTEGER,
@@ -1136,7 +1301,36 @@ fn ensure_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS code_graph_edges_source_idx ON code_graph_edges(source_id);
         CREATE INDEX IF NOT EXISTS code_graph_edges_target_idx ON code_graph_edges(target_id);
         "#,
-    )
+    )?;
+    ensure_file_chunks_columns(conn)?;
+    Ok(())
+}
+
+fn ensure_file_chunks_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let mut existing = HashSet::new();
+    let mut pragma_stmt = conn.prepare("PRAGMA table_info(file_chunks)")?;
+    let rows = pragma_stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for column in rows {
+        existing.insert(column?);
+    }
+
+    let desired = [
+        ("summary", "TEXT"),
+        ("symbol", "TEXT"),
+        ("identifier", "TEXT"),
+        ("source_type", "TEXT"),
+        ("language", "TEXT"),
+        ("metadata", "TEXT"),
+    ];
+
+    for (name, ty) in desired {
+        if !existing.contains(name) {
+            let sql = format!("ALTER TABLE file_chunks ADD COLUMN {name} {ty}");
+            conn.execute(&sql, [])?;
+        }
+    }
+
+    Ok(())
 }
 
 fn load_existing_files(

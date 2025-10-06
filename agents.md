@@ -24,116 +24,60 @@ If any command cannot be executed, explain why in the final response and highlig
 
 ## Agent Policy — Tool Chaining for Efficient, Context‑Aware Workflows
 
-**Purpose:** Define the *mandatory* chain of MCP tools that agents must follow to stay fast, fresh, and token‑efficient while maintaining accurate context. This policy removes ambiguity about which tool runs first, which tool routes follow‑ups, and how to keep the index authoritative.
+### Detailed Tool Chaining Playbook
+**Purpose**
+- Translate high-level policy into an actionable, auditable workflow that every agent can follow without improvisation.
+- Surface the minimum telemetry to prove compliance (timestamps, tool order, token budgets).
+- Define recovery paths when a link in the chain fails (missing index, stale cache, sandbox denials).
 
----
+**Preflight Checklist (run once per task)**
+1. Confirm `cwd` points to the active workspace root; export `INDEX_MCP_ROOT` if your client supports it.  
+2. Set or verify `INDEX_MCP_BUDGET_TOKENS` (default 3_500).  
+3. Ensure no outstanding edits need ingestion; if unsure, re-run `ingest_codebase` before touching anything else.  
+4. Capture the ticket goal in your scratchpad so you can reference it in tool call notes.  
+5. If the task touches Supabase, pause and obtain explicit user approval before continuing.
 
-### Tool Roles (authoritative)
+**Canonical Flow With Guardrails**
+| Step | Tool | Mandatory Inputs | Expected Output | Failure Recovery |
+| --- | --- | --- | --- | --- |
+| 1 | `index_status` | `root`, `databaseName` | Freshness + commit SHA | If `isStale` or SHA mismatch → run Step 2 immediately. |
+| 2 | `ingest_codebase` | Same root; optional include/exclude | Ingestion summary, chunk counts | On failure → inspect stderr, resolve permissions, retry; do not advance until it succeeds. |
+| 3 | `index_status` (confirm) | Same as Step 1 | `isStale=false` confirmation | If still stale → re-ingest with narrower include list or check for git HEAD changes. |
+| 4 | `semantic_search` | Focused query text | Ranked hits + tool suggestions | If zero hits → tighten keywords, add file hints, or broaden query. |
+| 5 | Follow suggestion | Typically `context_bundle` or `code_lookup` | Focused snippets respecting budget | If bundle empty → verify file indexed, rerun with ranges/focus line. |
+| 6 | Optional refinements | Repeat Steps 4-5 with narrower scope | Additional evidence | Stop once you have cited material; avoid redundant bundles. |
+| 7 | Action phase | `shell` edits/tests or MCP write tool | Code changes + validation logs | After edits → re-run Step 2 to refresh the index. |
+| 8 | Post-change `index_status` | Same as Step 1 | Green status | If stale → ingestion drift likely; rerun Step 2. |
+| 9 | Final Ops Log | N/A | Ordered list of tool calls + context usage | Required in every final reply. |
 
-| Tool / Prompt | Role & Routing | Notes |
-|---|---|---|
-| `ingest_codebase` | **Index priming & updates** | Always pass **absolute** `root` (e.g., `/Users/.../repo`). Honor `.gitignore`. Skip files **> 8 MiB**. Tune `autoEvict`/`maxDatabaseSizeBytes`. Prefer `--watch` when available. |
-| `index_status` | **Freshness gate** | Call before planning/answering. If `isStale` or HEAD moved, **re‑ingest** before continuing. |
-| `repository_timeline` | **Recent history brief** | Summarize latest commits & churn to steer exploration. |
-| `repository_timeline_entry` | **Deep dive commit** | Fetch cached details/diffs for a specific SHA when planning changes. |
-| `semantic_search` | **Primary discovery tool** | **Start here for exploration.** Embedding‑powered retrieval with ranked suggestions. Use to find concepts, behaviors, or entry points before deeper context assembly. |
-| `code_lookup` | **Routing & orchestration** | Router tool: `mode="search"` mirrors semantic search + suggestions; `mode="bundle"` fetches focused context. Use after initial discovery to assemble targeted context. |
-| `context_bundle` | **Compact, focused context** | Assemble trimmed, cited snippets for selected files/symbols. Always set `budgetTokens` (or `INDEX_MCP_BUDGET_TOKENS`). Called directly or via `code_lookup` bundles. |
-| `indexing_guidance` / `indexing_guidance_tool` | Operational reminders | Use for quick diagnostics and best‑practice prompts. |
-| `info` | Diagnostics | Environment/runtime metadata and sanity checks. |
+**Decision Triggers**
+- Need repo history? Call `repository_timeline` **only after** Step 3, and scope `limit` ≤ 5.
+- Need symbol-specific context? Use `code_lookup` with `mode="bundle"` and `symbol` populated; avoid manual globbing.
+- Exhausted local context? Document what is missing, then run `tavily-search` with explicit citations in your response.
+- Encounter sandbox denial? Retry the same command with `with_escalated_permissions=true` and a one-sentence justification, unless policy is `never` (default here).
 
-> **Design principle:** `semantic_search` discovers the space; `code_lookup` orchestrates follow‑ups; `context_bundle` assembles the final payload.
+**Telemetry You Must Track**
+- Timestamp each tool call in your scratchpad (HH:MM local is sufficient).  
+- Record token budgets requested vs. consumed (see `context_bundle` response `usage`).  
+- Capture any warnings returned by tools; echo them in the final Operation Log so the user can act.
 
----
+**Failure Recovery Patterns**
+- `semantic_search` returns outdated paths → rerun Steps 2-3, then repeat the query.  
+- `context_bundle` omits expected symbols → pass `focusLine` or `ranges`, or confirm the symbol via `code_lookup mode="search"`.  
+- Tool request rejected (Supabase/no approval) → stop and request direction; never attempt alternative credentials.  
+- Embedder missing → note the failure, fall back to lexical search (`code_lookup mode="search"`), and call it out in the Operation Log.
 
-### Mandatory Tool Chain (do not deviate)
+**Example Session (abbreviated)**
+1. `index_status {"root":".","databaseName":"default"}` → stale.  
+2. `ingest_codebase {"root":".","databaseName":"default"}` → 643 chunks ingested.  
+3. `index_status {"root":".","databaseName":"default"}` → fresh.  
+4. `semantic_search {"query":"ingest pipeline error","limit":5}` → suggestions include a `context_bundle` for `src/ingest.rs`.  
+5. `context_bundle {"file":"crates/index-mcp-server/src/ingest.rs","focusLine":520,"budgetTokens":2000}` → snippet confirms suspected regression.  
+6. `shell` command (`cargo test --all --all-targets`) → reproduces failure locally.  
+7. Apply fix, then rerun `ingest_codebase` and `index_status` to refresh the index.  
+8. Compile Operation Log summarizing steps, budgets, warnings, and validation status.
 
-**Step 0 — Workspace root & budgets**  
-- Always compute the **absolute** workspace root and reuse it for every call.  
-- Set `INDEX_MCP_BUDGET_TOKENS` globally (start around **3000–4000** for bundles).  
-- Never dump whole files; aim for minimal, cited snippets.
-
-**Step 1 — Prime the index**  
-Run `ingest_codebase {"root": "{ABSOLUTE_ROOT}"}` (or enable `--watch`). Respect `.gitignore`. Skip files > 8 MiB. Tune `autoEvict`/`maxDatabaseSizeBytes` before the SQLite file balloons.
-
-**Step 2 — Freshness gate**  
-Call `index_status`. If `isStale: true` **or** HEAD moved: run `ingest_codebase` again, then recheck `index_status`.
-
-**Step 3 — Brief on recent changes**  
-Call `repository_timeline` (optionally `repository_timeline_entry` for SHAs that matter). Use this to aim your first search at what recently changed.
-
-**Step 4 — Discover with semantic search (start exploration here)**  
-Call `semantic_search` with `query="..."` to get lightweight hit summaries and ranked follow‑up suggestions. Review the suggested tool chain before proceeding.
-
-**Step 5 — Execute guided follow‑ups**  
-Use the auto‑generated suggestions from `semantic_search` results:
-- Execute suggested `context_bundle` payloads for focused context assembly, or
-- Use suggested `code_lookup` calls to route into deeper exploration, or
-- Follow suggested `repository_timeline` links for change context.
-
-**Step 6 — Assemble focused bundles via router**  
-When ready for detailed context, call `code_lookup` with `mode="bundle"`, `file="..."`, and optional `symbol="..."` to get compact, budgeted snippets. Pass `budgetTokens` or rely on `INDEX_MCP_BUDGET_TOKENS`.
-
-**Step 7 — Fill gaps intelligently**  
-If bundles miss details, either:  
-- Refine the **semantic search** query with tighter terms, or  
-- Use `code_lookup` with `mode="search"` to mirror search + suggestions, or
-- Run additional narrowly scoped `semantic_search` for cross‑checking patterns.
-
-**Step 8 — Assemble answer payload**  
-Prefer **one** final `context_bundle` (direct or via `code_lookup` bundle mode) with tight `budgetTokens`. Include **file path + line range** citations. Avoid overlapping or duplicate spans.
-
-**Step 9 — After edits**  
-Once code changes are applied (outside the scope of this toolchain), immediately re‑run `ingest_codebase` (or rely on `--watch`) and confirm with `index_status` so subsequent steps see the updated code.
-
-**Step 10 — Deliver**  
-Answer concisely. Provide citations. No full‑file dumps. If more detail is requested, iterate Steps 4–8 with stricter targeting.
-
----
-
-### Chain Recipes (copy‑driven playbooks)
-
-**A) Understand a feature or bug surface**
-1. `index_status` → gate  
-2. `repository_timeline` → recent churn  
-3. `semantic_search query="{feature|bug}"` → ranked hits + suggestions  
-4. Execute suggested `context_bundle` or `code_lookup` payloads (budgeted)  
-5. (Optional) Additional `semantic_search` for confirming patterns  
-6. Final bundle → answer w/ citations
-
-**B) Locate implementation & prepare minimal context**
-1. `semantic_search query="{domain phrase}"` → hits + suggestions  
-2. Follow suggested `context_bundle` with `file="..." symbol?` → focused snippets  
-3. If incomplete: refine `semantic_search query`; use `code_lookup mode="search"` for routing  
-4. Final bundle with line‑precise citations
-
-**C) Post‑change refresh**
-1. Re‑run `ingest_codebase` or rely on `--watch`  
-2. `index_status` must be green  
-3. Resume at **Step 4** for the next task
-
----
-
-### Budget & Precision Heuristics
-- Start bundles at **3–4k tokens**; raise only when strictly necessary.  
-- Prefer multiple **small** bundles over one giant context.  
-- De‑duplicate overlapping snippets and collapse near‑adjacent ranges.  
-- Prefer files touched in the **recent timeline** when ranking equal options.  
-- If a query is noisy, tighten terms or add an expected symbol/type.
-- Let `semantic_search` suggestions guide the next tool hop instead of immediately fetching large bundles.
-
----
-
-### Strict Prohibitions
-- Do **not** bypass `semantic_search` discovery; always scout before assembling context.  
-- Do **not** dump entire files.  
-- Do **not** ignore token budgets or warnings.  
-- Do **not** proceed with stale indexes.  
-- Do **not** use external shells/interactive editors in place of MCP tools.
-- Do **not** skip the suggested follow‑ups from `semantic_search` results.
-
----
-
-### Compliance
-All agents must follow this chain. Deviations reduce accuracy and waste tokens. When uncertain, **start with `semantic_search`**, follow its suggestions, keep context compact, and re‑check freshness.
-
+**Final Message Requirements**
+- Cite every file/line referenced using repository-relative paths.  
+- Include the ordered tool list, token budgets, and key evidence in an Operation Log section.  
+- If any mandated step could not run, say why and suggest follow-ups.

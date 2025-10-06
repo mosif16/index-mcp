@@ -698,6 +698,7 @@ impl IndexMcpService {
                     budget_tokens,
                     ranges,
                     focus_line,
+                    query: None,
                 };
                 self.environment.apply_bundle_defaults(&mut bundle_params);
 
@@ -1568,7 +1569,10 @@ mod tests {
     };
     use crate::index_status::{IndexStatusIngestion, IndexStatusResponse};
     use crate::ingest::IngestResponse;
-    use crate::search::{Classification, SemanticSearchMatch, SemanticSearchResponse};
+    use crate::search::{
+        Classification, SearchDiagnostics, SearchSource, SemanticSearchMatch,
+        SemanticSearchResponse,
+    };
     use serde_json::json;
 
     #[test]
@@ -1583,6 +1587,10 @@ mod tests {
             duration_ms: 1_500,
             embedded_chunk_count: 42,
             embedding_model: Some("Xenova/all-MiniLM-L6-v2".into()),
+            embedding_backend: Some("onnx".into()),
+            embedding_dimension: Some(384),
+            embedding_latency_ms: Some(250),
+            embedding_quantized: Some(false),
             graph_node_count: 0,
             graph_edge_count: 0,
             evicted: None,
@@ -1669,6 +1677,15 @@ mod tests {
                 line_start: Some(1),
                 line_end: Some(1),
                 served_count: None,
+                summary: None,
+                symbol: None,
+                identifier: None,
+                source_type: None,
+                metadata: None,
+                score: None,
+                similarity: None,
+                embedding_model: None,
+                embedding: None,
             }],
             latest_ingestion: None,
             warnings: vec!["No graph metadata".into()],
@@ -1691,6 +1708,7 @@ mod tests {
                 summary_snippets: 0,
                 cache_hit: false,
             },
+            diagnostics: None,
         };
 
         let summary = summarize_bundle(&bundle);
@@ -1727,9 +1745,17 @@ mod tests {
                 line_end: Some(45),
                 context_before: None,
                 context_after: None,
+                source: SearchSource::Embedding,
+                summary: None,
+                symbol: None,
+                identifier: None,
+                source_type: None,
+                metadata: None,
+                confidence: 0.87,
             }],
             summary_mode: SummaryMode::Brief,
             suggested_tools: Vec::new(),
+            diagnostics: None,
         };
 
         let summary = crate::search::summarize_semantic_search(&response);
@@ -1737,7 +1763,56 @@ mod tests {
         assert!(summary.contains(
             "Semantic search scanned 250 chunk(s) and returned 1 match(es) (model custom-model)."
         ));
-        assert!(summary.contains("Top hit: src/main.rs#L42 (score 0.87)."));
+        assert!(summary.contains("Top hit: src/main.rs#L42 (confidence 0.87)."));
+    }
+
+    #[test]
+    fn summarize_semantic_search_reports_lexical_hits_and_confidence() {
+        let response = SemanticSearchResponse {
+            database_path: "db.sqlite".into(),
+            database_name: Some("db.sqlite".into()),
+            embedding_model: Some("custom-model".into()),
+            total_chunks: 200,
+            evaluated_chunks: 150,
+            results: vec![SemanticSearchMatch {
+                path: "src/main.rs".into(),
+                chunk_index: 0,
+                score: 1.0,
+                normalized_score: 0.92,
+                language: Some("Rust".into()),
+                classification: Classification::Function,
+                content: "fn example() {}".into(),
+                embedding_model: "custom-model".into(),
+                byte_start: Some(10),
+                byte_end: Some(20),
+                line_start: Some(44),
+                line_end: Some(47),
+                context_before: None,
+                context_after: None,
+                source: SearchSource::Lexical,
+                summary: None,
+                symbol: None,
+                identifier: None,
+                source_type: None,
+                metadata: None,
+                confidence: 0.92,
+            }],
+            summary_mode: SummaryMode::Brief,
+            suggested_tools: Vec::new(),
+            diagnostics: Some(SearchDiagnostics {
+                total_latency_ms: 25,
+                lexical_latency_ms: Some(5),
+                ..Default::default()
+            }),
+        };
+
+        let summary = crate::search::summarize_semantic_search(&response);
+
+        assert!(summary.contains(
+            "Semantic search scanned 150 chunk(s) and returned 1 match(es) (model custom-model)."
+        ));
+        assert!(summary.contains("1 lexical match(es) promoted ahead of semantic ranks."));
+        assert!(summary.contains("Top hit: src/main.rs#L44 (confidence 0.92)."));
     }
 
     #[test]
@@ -1770,9 +1845,17 @@ mod tests {
                 line_end: Some(44),
                 context_before: None,
                 context_after: None,
+                source: SearchSource::Embedding,
+                summary: None,
+                symbol: None,
+                identifier: None,
+                source_type: None,
+                metadata: None,
+                confidence: 0.82,
             }],
             summary_mode: SummaryMode::Brief,
             suggested_tools: Vec::new(),
+            diagnostics: None,
         };
 
         let suggestions = build_search_suggestions(&snapshot, &response);

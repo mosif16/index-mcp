@@ -52,3 +52,4 @@ temp/
 *.orig
 .fastembed_cache
 full.json
+default

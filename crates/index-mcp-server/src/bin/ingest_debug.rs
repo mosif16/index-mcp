@@ -646,6 +646,7 @@ async fn run_context_bundle(
         budget_tokens: Some(config.budget_tokens),
         ranges: None,
         focus_line: None,
+        query: None,
     };
 
     context_bundle(params).await

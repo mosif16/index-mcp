@@ -6,12 +6,12 @@ The project previously shipped a Node/TypeScript runtime. That implementation ha
 
 ## Key Capabilities
 
-- **Fast ingestion** – Parallel filesystem walker with `.gitignore` support, hashing, chunking, embeddings, and optional auto-eviction based on database size targets.
-- **Flexible lookups** – `code_lookup`, `semantic_search`, and `context_bundle` expose focused snippets and structured metadata for agents.
+- **Fast ingestion** – Parallel filesystem walker with `.gitignore` support, hashing, chunking, embeddings, and optional auto-eviction based on database size targets. Each chunk now persists summary, symbol, identifier, language, and graph metadata alongside the embedding payload.
+- **Hybrid lookups** – `semantic_search`, `code_lookup`, and `context_bundle` blend lexical sieves with embedding-backed similarity. Results ship with `source` (`embedding` vs `lexical`), `confidence`, and symbol metadata so agents understand why a match was promoted.
 - **Git awareness** – `repository_timeline` and `repository_timeline_entry` summarise recent commits and cached diffs so agents can reason about repo history.
 - **Watch mode** – Optional filesystem watcher re-ingests changed paths automatically for long-running agent sessions.
 - **Remote proxies** – Mount additional MCP servers behind the same process by declaring JSON descriptors in `INDEX_MCP_REMOTE_SERVERS`.
-- **Context budgeting & hotness tracking** – Bundles respect a configurable token budget and track per-chunk usage to inform eviction heuristics.
+- **Context budgeting & observability** – Bundles respect a configurable token budget, track per-chunk usage, and emit diagnostics (model, backend, latency, similarity range) to help tune downstream prompting.
 
 ## Requirements
 
@@ -97,9 +97,15 @@ Key flags:
 | `--watch-quiet` | Silence watcher progress logs. |
 | `--watch-database <name>` | Use an alternate SQLite filename for watch mode. |
 
-## Context Budget & Hotness Tracking
+## Hybrid Search, Context Budget & Hotness Tracking
 
-Context bundles automatically respect the `INDEX_MCP_BUDGET_TOKENS` environment variable (default: 3000 tokens). Responses prioritise focus definitions, append nearby lines, and truncate intelligently with explicit notices when content is trimmed. Each served chunk increments a `hits` counter which feeds auto-eviction heuristics during ingest.
+`semantic_search` now returns richer matches: every row includes a `source` flag (embedding vs lexical), a normalised `confidence`, and optional chunk metadata (`summary`, `symbol`, `identifier`, `sourceType`, `metadata`). Identifier-style prompts promote up to three high-confidence lexical hits before semantic results, and the response captures end-to-end timings via `diagnostics` (`embedding_latency_ms`, `lexical_latency_ms`, `total_latency_ms`, evaluated chunk counts, and the active model/backend).
+
+`context_bundle` accepts an optional natural-language `query` that re-ranks snippets via the same embedding backend used for ingest. Bundles expose similarity scores, symbol metadata, and diagnostics (query echo, model/backend, latency, similarity range) so downstream prompts can weight each excerpt appropriately. Raw embedding vectors are stripped from the final payload, but the per-snippet metadata remains available for agents that need richer citations.
+
+`ingest_codebase` persists the additional metadata (summary, symbol, identifier, language, graph metadata) to `file_chunks` and records `embedding_backend`, `embedding_dimension`, `embedding_quantized`, and `embedding_latency_ms` in both the `IngestResponse` and the backing SQLite `meta` table. Existing databases auto-migrate—missing columns are added on demand, and older indices continue to work until a fresh ingest backfills the new fields.
+
+Context bundles still respect the `INDEX_MCP_BUDGET_TOKENS` environment variable (default: 3000 tokens). Responses prioritise focus definitions, append nearby lines, and truncate intelligently with explicit notices when content is trimmed. Each served chunk increments a `hits` counter which feeds auto-eviction heuristics during ingest.
 
 To cap database size during ingest:
 
@@ -152,8 +158,7 @@ Remote tools are surfaced under `<namespace>.<tool>` and benefit from the same s
 
 ## Further Reading
 
-> **Docs relocation:** The historical `docs/` directory has been removed. Long-form guides now live at the repository root to simplify distribution across downstream consumers.
-
+- `docs/zero_shot_code_search.md` – deep dive into the hybrid embedding stack that powers `semantic_search`, `code_lookup`, and `context_bundle`.
 - `rust-migration.md` – status tracker for the Rust rewrite (formerly `docs/rust-migration.md`).
 - `rust-acceleration.md` – design notes and benchmarks for the native pipeline (formerly `docs/rust-acceleration.md`).
 - `agents_repo.md` – repository-specific guidance for wiring the server into MCP-compatible clients.

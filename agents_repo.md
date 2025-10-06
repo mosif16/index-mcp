@@ -67,9 +67,9 @@ The Rust binary registers the full tool surface that previously lived in the Nod
 | Tool / Prompt | Notes |
 |---------------|-------|
 | `ingest_codebase` | Walks the workspace, respects `.gitignore`, stores metadata, embeddings, and auto-evicts least-used chunks when requested. |
-| `semantic_search` | Embedding-powered chunk retrieval with language guesses, context padding, and hit counters. |
-| `code_lookup` | Routes `mode="search"` queries to semantic search and `mode="bundle"` to context bundles. |
-| `context_bundle` | Returns file metadata, focus definitions, nearby snippets, and quick links within a token budget. |
+| `semantic_search` | Hybrid lexical + embedding retrieval. Results include `source` (`embedding`/`lexical`), `confidence`, chunk metadata (`summary`, `symbol`, `identifier`, `sourceType`, `metadata`), and `diagnostics` (model, backend, quantization, latency, evaluated chunk count). |
+| `code_lookup` | Routes `mode="search"` queries to semantic search and `mode="bundle"` to context bundles, forwarding the same metadata/diagnostics so downstream prompts can cite confidently. |
+| `context_bundle` | Returns file metadata, focus definitions, nearby snippets, and quick links within a token budget. Accepts optional natural-language `query` to re-rank snippets via embeddings and emits per-snippet similarity scores, symbol metadata, and bundle diagnostics (model/backend, latency, similarity range). |
 | `index_status` | Summarizes index freshness, embedding models, ingestion history, and git parity. |
 | `repository_timeline` | Streams recent git commits with churn stats, directory highlights, optional diffs, and PR URLs. |
 | `repository_timeline_entry` | Recovers cached commit details and (when available) full diff text for a specific SHA. |
@@ -83,9 +83,9 @@ The server banner reminds clients to re-run `ingest_codebase` after edits, check
 The Rust runtime preserves the schema introduced by the legacy implementation:
 
 - `files` – path, size, modified time (ms), SHA-256 hash, stored content, last indexed timestamp.
-- `file_chunks` – chunk text, embeddings (float32 blobs), byte/line spans, hit counters, embedding model id.
+- `file_chunks` – chunk text, embeddings (float32 blobs), byte/line spans, hit counters, embedding metadata (`embedding_model`, summary/symbol fields, detected language, serialized graph metadata).
 - `ingestions` – ingest history, durations, counts, and root paths.
-- `meta` – key/value store for commit SHA, last indexed timestamp, and other metadata.
+- `meta` – key/value store for commit SHA, last indexed timestamp, embedding backend/dimension/quantized flags, and other metadata.
 
 Databases created before the rewrite remain compatible with the current runtime.
 
@@ -120,6 +120,7 @@ Tokens can be sourced from environment variables (for example `${DOCS_KEY}`) or 
 ## 8. Additional Resources
 
 - `README.md` – High-level features and CLI examples (see "Docs relocation" for context on the removed `docs/` folder).
+- `docs/zero_shot_code_search.md` – Retrieval system deep dive covering hybrid ranking, diagnostics, and query-driven bundles.
 - `rust-migration.md` – Detailed migration status and parity checklist (relocated from `docs/`).
 - `rust-acceleration.md` – Design notes for native ingestion (relocated from `docs/`).
 - `start.sh` – Runtime launcher with environment variable overrides.

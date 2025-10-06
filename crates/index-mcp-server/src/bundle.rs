@@ -3,6 +3,7 @@ use std::convert::TryFrom;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -14,6 +15,7 @@ use thiserror::Error;
 use tokio::task::JoinError;
 
 use crate::index_status::DEFAULT_DB_FILENAME;
+use crate::search::create_embedder;
 
 const DEFAULT_SNIPPET_LIMIT: usize = 3;
 const MAX_SNIPPET_LIMIT: usize = 10;
@@ -40,6 +42,7 @@ struct BundleCacheKey {
     max_snippets: usize,
     budget_tokens: usize,
     max_neighbors: usize,
+    query_fingerprint: Option<String>,
 }
 
 #[derive(Debug)]
@@ -115,6 +118,8 @@ pub struct ContextBundleParams {
     pub ranges: Option<Vec<LineRange>>,
     #[serde(default)]
     pub focus_line: Option<u32>,
+    #[serde(default)]
+    pub query: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Clone)]
@@ -145,6 +150,8 @@ pub struct ContextBundleResponse {
     pub warnings: Vec<String>,
     pub quick_links: Vec<ContextBundleQuickLink>,
     pub usage: BundleUsageStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<BundleDiagnostics>,
 }
 
 #[derive(Debug, Serialize, JsonSchema, Clone)]
@@ -223,6 +230,41 @@ pub struct BundleSnippet {
     pub line_end: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub served_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
+    #[serde(skip_serializing)]
+    pub embedding: Option<Vec<f32>>,
+}
+
+#[derive(Debug, Serialize, JsonSchema, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleDiagnostics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_latency_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similarity_min: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similarity_max: Option<f32>,
 }
 
 #[derive(Debug, Serialize, JsonSchema, Clone)]
@@ -307,6 +349,7 @@ fn build_bundle(params: ContextBundleParams) -> Result<ContextBundleResponse, Co
         budget_tokens,
         ranges,
         focus_line,
+        query,
     } = params;
 
     let root_path = resolve_root(root.unwrap_or_else(|| "./".to_string()))?;
@@ -317,6 +360,9 @@ fn build_bundle(params: ContextBundleParams) -> Result<ContextBundleResponse, Co
         .map_err(ContextBundleError::Sqlite)?;
 
     let target_file = normalize_file(&file);
+    let query_clean = query
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
 
     let max_snippets = max_snippets
         .map(|value| value.min(MAX_SNIPPET_LIMIT as u32) as usize)
@@ -359,6 +405,7 @@ fn build_bundle(params: ContextBundleParams) -> Result<ContextBundleResponse, Co
         max_snippets,
         budget_tokens,
         max_neighbors,
+        query_fingerprint: query_clean.clone(),
     };
 
     if let Ok(mut cache) = CONTEXT_BUNDLE_CACHE.lock() {
@@ -386,15 +433,46 @@ fn build_bundle(params: ContextBundleParams) -> Result<ContextBundleResponse, Co
     let content_ref = file_content.as_deref();
     let line_offsets = content_ref.map(compute_line_offsets);
 
-    let (snippets, mut snippet_warnings) = collect_snippets(
-        &conn,
-        &target_file,
+    let mut embedding_backend = load_meta_value_bundle(&conn, "embedding_backend");
+    let mut embedding_model_name: Option<String> = None;
+    let mut embedding_latency_ms: Option<u128> = None;
+    let mut query_embedding: Option<Vec<f32>> = None;
+
+    if let Some(query_text) = query_clean.clone() {
+        if let Ok(models) = available_embedding_models_bundle(&conn) {
+            if let Some(model_name) = models.first().cloned() {
+                if let Ok(mut embedder) = create_embedder(&model_name) {
+                    let timer = Instant::now();
+                    if let Ok(mut vectors) = embedder.embed(vec![query_text.clone()], None) {
+                        if let Some(vector) = vectors.pop() {
+                            query_embedding = Some(vector);
+                            embedding_latency_ms = Some(timer.elapsed().as_millis());
+                            embedding_model_name = Some(model_name);
+                            if embedding_backend.is_none() {
+                                embedding_backend =
+                                    load_meta_value_bundle(&conn, "embedding_backend");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let query_vector_ref = query_embedding.as_deref();
+
+    let snippet_request = CollectSnippetsRequest {
+        path: &target_file,
         max_snippets,
-        &requested_ranges,
+        ranges: &requested_ranges,
         focus_line,
-        content_ref,
-        line_offsets.as_deref(),
-    );
+        file_content: content_ref,
+        line_offsets: line_offsets.as_deref(),
+        query_embedding: query_vector_ref,
+        query_model: embedding_model_name.as_deref(),
+    };
+
+    let (snippets, mut snippet_warnings) = collect_snippets(&conn, snippet_request);
     let (trimmed_snippets, usage_stats, mut trimming_warnings) =
         trim_snippets_to_budget(snippets, &definitions, budget_tokens);
 
@@ -416,6 +494,48 @@ fn build_bundle(params: ContextBundleParams) -> Result<ContextBundleResponse, Co
 
     let brief = file_content.as_deref().and_then(build_file_brief);
 
+    let mut diagnostics = BundleDiagnostics {
+        query: query_clean.clone(),
+        embedding_model: embedding_model_name.clone(),
+        embedding_backend,
+        embedding_latency_ms,
+        similarity_min: None,
+        similarity_max: None,
+    };
+
+    if let Some(first) = trimmed_snippets
+        .iter()
+        .filter_map(|snippet| snippet.similarity)
+        .next()
+    {
+        let mut min_sim = first;
+        let mut max_sim = first;
+        for value in trimmed_snippets
+            .iter()
+            .filter_map(|snippet| snippet.similarity)
+        {
+            if value < min_sim {
+                min_sim = value;
+            }
+            if value > max_sim {
+                max_sim = value;
+            }
+        }
+        diagnostics.similarity_min = Some(min_sim);
+        diagnostics.similarity_max = Some(max_sim);
+    }
+
+    let diagnostics_opt = if diagnostics.query.is_some()
+        || diagnostics.embedding_model.is_some()
+        || diagnostics.embedding_latency_ms.is_some()
+        || diagnostics.similarity_min.is_some()
+        || diagnostics.similarity_max.is_some()
+    {
+        Some(diagnostics.clone())
+    } else {
+        None
+    };
+
     let response = ContextBundleResponse {
         database_path: db_path_string,
         file: BundleFileMetadata {
@@ -435,6 +555,7 @@ fn build_bundle(params: ContextBundleParams) -> Result<ContextBundleResponse, Co
         warnings,
         quick_links,
         usage: usage_stats,
+        diagnostics: diagnostics_opt.clone(),
     };
 
     if let Ok(mut cache) = CONTEXT_BUNDLE_CACHE.lock() {
@@ -489,6 +610,43 @@ fn read_file_from_disk(root: &Path, relative: &str) -> Result<String, std::io::E
 
 fn normalize_file(file: &str) -> String {
     file.replace("\\", "/")
+}
+
+fn available_embedding_models_bundle(conn: &Connection) -> Result<Vec<String>, ContextBundleError> {
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT embedding_model FROM file_chunks")
+        .map_err(ContextBundleError::Sqlite)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(ContextBundleError::Sqlite)?;
+    Ok(rows.flatten().collect())
+}
+
+fn load_meta_value_bundle(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
+fn blob_to_vec(blob: &[u8]) -> Vec<f32> {
+    if !blob.len().is_multiple_of(4) {
+        return Vec::new();
+    }
+    let mut values = Vec::with_capacity(blob.len() / 4);
+    for chunk in blob.chunks_exact(4) {
+        values.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    values
+}
+
+fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
 fn load_definitions(conn: &Connection, path: &str, content: Option<&str>) -> Vec<BundleDefinition> {
@@ -737,7 +895,7 @@ fn load_neighbor_node(conn: &Connection, node_id: &str) -> Option<NeighborNode> 
 
 fn load_snippets(conn: &Connection, path: &str, max_snippets: usize) -> Vec<BundleSnippet> {
     let mut stmt = match conn.prepare(
-        "SELECT chunk_index, content, byte_start, byte_end, line_start, line_end, hits \
+        "SELECT chunk_index, content, summary, symbol, identifier, source_type, metadata, embedding_model, embedding, byte_start, byte_end, line_start, line_end, hits \
          FROM file_chunks \
          WHERE path = ?1 \
          ORDER BY hits ASC, chunk_index ASC \
@@ -748,30 +906,64 @@ fn load_snippets(conn: &Connection, path: &str, max_snippets: usize) -> Vec<Bund
     };
 
     stmt.query_map(params![path, max_snippets as i64], |row| {
+        let metadata_raw: Option<String> = row.get(6)?;
+        let embedding_blob: Vec<u8> = row.get(8)?;
+        let embedding = blob_to_vec(&embedding_blob);
         Ok(BundleSnippet {
             source: SnippetSource::Chunk,
             chunk_index: Some(row.get(0)?),
             content: row.get(1)?,
-            byte_start: row.get(2)?,
-            byte_end: row.get(3)?,
-            line_start: row.get(4)?,
-            line_end: row.get(5)?,
-            served_count: Some(row.get::<_, i64>(6)?),
+            byte_start: row.get(9)?,
+            byte_end: row.get(10)?,
+            line_start: row.get(11)?,
+            line_end: row.get(12)?,
+            served_count: Some(row.get::<_, i64>(13)?),
+            summary: row.get(2)?,
+            symbol: row.get(3)?,
+            identifier: row.get(4)?,
+            source_type: row.get(5)?,
+            metadata: metadata_raw
+                .as_ref()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok()),
+            score: None,
+            similarity: None,
+            embedding_model: row.get(7)?,
+            embedding: if embedding.is_empty() {
+                None
+            } else {
+                Some(embedding)
+            },
         })
     })
     .map(|rows| rows.flatten().collect())
     .unwrap_or_default()
 }
 
+struct CollectSnippetsRequest<'a> {
+    path: &'a str,
+    max_snippets: usize,
+    ranges: &'a [LineRange],
+    focus_line: Option<u32>,
+    file_content: Option<&'a str>,
+    line_offsets: Option<&'a [usize]>,
+    query_embedding: Option<&'a [f32]>,
+    query_model: Option<&'a str>,
+}
+
 fn collect_snippets(
     conn: &Connection,
-    path: &str,
-    max_snippets: usize,
-    ranges: &[LineRange],
-    focus_line: Option<u32>,
-    file_content: Option<&str>,
-    line_offsets: Option<&[usize]>,
+    request: CollectSnippetsRequest<'_>,
 ) -> (Vec<BundleSnippet>, Vec<String>) {
+    let CollectSnippetsRequest {
+        path,
+        max_snippets,
+        ranges,
+        focus_line,
+        file_content,
+        line_offsets,
+        query_embedding,
+        query_model,
+    } = request;
     #[derive(Debug)]
     struct Candidate {
         snippet: BundleSnippet,
@@ -804,11 +996,28 @@ fn collect_snippets(
                 if let Some(snippet) =
                     build_range_snippet(content, offsets, range.start_line, range.end_line)
                 {
+                    let mut snippet = snippet;
                     let mut score = 120.0 + snippet_semantic_weight(&snippet.content);
                     if let Some(line) = focus_line {
                         score += proximity_bonus(&snippet, line);
                     }
+                    if let Some(query_vec) = query_embedding {
+                        if let Some(embed_vec) = snippet.embedding.as_ref() {
+                            let model_matches =
+                                match (query_model, snippet.embedding_model.as_deref()) {
+                                    (Some(expected), Some(actual)) => expected == actual,
+                                    (Some(_), None) => false,
+                                    _ => true,
+                                };
+                            if model_matches {
+                                let similarity = dot_product(query_vec, embed_vec);
+                                snippet.similarity = Some(similarity);
+                                score += similarity * 10.0;
+                            }
+                        }
+                    }
                     score -= snippet_usage_penalty(snippet.served_count);
+                    snippet.score = Some(score);
                     push_candidate(snippet, score);
                 } else {
                     warnings.push(format!(
@@ -826,8 +1035,25 @@ fn collect_snippets(
     if let Some(line) = focus_line {
         if let (Some(content), Some(offsets)) = (file_content, line_offsets) {
             if let Some(snippet) = build_focus_snippet(content, offsets, line) {
-                let score = 110.0 + snippet_semantic_weight(&snippet.content);
+                let mut snippet = snippet;
+                let mut score = 110.0 + snippet_semantic_weight(&snippet.content);
+                if let Some(query_vec) = query_embedding {
+                    if let Some(embed_vec) = snippet.embedding.as_ref() {
+                        let model_matches = match (query_model, snippet.embedding_model.as_deref())
+                        {
+                            (Some(expected), Some(actual)) => expected == actual,
+                            (Some(_), None) => false,
+                            _ => true,
+                        };
+                        if model_matches {
+                            let similarity = dot_product(query_vec, embed_vec);
+                            snippet.similarity = Some(similarity);
+                            score += similarity * 10.0;
+                        }
+                    }
+                }
                 let adjusted = score - snippet_usage_penalty(snippet.served_count);
+                snippet.score = Some(adjusted);
                 push_candidate(snippet, adjusted);
             }
         } else {
@@ -838,17 +1064,32 @@ fn collect_snippets(
     let fetch_limit = std::cmp::max(max_snippets, 1)
         .saturating_mul(3)
         .min(MAX_SNIPPET_LIMIT);
-    for snippet in load_snippets(conn, path, fetch_limit) {
+    for mut snippet in load_snippets(conn, path, fetch_limit) {
         let mut score = 30.0 + snippet_semantic_weight(&snippet.content);
         if let Some(line) = focus_line {
             score += proximity_bonus(&snippet, line);
         }
+        if let Some(query_vec) = query_embedding {
+            if let Some(embed_vec) = snippet.embedding.as_ref() {
+                let model_matches = match (query_model, snippet.embedding_model.as_deref()) {
+                    (Some(expected), Some(actual)) => expected == actual,
+                    (Some(_), None) => false,
+                    _ => true,
+                };
+                if model_matches {
+                    let similarity = dot_product(query_vec, embed_vec);
+                    snippet.similarity = Some(similarity);
+                    score += similarity * 10.0;
+                }
+            }
+        }
         let adjusted = score - snippet_usage_penalty(snippet.served_count);
+        snippet.score = Some(adjusted);
         push_candidate(snippet, adjusted);
     }
 
     if candidates.is_empty() {
-        let fallback = load_snippets(conn, path, max_snippets.max(1));
+        let mut fallback = load_snippets(conn, path, max_snippets.max(1));
         if fallback.is_empty() {
             warnings.push("No snippets available for the requested file.".to_string());
         } else if had_range_request || focus_line.is_some() {
@@ -857,6 +1098,28 @@ fn collect_snippets(
                     .to_string(),
             );
         }
+
+        if let Some(query_vec) = query_embedding {
+            for snippet in fallback.iter_mut() {
+                if let Some(embed_vec) = snippet.embedding.as_ref() {
+                    let model_matches = match (query_model, snippet.embedding_model.as_deref()) {
+                        (Some(expected), Some(actual)) => expected == actual,
+                        (Some(_), None) => false,
+                        _ => true,
+                    };
+                    if model_matches {
+                        let similarity = dot_product(query_vec, embed_vec);
+                        snippet.similarity = Some(similarity);
+                        snippet.score = Some(similarity);
+                    }
+                }
+            }
+        }
+
+        for snippet in fallback.iter_mut() {
+            snippet.embedding = None;
+        }
+
         return (fallback, warnings);
     }
 
@@ -1019,6 +1282,15 @@ fn build_range_snippet(
         line_start: Some(start as i64),
         line_end: Some(end as i64),
         served_count: None,
+        summary: None,
+        symbol: None,
+        identifier: None,
+        source_type: Some("content".to_string()),
+        metadata: None,
+        score: None,
+        similarity: None,
+        embedding_model: None,
+        embedding: None,
     })
 }
 
@@ -1089,6 +1361,14 @@ fn trim_snippets_to_budget(
         line_start: Option<i64>,
         line_end: Option<i64>,
         served_count: Option<i64>,
+        summary: Option<String>,
+        symbol: Option<String>,
+        identifier: Option<String>,
+        source_type: Option<String>,
+        metadata: Option<Value>,
+        score: Option<f32>,
+        similarity: Option<f32>,
+        embedding_model: Option<String>,
         summary_content: String,
         summary_tokens: usize,
         excerpt_content: Option<String>,
@@ -1116,6 +1396,14 @@ fn trim_snippets_to_budget(
                 line_start: snippet.line_start,
                 line_end: snippet.line_end,
                 served_count: snippet.served_count,
+                summary: snippet.summary,
+                symbol: snippet.symbol,
+                identifier: snippet.identifier,
+                source_type: snippet.source_type,
+                metadata: snippet.metadata,
+                score: snippet.score,
+                similarity: snippet.similarity,
+                embedding_model: snippet.embedding_model,
                 summary_content,
                 summary_tokens,
                 excerpt_content,
@@ -1154,6 +1442,14 @@ fn trim_snippets_to_budget(
                 line_start,
                 line_end,
                 served_count,
+                summary,
+                symbol,
+                identifier,
+                source_type,
+                metadata,
+                score,
+                similarity,
+                embedding_model,
                 summary_content,
                 excerpt_content,
                 full_content,
@@ -1177,6 +1473,15 @@ fn trim_snippets_to_budget(
                 line_start,
                 line_end,
                 served_count,
+                summary,
+                symbol,
+                identifier,
+                source_type,
+                metadata,
+                score,
+                similarity,
+                embedding_model,
+                embedding: None,
             })
         }
     }
@@ -1504,6 +1809,15 @@ mod tests {
             line_start: Some(1),
             line_end: Some(content.lines().count() as i64),
             served_count: None,
+            summary: None,
+            symbol: None,
+            identifier: None,
+            source_type: None,
+            metadata: None,
+            score: None,
+            similarity: None,
+            embedding_model: None,
+            embedding: None,
         }
     }
 
