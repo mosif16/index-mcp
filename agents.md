@@ -16,7 +16,7 @@ Update both documents together when workflows change so global expectations and 
 
 With the GitHub workflows removed, agents must run these checks before handing work back to the user:
 
-- `cargo fmt --all -- --check`
+- `cargo fmt --all -- --check"
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --all --all-targets`
 
