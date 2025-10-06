@@ -4,9 +4,10 @@ This document describes the embedding-backed retrieval layer that now powers `se
 
 ## Model Strategy
 
-- **Backend**: `fastembed` ONNX models, defaulting to `Xenova/all-MiniLM-L6-v2`. Quantized variants remain supported; ingest surfaces `embedding_backend`, `embedding_dimension`, and `embedding_quantized` in `IngestResponse` and `meta`.
-- **Extensibility**: the ingest pipeline accepts a `model` override. Any model that `fastembed` exposes can be plugged in, including `BGE-small-en-v1.5` and code-tuned MiniLM derivatives. Model and backend details are logged with each ingest run and echoed in search diagnostics.
-- **Caching**: embedder instances remain in-process via the shared cache from `ingest` and are reused by search and bundle flows. Query embeddings are created lazily and reported via diagnostics.
+- **Backends**: `embedding.backend` selects the embedding runtime. `fastembed` (default) loads ONNX weights such as `Xenova/all-MiniLM-L6-v2` and its quantized variants; `candle` boots CPU-only sentence-transformer pipelines built on Candle. Both backends report `embedding_backend`, `embedding_dimension`, and `embedding_quantized` in `IngestResponse` and the SQLite `meta` table.
+- **Extensibility**: the ingest pipeline accepts per-run overrides (`model`, `batchSize`, chunk sizing). Any model exposed by the chosen backend can be used (for example FastEmbed’s `BAAI/bge-base-en-v1.5` or Candle’s `sentence-transformers/all-MiniLM-L12-v2`). Candle honours batch-size hints, while quantized FastEmbed variants fall back to single-item embedding.
+- **Caching**: embedder instances remain in-process via the shared cache from `ingest` and are reused by search and bundle flows. Query embeddings are created lazily, reusing the same cache entry.
+- **ANN acceleration**: successful ingests produce a `.ann/<basename>.hnsw.{graph,data}` pair plus an `.ids` mapping file. These files are keyed by model/backend so multiple indices can coexist; metadata entries (`embedding_ann_basename`, `embedding_ann_mapping`) make the active pair discoverable at query time.
 
 ## Data Flow
 
@@ -48,9 +49,9 @@ Meta table additions record `embedding_model`, `embedding_backend`, `embedding_d
 ## Retrieval Strategy
 
 ### Embedded search (default for `semantic_search`)
-1. Load query embedding via `fastembed` (cached by model name).
-2. Score each candidate via dot product; normalize to `[0, 1]`.
-3. Merge diagnostics: latency, evaluated chunk counts, model metadata.
+1. Load the query embedding through the configured backend (FastEmbed or Candle) using the shared cache.
+2. If an ANN index is present, query the HNSW graph (with configurable `k`/`ef`) and project neighbours back to chunk ids; otherwise fall back to brute-force cosine scoring.
+3. Normalize scores to `[0, 1]` and merge diagnostics covering backend, model, latencies, evaluated chunk counts, and whether ANN succeeded.
 4. Return `SemanticSearchMatch` with confidence, summary, symbol metadata, and a `SearchSource` tag (`embedding` or `lexical`).
 
 ### Lexical infusion
@@ -90,5 +91,5 @@ The SQLite schema self-migrates: missing columns are added via `ALTER TABLE file
 
 ## Future Work
 
-- Pluggable Candle backends once lightweight sentence transformer weights are packaged.
-- On-disk ANN acceleration for large repos; today’s approach uses brute-force cosine with cache assistance.
+- Evaluate GPU-enabled Candle builds or optional GGUF runners for heavier models.
+- Persist ANN health metrics (build durations, neighbour recall sampling) alongside ingest reports for easier regression tracking.

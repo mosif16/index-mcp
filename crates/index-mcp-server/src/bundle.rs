@@ -15,7 +15,7 @@ use thiserror::Error;
 use tokio::task::JoinError;
 
 use crate::index_status::DEFAULT_DB_FILENAME;
-use crate::search::create_embedder;
+use crate::search::create_embedding_runner;
 
 const DEFAULT_SNIPPET_LIMIT: usize = 3;
 const MAX_SNIPPET_LIMIT: usize = 10;
@@ -449,16 +449,18 @@ fn build_bundle(params: ContextBundleParams) -> Result<ContextBundleResponse, Co
     if let Some(query_text) = query_clean.clone() {
         if let Ok(models) = available_embedding_models_bundle(&conn) {
             if let Some(model_name) = models.first().cloned() {
-                if let Ok(mut embedder) = create_embedder(&model_name) {
-                    let timer = Instant::now();
-                    if let Ok(mut vectors) = embedder.embed(vec![query_text.clone()], None) {
-                        if let Some(vector) = vectors.pop() {
+                let backend_label = embedding_backend
+                    .clone()
+                    .unwrap_or_else(|| "onnx".to_string());
+                if let Ok(handle) = create_embedding_runner(&model_name, &backend_label) {
+                    if let Ok(mut runner) = handle.lock() {
+                        let timer = Instant::now();
+                        if let Ok(vector) = runner.embed_query(&query_text) {
                             query_embedding = Some(vector);
                             embedding_latency_ms = Some(timer.elapsed().as_millis());
                             embedding_model_name = Some(model_name);
                             if embedding_backend.is_none() {
-                                embedding_backend =
-                                    load_meta_value_bundle(&conn, "embedding_backend");
+                                embedding_backend = Some(backend_label);
                             }
                         }
                     }

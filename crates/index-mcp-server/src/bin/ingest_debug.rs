@@ -1,5 +1,9 @@
+#[path = "../ann.rs"]
+mod ann;
 #[path = "../bundle.rs"]
 mod bundle;
+#[path = "../embedding.rs"]
+mod embedding;
 #[path = "../git_timeline.rs"]
 mod git_timeline;
 #[path = "../graph.rs"]

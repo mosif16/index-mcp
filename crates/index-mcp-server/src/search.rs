@@ -1,10 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::Instant;
 
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use rmcp::schemars::{self, JsonSchema};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -12,8 +10,13 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::task::JoinError;
 
+use crate::ann::{self, ANN_META_BASENAME_KEY};
+use crate::embedding::{
+    build_candle_backend, build_fastembed_backend, get_or_create_embedding_runner, EmbeddingHandle,
+};
 use crate::index_status::DEFAULT_DB_FILENAME;
 use crate::ingest::DEFAULT_EMBEDDING_MODEL;
+use tracing::warn;
 
 const DEFAULT_RESULT_LIMIT: usize = 6;
 const DEFAULT_IDENTIFIER_LIMIT: usize = 3;
@@ -220,6 +223,25 @@ struct PendingMatch {
     source: SearchSource,
 }
 
+struct ChunkRow {
+    id: String,
+    path: String,
+    chunk_index: i32,
+    content: String,
+    summary: Option<String>,
+    symbol: Option<String>,
+    identifier: Option<String>,
+    source_type: Option<String>,
+    language: Option<String>,
+    metadata_raw: Option<String>,
+    embedding_blob: Vec<u8>,
+    byte_start: Option<i64>,
+    byte_end: Option<i64>,
+    line_start: Option<i64>,
+    line_end: Option<i64>,
+    embedding_model: String,
+}
+
 fn perform_semantic_search(
     params: SemanticSearchParams,
 ) -> Result<SemanticSearchResponse, SemanticSearchError> {
@@ -271,6 +293,7 @@ fn perform_semantic_search(
     let absolute_root = resolve_root(&root_param)?;
     let database_name_value = database_name.unwrap_or_else(|| DEFAULT_DB_FILENAME.to_string());
     let db_path = absolute_root.join(&database_name_value);
+    let ann_dir = ann::ann_directory(&db_path);
     let db_path_string = db_path.to_string_lossy().to_string();
 
     let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
@@ -297,6 +320,11 @@ fn perform_semantic_search(
         model: Some(requested_model.clone()),
         ..Default::default()
     };
+
+    let backend_label_meta = load_meta_value(&conn, "embedding_backend");
+    diagnostics.backend = backend_label_meta.clone();
+    let backend_label = backend_label_meta.unwrap_or_else(|| "onnx".to_string());
+    let ann_basename_meta = load_meta_value(&conn, ANN_META_BASENAME_KEY);
 
     if normalized_limit == 0 {
         diagnostics.total_latency_ms = total_timer.elapsed().as_millis();
@@ -357,119 +385,111 @@ fn perform_semantic_search(
 
     if !skip_embedding && lexical_matches.len() < normalized_limit {
         let embedding_timer = Instant::now();
-        let mut stmt = conn.prepare(
-            "SELECT id, path, chunk_index, content, summary, symbol, identifier, source_type, language, metadata, embedding, embedding_model, byte_start, byte_end, line_start, line_end FROM file_chunks WHERE embedding_model = ?1",
-        )?;
-        let mut rows = stmt.query(params![&requested_model])?;
+        let backend = if backend_label.eq_ignore_ascii_case("candle") {
+            build_candle_backend(&requested_model, None)
+                .map_err(|error| SemanticSearchError::Embedding(error.to_string()))?
+        } else {
+            build_fastembed_backend(&requested_model)
+                .map_err(|error| SemanticSearchError::Embedding(error.to_string()))?
+        };
 
-        let mut embedder = create_embedder(&requested_model)?;
-        let mut cached_query: Option<(String, Vec<f32>)> = None;
+        let embedder_handle = get_or_create_embedding_runner(&backend, &requested_model, None)
+            .map_err(|error| SemanticSearchError::Embedding(error.to_string()))?;
+
+        let query_embedding = {
+            let mut guard = embedder_handle
+                .lock()
+                .map_err(|error| SemanticSearchError::Embedding(error.to_string()))?;
+            guard
+                .embed_query(trimmed_query)
+                .map_err(|error| SemanticSearchError::Embedding(error.to_string()))?
+        };
+
+        let ann_index = if let Some(basename) = ann_basename_meta.as_ref() {
+            ann::load_ann_index(&ann_dir, basename).ok().flatten()
+        } else {
+            None
+        };
+
         let mut top_matches: Vec<PendingMatch> = Vec::new();
+        let top_limit = normalized_limit.max(DEFAULT_RESULT_LIMIT);
+        let mut ann_used = false;
 
-        while let Some(row) = rows.next()? {
-            evaluated_chunks += 1;
-            let id: String = row.get(0)?;
-            let path: String = row.get(1)?;
-            let chunk_index: i32 = row.get(2)?;
-            let content: String = row.get(3)?;
-            let summary: Option<String> = row.get(4)?;
-            let symbol: Option<String> = row.get(5)?;
-            let identifier: Option<String> = row.get(6)?;
-            let source_type: Option<String> = row.get(7)?;
-            let stored_language: Option<String> = row.get(8)?;
-            let metadata_raw: Option<String> = row.get(9)?;
-            let embedding_blob: Vec<u8> = row.get(10)?;
-            let embedding_model: String = row.get(11)?;
-            let byte_start: Option<i64> = row.get(12)?;
-            let byte_end: Option<i64> = row.get(13)?;
-            let line_start: Option<i64> = row.get(14)?;
-            let line_end: Option<i64> = row.get(15)?;
+        if let Some(ann_index) = ann_index.as_ref() {
+            let ann_search_k = (normalized_limit * 3)
+                .max(lexical_matches.len() * 2)
+                .min(256);
+            let ef = ann_search_k.max(64);
 
-            let chunk_key = (path.clone(), chunk_index);
-            if seen_hits.contains(&chunk_key) {
-                continue;
-            }
+            match ann_index.search(&query_embedding, ann_search_k, ef) {
+                Ok(neighbours) => {
+                    evaluated_chunks = neighbours.len() as u64;
 
-            let classification_value = classify_snippet(&content);
-            if let Some(required) = &classification {
-                if &classification_value != required {
-                    continue;
+                    let mut chunk_stmt = conn.prepare(
+                        "SELECT id, path, chunk_index, content, summary, symbol, identifier, source_type, language, metadata, embedding, embedding_model, byte_start, byte_end, line_start, line_end FROM file_chunks WHERE id = ?1",
+                    )?;
+
+                    for neighbour in neighbours {
+                        let idx = neighbour.d_id;
+                        let Some(chunk_id) = ann_index.id_lookup.get(idx) else {
+                            continue;
+                        };
+
+                        let chunk = match chunk_stmt.query_row(params![chunk_id], read_chunk_row) {
+                            Ok(value) => value,
+                            Err(_) => continue,
+                        };
+
+                        if let Some(pending) = chunk_to_pending(
+                            &chunk,
+                            &query_embedding,
+                            &classification,
+                            path_prefix.as_deref(),
+                            path_contains.as_deref(),
+                            language_filter.as_deref(),
+                            &mut seen_hits,
+                        ) {
+                            insert_into_top_matches(&mut top_matches, pending, top_limit);
+                        }
+                    }
+
+                    ann_used = true;
+                }
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        basename = ann_index.basename(),
+                        "failed to query ANN index; falling back to brute-force search"
+                    );
                 }
             }
-
-            if let Some(prefix) = &path_prefix {
-                if !path.starts_with(prefix) {
-                    continue;
-                }
-            }
-
-            if let Some(fragment) = &path_contains {
-                if !path.contains(fragment) {
-                    continue;
-                }
-            }
-
-            let detected_language = stored_language.clone().or_else(|| detect_language(&path));
-            if let Some(required_lang) = &language_filter {
-                match detected_language.as_ref().map(|value| value.to_lowercase()) {
-                    Some(ref lang) if lang == required_lang => {}
-                    Some(_) => continue,
-                    None => continue,
-                }
-            }
-
-            let chunk_embedding = blob_to_vec(&embedding_blob);
-            if chunk_embedding.is_empty() {
-                continue;
-            }
-
-            let query_embedding = if let Some((cached_text, cached_vector)) = &cached_query {
-                if cached_text == trimmed_query {
-                    cached_vector.clone()
-                } else {
-                    let vector = embed_query(&mut embedder, trimmed_query)?;
-                    cached_query = Some((trimmed_query.to_string(), vector.clone()));
-                    vector
-                }
-            } else {
-                let vector = embed_query(&mut embedder, trimmed_query)?;
-                cached_query = Some((trimmed_query.to_string(), vector.clone()));
-                vector
-            };
-
-            let score = dot_product(&query_embedding, &chunk_embedding);
-            let metadata_value = metadata_raw
-                .as_ref()
-                .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
-
-            insert_into_top_matches(
-                &mut top_matches,
-                PendingMatch {
-                    id,
-                    path,
-                    chunk_index,
-                    content,
-                    summary,
-                    symbol,
-                    identifier,
-                    source_type,
-                    metadata: metadata_value,
-                    byte_start,
-                    byte_end,
-                    line_start,
-                    line_end,
-                    embedding_model,
-                    score,
-                    classification: classification_value,
-                    language: detected_language,
-                    source: SearchSource::Embedding,
-                },
-                normalized_limit.max(DEFAULT_RESULT_LIMIT),
-            );
         }
 
-        embedding_latency_ms = Some(embedding_timer.elapsed().as_millis());
+        if !ann_used {
+            let mut stmt = conn.prepare(
+                "SELECT id, path, chunk_index, content, summary, symbol, identifier, source_type, language, metadata, embedding, embedding_model, byte_start, byte_end, line_start, line_end FROM file_chunks WHERE embedding_model = ?1",
+            )?;
+            let mut rows = stmt.query(params![&requested_model])?;
+
+            while let Some(row) = rows.next()? {
+                evaluated_chunks += 1;
+                let chunk = read_chunk_row(row)?;
+                if let Some(pending) = chunk_to_pending(
+                    &chunk,
+                    &query_embedding,
+                    &classification,
+                    path_prefix.as_deref(),
+                    path_contains.as_deref(),
+                    language_filter.as_deref(),
+                    &mut seen_hits,
+                ) {
+                    insert_into_top_matches(&mut top_matches, pending, top_limit);
+                }
+            }
+        }
+
         embedding_matches = top_matches.into_iter().rev().collect();
+        embedding_latency_ms = Some(embedding_timer.elapsed().as_millis());
     }
 
     diagnostics.embedding_latency_ms = embedding_latency_ms;
@@ -687,22 +707,122 @@ fn blob_to_vec(blob: &[u8]) -> Vec<f32> {
     values
 }
 
-pub(crate) fn create_embedder(model_name: &str) -> Result<TextEmbedding, SemanticSearchError> {
-    let name = model_name.trim();
-    let parsed = EmbeddingModel::from_str(name).map_err(|error| {
-        SemanticSearchError::Embedding(format!("Unknown embedding model '{name}': {error}"))
-    })?;
-    let options = TextInitOptions::new(parsed).with_show_download_progress(false);
-
-    TextEmbedding::try_new(options)
-        .map_err(|error| SemanticSearchError::Embedding(error.to_string()))
+fn read_chunk_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkRow> {
+    Ok(ChunkRow {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        chunk_index: row.get(2)?,
+        content: row.get(3)?,
+        summary: row.get(4)?,
+        symbol: row.get(5)?,
+        identifier: row.get(6)?,
+        source_type: row.get(7)?,
+        language: row.get(8)?,
+        metadata_raw: row.get(9)?,
+        embedding_blob: row.get(10)?,
+        embedding_model: row.get(11)?,
+        byte_start: row.get(12)?,
+        byte_end: row.get(13)?,
+        line_start: row.get(14)?,
+        line_end: row.get(15)?,
+    })
 }
 
-fn embed_query(embedder: &mut TextEmbedding, text: &str) -> Result<Vec<f32>, SemanticSearchError> {
-    embedder
-        .embed(vec![text.to_string()], None)
+fn chunk_to_pending(
+    chunk: &ChunkRow,
+    query_embedding: &[f32],
+    classification_filter: &Option<Classification>,
+    path_prefix: Option<&str>,
+    path_contains: Option<&str>,
+    language_filter: Option<&str>,
+    seen_hits: &mut HashSet<(String, i32)>,
+) -> Option<PendingMatch> {
+    let key = (chunk.path.clone(), chunk.chunk_index);
+    if seen_hits.contains(&key) {
+        return None;
+    }
+
+    let classification_value = classify_snippet(&chunk.content);
+    if let Some(required) = classification_filter {
+        if &classification_value != required {
+            return None;
+        }
+    }
+
+    if let Some(prefix) = path_prefix {
+        if !chunk.path.starts_with(prefix) {
+            return None;
+        }
+    }
+
+    if let Some(fragment) = path_contains {
+        if !chunk.path.contains(fragment) {
+            return None;
+        }
+    }
+
+    let detected_language = chunk
+        .language
+        .clone()
+        .or_else(|| detect_language(&chunk.path));
+
+    if let Some(required_lang) = language_filter {
+        match detected_language.as_ref().map(|value| value.to_lowercase()) {
+            Some(lang) if lang == required_lang => {}
+            Some(_) => return None,
+            None => return None,
+        }
+    }
+
+    let chunk_embedding = blob_to_vec(&chunk.embedding_blob);
+    if chunk_embedding.is_empty() {
+        return None;
+    }
+
+    let score = dot_product(query_embedding, &chunk_embedding);
+    let metadata_value = chunk
+        .metadata_raw
+        .as_ref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+
+    seen_hits.insert(key);
+
+    Some(PendingMatch {
+        id: chunk.id.clone(),
+        path: chunk.path.clone(),
+        chunk_index: chunk.chunk_index,
+        content: chunk.content.clone(),
+        summary: chunk.summary.clone(),
+        symbol: chunk.symbol.clone(),
+        identifier: chunk.identifier.clone(),
+        source_type: chunk.source_type.clone(),
+        metadata: metadata_value,
+        byte_start: chunk.byte_start,
+        byte_end: chunk.byte_end,
+        line_start: chunk.line_start,
+        line_end: chunk.line_end,
+        embedding_model: chunk.embedding_model.clone(),
+        score,
+        classification: classification_value,
+        language: detected_language,
+        source: SearchSource::Embedding,
+    })
+}
+
+pub(crate) fn create_embedding_runner(
+    model_name: &str,
+    backend_label: &str,
+) -> Result<EmbeddingHandle, SemanticSearchError> {
+    let backend = if backend_label.eq_ignore_ascii_case("candle") {
+        build_candle_backend(model_name, None)
+            .map_err(|error| SemanticSearchError::Embedding(error.to_string()))?
+    } else {
+        build_fastembed_backend(model_name)
+            .map_err(|error| SemanticSearchError::Embedding(error.to_string()))?
+    };
+
+    get_or_create_embedding_runner(&backend, model_name, None)
         .map_err(|error| SemanticSearchError::Embedding(error.to_string()))
-        .map(|mut vectors| vectors.pop().unwrap_or_default())
 }
 
 fn dot_product(query: &[f32], chunk: &[f32]) -> f32 {
@@ -1405,7 +1525,36 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use rusqlite::{params, Connection};
+    use std::collections::HashSet;
     use tempfile::tempdir;
+
+    fn vec_to_blob(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    fn sample_chunk(path: &str) -> ChunkRow {
+        ChunkRow {
+            id: "chunk-1".to_string(),
+            path: path.to_string(),
+            chunk_index: 0,
+            content: "fn example() { 42; }".to_string(),
+            summary: None,
+            symbol: None,
+            identifier: None,
+            source_type: Some("code".to_string()),
+            language: Some("rust".to_string()),
+            metadata_raw: None,
+            embedding_blob: vec_to_blob(&[1.0, 0.0]),
+            embedding_model: DEFAULT_EMBEDDING_MODEL.to_string(),
+            byte_start: Some(0),
+            byte_end: Some(18),
+            line_start: Some(1),
+            line_end: Some(1),
+        }
+    }
 
     #[test]
     fn identifier_query_short_circuits_embedding() -> Result<()> {
@@ -1516,5 +1665,71 @@ mod tests {
         assert!(diagnostics.lexical_latency_ms.is_some());
 
         Ok(())
+    }
+
+    #[test]
+    fn chunk_to_pending_respects_filters() {
+        let chunk = sample_chunk("src/lib.rs");
+        let mut seen_hits = HashSet::new();
+        let query_embedding = vec![1.0, 0.0];
+        let pending = chunk_to_pending(
+            &chunk,
+            &query_embedding,
+            &Some(Classification::Function),
+            Some("src"),
+            Some("lib"),
+            Some("rust"),
+            &mut seen_hits,
+        )
+        .expect("chunk should pass filters");
+
+        assert_eq!(pending.path, "src/lib.rs");
+        assert!(matches!(pending.classification, Classification::Function));
+        assert!(seen_hits.contains(&(chunk.path.clone(), chunk.chunk_index)));
+    }
+
+    #[test]
+    fn chunk_to_pending_rejects_duplicates_and_mismatched_paths() {
+        let chunk = sample_chunk("src/lib.rs");
+        let mut seen_hits = HashSet::new();
+        let query_embedding = vec![1.0, 0.0];
+
+        // First call inserts into the seen set.
+        let first = chunk_to_pending(
+            &chunk,
+            &query_embedding,
+            &None,
+            None,
+            None,
+            None,
+            &mut seen_hits,
+        );
+        assert!(first.is_some());
+
+        // Second call should be filtered out due to seen_hits.
+        let second = chunk_to_pending(
+            &chunk,
+            &query_embedding,
+            &None,
+            None,
+            None,
+            None,
+            &mut seen_hits,
+        );
+        assert!(second.is_none());
+
+        // Unknown path prefix should filter the chunk immediately.
+        let mut fresh_seen = HashSet::new();
+        let filtered = chunk_to_pending(
+            &chunk,
+            &query_embedding,
+            &None,
+            Some("tests"),
+            None,
+            None,
+            &mut fresh_seen,
+        );
+        assert!(filtered.is_none());
+        assert!(fresh_seen.is_empty());
     }
 }

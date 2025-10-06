@@ -1,4 +1,6 @@
+mod ann;
 mod bundle;
+mod embedding;
 mod git_timeline;
 mod graph;
 mod index_status;

@@ -6,7 +6,7 @@ This guide explains how to run the **index-mcp** Rust server with Codex CLI (or 
 
 ## 1. Overview
 
-- **Purpose:** Build and query a `.mcp-index.sqlite` database that captures file metadata, embeddings, and git history so agents can answer questions without re-parsing the repo.
+- **Purpose:** Build and query a `.mcp-index.sqlite` database (plus optional `.ann` neighbours) that captures file metadata, embeddings, and git history so agents can answer questions without re-parsing the repo.
 - **Primary runtime:** `crates/index-mcp-server` – a Rust binary using the official [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) SDK.
 - **Helper script:** `start.sh` launches the Rust binary via `cargo run`, honouring `INDEX_MCP_ARGS` and `INDEX_MCP_CARGO_PROFILE` overrides.
 - **Watch mode:** `cargo run -p index-mcp-server -- --watch` (or `INDEX_MCP_ARGS="--watch" ./start.sh`) keeps the SQLite index fresh after file edits.
@@ -66,9 +66,9 @@ The Rust binary registers the full tool surface that previously lived in the Nod
 
 | Tool / Prompt | Notes |
 |---------------|-------|
-| `ingest_codebase` | Walks the workspace, respects `.gitignore`, stores metadata, embeddings, and auto-evicts least-used chunks when requested. |
-| `semantic_search` | Hybrid lexical + embedding retrieval. Results suppress chunks served recently in this session (pass `recent_hits` to override), return trimmed focus spans instead of the entire chunk, and include `source` (`embedding`/`lexical`), `confidence`, chunk metadata (`summary`, `symbol`, `identifier`, `sourceType`, `metadata`), plus `diagnostics` (model, backend, quantization, latency, evaluated chunk count). |
-| `code_lookup` | Routes `mode="search"` queries to semantic search and `mode="bundle"` to context bundles, forwarding deduped results, focus spans, and the same metadata/diagnostics so downstream prompts can cite confidently. |
+| `ingest_codebase` | Walks the workspace, respects `.gitignore`, stores metadata, embeddings, and auto-evicts least-used chunks when requested. When overriding `databaseName`, provide a filename (for example `index-alt.sqlite`)—directory values like `"."` cannot be opened by SQLite. |
+| `semantic_search` | Hybrid lexical + embedding retrieval. Results suppress chunks served recently in this session (pass `recent_hits` to override), return trimmed focus spans instead of the entire chunk, and include `source` (`embedding`/`lexical`), `confidence`, chunk metadata (`summary`, `symbol`, `identifier`, `sourceType`, `metadata`), plus `diagnostics` (model, backend, quantization, latency, evaluated chunk count, ANN status). |
+| `code_lookup` | Routes `mode="search"` queries to semantic search and `mode="bundle"` to context bundles, forwarding deduped results, focus spans, and the same metadata/diagnostics so downstream prompts can cite confidently. Bundle mode requires a `file` (or query that resolves to one), and the `symbol` parameter must be a `{ "name": "..." }` object rather than a raw string. |
 | `context_bundle` | Returns file metadata, focus definitions, nearby snippets, and quick links within a token budget. Optional natural-language `query` re-ranks snippets via embeddings, and the bundle now appends graph-linked neighbor snippets from other files (deduped and annotated with edge metadata) before trimming. Diagnostics still report embedding model/backend, latency, and similarity range so prompts can tune follow-up calls. |
 | `index_status` | Summarizes index freshness, embedding models, ingestion history, and git parity. |
 | `repository_timeline` | Streams recent git commits with churn stats, directory highlights, optional diffs, and PR URLs. |
@@ -85,7 +85,8 @@ The Rust runtime preserves the schema introduced by the legacy implementation:
 - `files` – path, size, modified time (ms), SHA-256 hash, stored content, last indexed timestamp.
 - `file_chunks` – chunk text, embeddings (float32 blobs), byte/line spans, hit counters, embedding metadata (`embedding_model`, summary/symbol fields, detected language, serialized graph metadata).
 - `ingestions` – ingest history, durations, counts, and root paths.
-- `meta` – key/value store for commit SHA, last indexed timestamp, embedding backend/dimension/quantized flags, and other metadata.
+- `meta` – key/value store for commit SHA, last indexed timestamp, embedding backend/dimension/quantized flags, ANN basenames/mapping filenames, and other metadata.
+- `.ann/` directory – optional HNSW graph (`*.hnsw.graph`/`*.hnsw.data`) plus an `.ids` mapping file that map ANN neighbours back to chunk ids. These files are regenerated on each ingest when embeddings are enabled.
 
 Databases created before the rewrite remain compatible with the current runtime.
 
@@ -112,7 +113,8 @@ Tokens can be sourced from environment variables (for example `${DOCS_KEY}`) or 
 - **Missing toolchain:** `start.sh` aborts when `cargo` is absent. Install Rust via `rustup` and re-run the script.
 - **Slow cold start:** Use `INDEX_MCP_CARGO_PROFILE=debug` while iterating; switch back to release for production agents.
 - **Cold ingest latency:** Startup now warms the quantized `Xenova/all-MiniLM-L6-v2` embedder in the background, trimming the first `ingest_codebase` on clean workspaces to ~24s; subsequent runs reuse the cache and finish in milliseconds when files are unchanged.
-- **Embedding download issues:** The server uses `fastembed`; failures leave the cache empty. Re-run once connectivity returns or disable embeddings with `{ "embedding": { "enabled": false } }`.
+- **Embedding download issues:** FastEmbed models download on demand. Re-run once connectivity returns, point Candle at pre-fetched weights with `embedding.backend="candle"`, or disable embeddings entirely via `{ "embedding": { "enabled": false } }`.
+- **ANN corruption:** If search logs warn about ANN load failures, delete the corresponding files under `.ann/` and trigger a fresh ingest. The runtime will fall back to brute-force scoring in the meantime.
 - **SQLite locks:** The Rust ingestor uses transactions with `PRAGMA foreign_keys=ON`. If another process holds the DB, re-run after releasing the lock or configure a different database filename.
 - **Watcher noise:** Add `--watch-quiet` or tighten `--watch-debounce`. The watcher respects include/exclude globs plus `.gitignore` entries.
 - **Remote proxy errors:** Check stderr for reconnect attempts. Invalid auth headers or TLS failures propagate as MCP tool errors.

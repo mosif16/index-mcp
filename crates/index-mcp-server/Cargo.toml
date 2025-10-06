@@ -36,7 +36,12 @@ url = { workspace = true }
 notify = { workspace = true }
 reqwest = { workspace = true }
 ignore = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
+sentence-transformers-rs = { workspace = true }
+hnsw_rs = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
-tempfile = { workspace = true }

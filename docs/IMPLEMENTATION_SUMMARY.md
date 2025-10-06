@@ -11,7 +11,7 @@ This document describes the Rust implementation that now powers the `index-mcp` 
 ## Ingestion Pipeline (`crates/index-mcp-server/src/ingest.rs`)
 
 - `perform_ingest` resolves the workspace root, applies default include/exclude glob sets (skipping `.git`, build artifacts, and `.mcp-index.sqlite`), and optionally restricts ingestion to targeted paths ([ingest.rs:1-120,233-317]).
-- The walker hashes files, respects a configurable max size, and stores metadata and (optionally) file contents in the `files` table. Chunks are built with `fastembed` using a cached embedder, then written to `file_chunks` with embeddings, byte/line ranges, and hit counters ([ingest.rs:57-206,703-317]).
+- The walker hashes files, respects a configurable max size, and stores metadata and (optionally) file contents in the `files` table. Embeddings are produced through a pluggable backend (FastEmbed ONNX by default, Candle sentence-transformers when `embedding.backend="candle"`) with per-model caching, then written to `file_chunks` alongside byte/line ranges and hit counters. When embeddings are present the ingest pass also emits a `.ann/<basename>.hnsw.*` index plus `.ids` mapping for HNSW-based ANN search ([ingest.rs:57-206,640-765]).
 - Each ingest writes an `ingestions` row, updates the `meta` table with the current `commit_sha` (via `git rev-parse`) and `indexed_at` timestamp, and purges removed files before committing ([ingest.rs:434-472]).
 - Source files feed a lightweight TypeScript-oriented code graph extractor that populates `code_graph_nodes`/`code_graph_edges`, enabling relationship-aware bundles ([graph.rs:1-132]).
 - Auto-eviction keeps the SQLite database near the configured ceiling by removing the coldest chunks/nodes when `autoEvict` and `maxDatabaseSizeBytes` are provided ([ingest.rs:725-779]).
@@ -19,7 +19,7 @@ This document describes the Rust implementation that now powers the `index-mcp` 
 
 ## Semantic Lookup & Bundling
 
-- `semantic_search` opens the SQLite database read-only, resolves the desired embedding model, streams chunk embeddings, and maintains a top-k heap. Returned chunks carry surrounding context and trigger `UPDATE file_chunks SET hits = hits + 1` so usage influences eviction ([search.rs:1-231]).
+- `semantic_search` opens the SQLite database read-only, resolves the desired embedding model, and hydrates a cached embedder. When an ANN basename is present it queries the on-disk HNSW graph first and automatically falls back to brute-force scoring if loading fails, logging diagnostics either way. Returned chunks carry surrounding context and trigger `UPDATE file_chunks SET hits = hits + 1` so usage influences eviction ([search.rs:1-231,386-504]).
 - `context_bundle` assembles file metadata, symbol definitions, graph neighbors, and related snippets. It now memoizes responses by file hash, selector, ranges, and budget so repeat queries avoid duplicate work, and its multi-tier trimming falls back from full text to focused excerpts and summaries while surfacing explicit token-usage guidance (default 3 000 tokens or `INDEX_MCP_BUDGET_TOKENS`) ([bundle.rs:1-314,586-899]).
 - `code_lookup` inside `service.rs` routes `mode="search"` requests to semantic search and `mode="bundle"` to contextual bundles, mirroring the legacy “auto” router ([service.rs:293-341]).
 

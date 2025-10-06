@@ -2,12 +2,12 @@
 
 `index-mcp` is a Rust-native [Model Context Protocol](https://github.com/modelcontextprotocol) (MCP) server that scans a source-code workspace and writes a searchable SQLite database (`.mcp-index.sqlite`) into the project root. Agents query the database through MCP tools to obtain semantic chunks and git history without re-reading the entire repository on every request.
 
-The project previously shipped a Node/TypeScript runtime. That implementation has now been retired in favour of the Rust server, which owns the complete tool surface.
+The project previously shipped a Node/TypeScript runtime. That implementation has now been retired in favour of the Rust server, which owns the complete tool surface. If you need the legacy Node server, check out the `main` branch; everything on `Rust-rewrite` assumes the Rust runtime.
 
 ## Key Capabilities
 
-- **Fast ingestion** – Parallel filesystem walker with `.gitignore` support, hashing, chunking, embeddings, and optional auto-eviction based on database size targets. Each chunk now persists summary, symbol, identifier, language, and graph metadata alongside the embedding payload.
-- **Hybrid lookups** – `semantic_search`, `code_lookup`, and `context_bundle` blend lexical sieves with embedding-backed similarity. Results ship with `source` (`embedding` vs `lexical`), `confidence`, and symbol metadata so agents understand why a match was promoted.
+- **Fast ingestion** – Parallel filesystem walker with `.gitignore` support, hashing, chunking, pluggable embeddings (FastEmbed ONNX by default, Candle sentence-transformers optional), and optional auto-eviction based on database size targets. Each chunk now persists summary, symbol, identifier, language, and graph metadata alongside the embedding payload. When embeddings are enabled the ingest pass can also persist an on-disk HNSW index for fast approximate nearest-neighbour (ANN) search.
+- **Hybrid lookups** – `semantic_search`, `code_lookup`, and `context_bundle` blend lexical sieves with embedding-backed similarity. Results ship with `source` (`embedding` vs `lexical`), `confidence`, and symbol metadata so agents understand why a match was promoted, while automatically falling back to brute-force scoring if the ANN index is unavailable.
 - **Cross-file awareness** – `context_bundle` automatically pulls in graph-linked snippets from neighboring files, annotating each excerpt with edge metadata so downstream prompts can cite related definitions without extra calls.
 - **Git awareness** – `repository_timeline` and `repository_timeline_entry` summarise recent commits and cached diffs so agents can reason about repo history.
 - **Watch mode** – Optional filesystem watcher re-ingests changed paths automatically for long-running agent sessions.
@@ -76,6 +76,70 @@ INDEX_MCP_MODE=dev INDEX_MCP_ARGS="--watch-debounce=250" ./start.sh
 
 `INDEX_MCP_MODE` or the first positional argument choose between `production` and `development` presets. Additional CLI flags can be provided via `INDEX_MCP_ARGS` or by appending them after the mode; both paths are tokenised before being passed downstream.
 
+## Embedding Backends & ANN Search
+
+`ingest_codebase` exposes a configurable embedding pipeline via the `embedding` request block (and the corresponding CLI flags). Key options:
+
+- `backend`: `fastembed` (default) loads ONNX models from the FastEmbed distribution, while `candle` bootstraps CPU-only sentence-transformers via Candle. Candle honours optional `batchSize` overrides and inherits model-specific requirements (download the model weights before running in offline environments).
+- `model`: Case-sensitive identifier understood by the chosen backend (for example `Xenova/all-MiniLM-L6-v2`, `BAAI/bge-base-en-v1.5`, or the Candle variants listed in `embedding.rs`).
+- `enabled`: Toggle embeddings entirely—lexical search continues to work when set to `false`.
+- `chunkSizeTokens`, `chunkOverlapTokens`, and `batchSize`: Tune tokenizer slice length, overlap, and embedding batch size. Quantized FastEmbed models ignore batch size, while Candle honours whichever value is provided.
+
+Embedders are cached per `(backend, model, batchSize)` tuple, so watches, search, and bundle operations reuse the warmed runner without paying model start-up costs.
+
+When embeddings are written the ingest pass also attempts to persist an ANN index (`.ann/<basename>.hnsw.{graph,data}` plus a mapping file). Search mode opens that index lazily, falling back to brute-force scoring if the files are missing or corrupted; a warning is emitted so operators can investigate. The active basename and mapping filename are mirrored into the SQLite `meta` table (`embedding_ann_basename`, `embedding_ann_mapping`) for observability and cleanup.
+
+## MCP Client Configuration Examples
+
+The snippets below show how to wire this server into popular MCP clients. Adjust paths and logging preferences for your machine.
+
+### Codex CLI (`~/.config/codex/config.toml`)
+
+```toml
+[mcp_servers.index_mcp]
+command = "/path/to/index-mcp/start.sh"
+# Optionally pass a mode (`production` by default) or extra flags.
+# args = ["production"]
+startup_timeout_sec = 30
+tool_timeout_sec = 300
+
+[mcp_servers.index_mcp.env]
+INDEX_MCP_MODE = "production"          # or "development"
+INDEX_MCP_LOG_LEVEL = "info"
+INDEX_MCP_LOG_DIR = "/path/to/index-mcp/logs"
+INDEX_MCP_LOG_CONSOLE = "true"
+INDEX_MCP_BUDGET_TOKENS = "3000"
+INDEX_MCP_RUNTIME = "rust"              # switch to "node" for the legacy server
+RUST_LOG = "warn"
+```
+
+### Claude Code (`~/Library/Application Support/Claude/code/config.json` on macOS)
+
+```json
+{
+  "mcpServers": {
+    "index_mcp": {
+      "command": "/path/to/index-mcp/start.sh",
+      "env": {
+        "INDEX_MCP_MODE": "production",
+        "INDEX_MCP_LOG_LEVEL": "info",
+        "INDEX_MCP_LOG_DIR": "/path/to/index-mcp/logs",
+        "INDEX_MCP_LOG_CONSOLE": "true",
+        "INDEX_MCP_BUDGET_TOKENS": "3000",
+        "INDEX_MCP_RUNTIME": "rust",
+        "RUST_LOG": "warn"
+      },
+      "timeout": {
+        "startup": 30,
+        "tool": 300
+      }
+    }
+  }
+}
+```
+
+Claude Code reads this JSON when the VS Code extension starts. Restart the extension (or VS Code) after editing the file so the new server registration takes effect.
+
 ## Watch Mode
 
 Enable watch mode either via Cargo directly or with the helper script:
@@ -104,7 +168,7 @@ Key flags:
 
 `context_bundle` accepts an optional natural-language `query` that re-ranks snippets via the same embedding backend used for ingest. Bundles expose similarity scores, symbol metadata, and diagnostics (query echo, model/backend, latency, similarity range) so downstream prompts can weight each excerpt appropriately. Raw embedding vectors are stripped from the final payload, but the per-snippet metadata remains available for agents that need richer citations.
 
-`ingest_codebase` persists the additional metadata (summary, symbol, identifier, language, graph metadata) to `file_chunks` and records `embedding_backend`, `embedding_dimension`, `embedding_quantized`, and `embedding_latency_ms` in both the `IngestResponse` and the backing SQLite `meta` table. Existing databases auto-migrate—missing columns are added on demand, and older indices continue to work until a fresh ingest backfills the new fields.
+`ingest_codebase` persists the additional metadata (summary, symbol, identifier, language, graph metadata) to `file_chunks` and records `embedding_backend`, `embedding_dimension`, `embedding_quantized`, and `embedding_latency_ms` in both the `IngestResponse` and the backing SQLite `meta` table. Existing databases auto-migrate—missing columns are added on demand, and older indices continue to work until a fresh ingest backfills the new fields. When overriding `databaseName`, always supply a filename (for example `".mcp-index.sqlite"` or `"index-alt.sqlite"`); directory-like values such as `"."` cannot be opened by SQLite and will fail the ingest.
 
 Context bundles still respect the `INDEX_MCP_BUDGET_TOKENS` environment variable (default: 3000 tokens). Responses prioritise focus definitions, append nearby lines, and truncate intelligently with explicit notices when content is trimmed. Each served chunk increments a `hits` counter which feeds auto-eviction heuristics during ingest.
 
@@ -122,10 +186,10 @@ Pass the payload above to the `ingest_codebase` tool (for example via the MCP cl
 
 ## Recommended Agent Workflow
 
-- **Prime the index** at the start of every session: run `ingest_codebase { "root": "." }` or launch the server with `--watch`. Respect `.gitignore`, skip artifacts larger than 8 MiB, and configure `autoEvict`/`maxDatabaseSizeBytes` before the database grows out of control.
+- **Prime the index** at the start of every session: run `ingest_codebase { "root": "." }` or launch the server with `--watch`. Respect `.gitignore`, skip artifacts larger than 8 MiB, and configure `autoEvict`/`maxDatabaseSizeBytes` before the database grows out of control. If you need a custom SQLite location, pass `databaseName` as a filename (not a directory path) so the ingestor can create the file safely.
 - **Check freshness before reasoning** by calling `index_status`. If `isStale` is true or HEAD moved, re-run ingest before answering questions.
 - **Brief yourself on recent commits** with `repository_timeline` (and `repository_timeline_entry` when you need detailed diffs) so plans reflect the latest changes.
-- **Assemble payloads with `code_lookup`**: start with `query="..."` to scope results, then request `file="..."` plus optional `symbol` bundles for the snippets you intend to cite.
+- **Assemble payloads with `code_lookup`**: start with `query="..."` to scope results, then request `file="..."` plus optional `symbol` bundles for the snippets you intend to cite. Bundle mode enforces this contract—include `file` (or a `query` that resolves to a file) and provide `symbol` as an object such as `{ "name": "perform_ingest" }` rather than a bare string so the request passes schema validation.
 - **Deliver targeted context** using `context_bundle` with `budgetTokens` (or `INDEX_MCP_BUDGET_TOKENS`), include citations, and avoid dumping entire files into responses.
 - **Refine without re-ingesting** by leaning on `semantic_search` or additional `context_bundle` calls for deeper dives.
 - **Close the loop after edits**: re-run ingest (or keep watch mode active) and confirm with `index_status`/`info` so downstream tasks consume fresh data.
@@ -152,7 +216,8 @@ Remote tools are surfaced under `<namespace>.<tool>` and benefit from the same s
 ## Troubleshooting
 
 - **Missing toolchain** – Install Rust with `rustup` and ensure `cargo` is on `PATH`.
-- **Embedding download issues** – The server uses `fastembed`; transient network failures leave the cache empty. Re-run ingest when connectivity is restored or disable embeddings via `{ "embedding": { "enabled": false } }`.
+- **Embedding download issues** – Default runs rely on FastEmbed’s ONNX cache. Re-run ingest once connectivity returns, switch to Candle with pre-seeded weights, or disable embeddings via `{ "embedding": { "enabled": false } }`.
+- **ANN index missing** – The `.ann` directory is regenerated on each ingest. If search logs warn about ANN load failures, remove the stale files and trigger a fresh ingest; the system will continue with brute-force scoring meanwhile.
 - **Cold ingest latency** – Startup now preloads the quantized `Xenova/all-MiniLM-L6-v2` weights; the first ingest on a clean workspace drops to ~24s, and subsequent runs reuse the in-process cache so they finish in milliseconds.
 - **SQLite locks** – Another process may hold the database. Retry after releasing the lock or configure a different database filename with `--watch-database`.
 - **Watcher noise** – Increase debounce or enable `--watch-quiet` to reduce log output.

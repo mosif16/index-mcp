@@ -1,14 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
-use once_cell::sync::{Lazy, OnceCell};
 use rmcp::schemars::{self, JsonSchema};
 use rusqlite::{params, Connection, OpenFlags, Transaction};
 use serde::{Deserialize, Serialize};
@@ -18,6 +14,11 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
+    ann,
+    embedding::{
+        build_candle_backend, build_fastembed_backend, get_or_create_embedding_runner,
+        EmbeddingBackend, EmbeddingHandle,
+    },
     graph::{extract_graph, GraphExtraction},
     index_status::DEFAULT_DB_FILENAME,
     search::detect_language,
@@ -41,12 +42,6 @@ const DEFAULT_CHUNK_SIZE_TOKENS: usize = 256;
 const DEFAULT_CHUNK_OVERLAP_TOKENS: usize = 32;
 const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 32;
 const DEFAULT_MAX_DATABASE_SIZE_BYTES: u64 = 150 * 1024 * 1024; // 150 MB
-
-type EmbedderHandle = Arc<Mutex<TextEmbedding>>;
-type EmbedderEntry = Arc<OnceCell<EmbedderHandle>>;
-
-static EMBEDDER_CACHE: Lazy<Mutex<HashMap<String, EmbedderEntry>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -79,6 +74,8 @@ pub struct EmbeddingParams {
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
     pub chunk_size_tokens: Option<u32>,
@@ -91,7 +88,7 @@ pub struct EmbeddingParams {
 struct EmbeddingConfig {
     enabled: bool,
     model: String,
-    model_variant: EmbeddingModel,
+    backend: EmbeddingBackend,
     chunk_size_tokens: usize,
     chunk_overlap_tokens: usize,
     batch_size: Option<usize>,
@@ -557,8 +554,16 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
     let mut embedding_backend_output: Option<String> = None;
     let mut embedding_dimension_output: Option<u32> = None;
     let mut embedding_latency_ms: Option<u128> = None;
+    let mut ann_basename_output: Option<String> = None;
+    let mut ann_mapping_output: Option<String> = None;
+    let ann_dir = ann::ann_directory(&database_path);
+    let ann_backend_label = embedding_config.backend.metadata_label();
+    let ann_base_prefix =
+        ann::ann_base_prefix(&database_path, &embedding_config.model, &ann_backend_label);
+    let existing_ann_basename = load_meta_value_tx(&transaction, ann::ANN_META_BASENAME_KEY);
+    let existing_ann_mapping = load_meta_value_tx(&transaction, ann::ANN_META_MAPPING_KEY);
     let embedding_quantized_flag = if embedding_config.enabled {
-        Some(is_quantized_model(&embedding_config.model_variant))
+        Some(embedding_config.backend.is_quantized())
     } else {
         None
     };
@@ -653,7 +658,7 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
             }
 
             let embeddings = guard
-                .embed(batch_texts, embedding_config.batch_size)
+                .embed_batch(&batch_texts)
                 .map_err(|error| IngestError::Embedding(error.to_string()))?;
 
             for (offset, embedding_vec) in embeddings.into_iter().enumerate() {
@@ -672,12 +677,8 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
         }
 
         if embedding_backend_output.is_none() {
-            let backend = if embedding_quantized_flag.unwrap_or(false) {
-                "onnx-quantized"
-            } else {
-                "onnx"
-            };
-            embedding_backend_output = Some(backend.to_string());
+            let backend_label = embedding_config.backend.metadata_label();
+            embedding_backend_output = Some(backend_label);
         }
 
         let mut insert_stmt = transaction.prepare(
@@ -722,6 +723,58 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
         embedding_latency_ms = Some(embedding_start.elapsed().as_millis());
     }
 
+    let mut ann_embeddings: Vec<(String, Vec<f32>)> = Vec::new();
+    if embedding_config.enabled {
+        ann_embeddings = load_ann_embeddings(&transaction, &embedding_config.model)?;
+    }
+
+    if embedding_config.enabled && !ann_embeddings.is_empty() {
+        match ann::build_ann_index(&ann_dir, &ann_base_prefix, &ann_embeddings) {
+            Ok(Some(info)) => {
+                if let Some(existing) = existing_ann_basename.as_deref() {
+                    if existing != info.basename {
+                        let _ = ann::remove_ann_index(&ann_dir, existing);
+                    }
+                }
+                ann_basename_output = Some(info.basename);
+                ann_mapping_output = Some(info.mapping_filename);
+                if embedding_dimension_output.is_none() {
+                    embedding_dimension_output = Some(info.dimension as u32);
+                }
+            }
+            Ok(None) => {
+                if let Some(existing) = existing_ann_basename.as_deref() {
+                    let _ = ann::remove_ann_index(&ann_dir, existing);
+                }
+                ann_basename_output = None;
+                ann_mapping_output = None;
+            }
+            Err(error) => {
+                let root_cause = error.root_cause();
+                tracing::warn!(
+                    target = "ingest",
+                    error_display = %error,
+                    error_debug = ?error,
+                    root_cause = %root_cause,
+                    ann_dir = %ann_dir.display(),
+                    ann_base_prefix = %ann_base_prefix,
+                    existing_ann_basename = ?existing_ann_basename.as_ref(),
+                    existing_ann_mapping = ?existing_ann_mapping.as_ref(),
+                    "failed to build ANN index; falling back to brute-force"
+                );
+                if let Some(existing) = existing_ann_basename.as_deref() {
+                    let _ = ann::remove_ann_index(&ann_dir, existing);
+                }
+                ann_basename_output = None;
+                ann_mapping_output = None;
+            }
+        }
+    } else if let Some(existing) = existing_ann_basename.as_deref() {
+        let _ = ann::remove_ann_index(&ann_dir, existing);
+        ann_basename_output = None;
+        ann_mapping_output = None;
+    }
+
     if let Some(model) = &embedding_model_output {
         upsert_meta(&transaction, "embedding_model", model, finished_ms)?;
     }
@@ -743,6 +796,36 @@ fn perform_ingest(params: IngestParams) -> Result<IngestResponse, IngestError> {
             if quantized { "true" } else { "false" },
             finished_ms,
         )?;
+    }
+    match &ann_basename_output {
+        Some(basename) => {
+            upsert_meta(
+                &transaction,
+                ann::ANN_META_BASENAME_KEY,
+                basename,
+                finished_ms,
+            )?;
+        }
+        None => {
+            if existing_ann_basename.is_some() {
+                remove_meta(&transaction, ann::ANN_META_BASENAME_KEY)?;
+            }
+        }
+    }
+    match &ann_mapping_output {
+        Some(mapping) => {
+            upsert_meta(
+                &transaction,
+                ann::ANN_META_MAPPING_KEY,
+                mapping,
+                finished_ms,
+            )?;
+        }
+        None => {
+            if existing_ann_mapping.is_some() {
+                remove_meta(&transaction, ann::ANN_META_MAPPING_KEY)?;
+            }
+        }
     }
 
     transaction.commit()?;
@@ -800,10 +883,23 @@ fn resolve_embedding_config(
     let model = params
         .model
         .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
-
-    let model_variant = EmbeddingModel::from_str(&model).map_err(|error| {
-        IngestError::Embedding(format!("Unknown embedding model '{model}': {error}"))
-    })?;
+    let requested_batch_size = params.batch_size.map(|value| value.max(1) as usize);
+    let backend = match params
+        .backend
+        .unwrap_or_else(|| "fastembed".to_string())
+        .to_lowercase()
+        .as_str()
+    {
+        "fastembed" | "onnx" => build_fastembed_backend(&model)
+            .map_err(|error| IngestError::Embedding(error.to_string()))?,
+        "candle" => build_candle_backend(&model, requested_batch_size)
+            .map_err(|error| IngestError::Embedding(error.to_string()))?,
+        other => {
+            return Err(IngestError::Embedding(format!(
+                "Unsupported embedding backend '{other}'"
+            )))
+        }
+    };
 
     let chunk_size_tokens = params
         .chunk_size_tokens
@@ -816,10 +912,10 @@ fn resolve_embedding_config(
         .unwrap_or(DEFAULT_CHUNK_OVERLAP_TOKENS)
         .min(chunk_size_tokens);
 
-    let batch_size = match params.batch_size {
-        Some(value) => Some(value.max(1) as usize),
+    let batch_size = match requested_batch_size {
+        Some(value) => Some(value),
         None => {
-            if is_quantized_model(&model_variant) {
+            if backend.is_quantized() {
                 None
             } else {
                 Some(DEFAULT_EMBEDDING_BATCH_SIZE)
@@ -830,27 +926,11 @@ fn resolve_embedding_config(
     Ok(EmbeddingConfig {
         enabled,
         model,
-        model_variant,
+        backend,
         chunk_size_tokens,
         chunk_overlap_tokens,
         batch_size,
     })
-}
-
-fn is_quantized_model(model: &EmbeddingModel) -> bool {
-    matches!(
-        model,
-        EmbeddingModel::AllMiniLML6V2Q
-            | EmbeddingModel::AllMiniLML12V2Q
-            | EmbeddingModel::BGEBaseENV15Q
-            | EmbeddingModel::BGELargeENV15Q
-            | EmbeddingModel::BGESmallENV15Q
-            | EmbeddingModel::NomicEmbedTextV15Q
-            | EmbeddingModel::ParaphraseMLMiniLML12V2Q
-            | EmbeddingModel::MxbaiEmbedLargeV1Q
-            | EmbeddingModel::GTEBaseENV15Q
-            | EmbeddingModel::GTELargeENV15Q
-    )
 }
 
 fn resolve_target_entries(root: &Path, paths: Option<Vec<String>>) -> Vec<TargetEntry> {
@@ -1545,32 +1625,43 @@ fn upsert_meta(
     Ok(())
 }
 
-fn get_or_create_embedder(config: &EmbeddingConfig) -> Result<EmbedderHandle, IngestError> {
-    let model_name = config.model.trim().to_string();
-
-    let entry = {
-        let mut cache = EMBEDDER_CACHE.lock().map_err(|error| {
-            IngestError::Embedding(format!("failed to access embedder cache: {error}"))
-        })?;
-        cache
-            .entry(model_name.clone())
-            .or_insert_with(|| Arc::new(OnceCell::new()))
-            .clone()
-    };
-
-    let model_variant = config.model_variant.clone();
-    let handle = entry.get_or_try_init(move || {
-        initialize_embedder(model_variant.clone())
-            .map(|embedder| Arc::new(Mutex::new(embedder)) as EmbedderHandle)
-    })?;
-
-    Ok(handle.clone())
+fn remove_meta(conn: &Transaction<'_>, key: &str) -> Result<(), rusqlite::Error> {
+    conn.execute("DELETE FROM meta WHERE key = ?1", params![key])?;
+    Ok(())
 }
 
-fn initialize_embedder(model: EmbeddingModel) -> Result<TextEmbedding, IngestError> {
-    let options = TextInitOptions::new(model).with_show_download_progress(false);
+fn load_meta_value_tx(conn: &Transaction<'_>, key: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
 
-    TextEmbedding::try_new(options).map_err(|error| IngestError::Embedding(error.to_string()))
+fn load_ann_embeddings(
+    conn: &Transaction<'_>,
+    model: &str,
+) -> Result<Vec<(String, Vec<f32>)>, IngestError> {
+    let mut stmt = conn
+        .prepare("SELECT id, embedding FROM file_chunks WHERE embedding_model = ?1 ORDER BY id")
+        .map_err(IngestError::Sqlite)?;
+    let mut rows = stmt.query(params![model]).map_err(IngestError::Sqlite)?;
+    let mut embeddings = Vec::new();
+    while let Some(row) = rows.next().map_err(IngestError::Sqlite)? {
+        let id: String = row.get(0).map_err(IngestError::Sqlite)?;
+        let blob: Vec<u8> = row.get(1).map_err(IngestError::Sqlite)?;
+        let vector = embedding_from_bytes(&blob);
+        if !vector.is_empty() {
+            embeddings.push((id, vector));
+        }
+    }
+    Ok(embeddings)
+}
+
+fn get_or_create_embedder(config: &EmbeddingConfig) -> Result<EmbeddingHandle, IngestError> {
+    get_or_create_embedding_runner(&config.backend, &config.model, config.batch_size)
+        .map_err(|error| IngestError::Embedding(error.to_string()))
 }
 
 fn embedding_to_bytes(vector: &[f32]) -> Vec<u8> {
@@ -1579,6 +1670,12 @@ fn embedding_to_bytes(vector: &[f32]) -> Vec<u8> {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     bytes
+}
+
+fn embedding_from_bytes(blob: &[u8]) -> Vec<f32> {
+    blob.chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
 }
 
 fn get_current_commit_sha(root: &Path) -> Result<String, std::io::Error> {
@@ -1811,4 +1908,28 @@ fn line_number_for_char(line_starts: &[usize], target: usize) -> usize {
     }
 
     index + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedding_from_bytes_round_trips() {
+        let values = vec![0.0_f32, 1.5, -2.25, std::f32::consts::PI];
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for value in &values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let reconstructed = embedding_from_bytes(&bytes);
+        assert_eq!(reconstructed, values);
+    }
+
+    #[test]
+    fn embedding_from_bytes_rejects_partial_words() {
+        let bytes = vec![0_u8, 1, 2];
+        let reconstructed = embedding_from_bytes(&bytes);
+        assert!(reconstructed.is_empty());
+    }
 }

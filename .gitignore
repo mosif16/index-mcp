@@ -16,6 +16,10 @@ dist/
 # Local SQLite indexes
 .mcp-index.sqlite
 .mcp-index.sqlite-*
+.mcp-index-*.hnsw.graph
+.mcp-index-*.hnsw.data
+.mcp-index-*.ids
+.ann/
 index
 index-mcp
 *.sqlite
