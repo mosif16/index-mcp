@@ -67,8 +67,8 @@ The Rust binary registers the full tool surface that previously lived in the Nod
 | Tool / Prompt | Notes |
 |---------------|-------|
 | `ingest_codebase` | Walks the workspace, respects `.gitignore`, stores metadata, embeddings, and auto-evicts least-used chunks when requested. |
-| `semantic_search` | Hybrid lexical + embedding retrieval. Results include `source` (`embedding`/`lexical`), `confidence`, chunk metadata (`summary`, `symbol`, `identifier`, `sourceType`, `metadata`), and `diagnostics` (model, backend, quantization, latency, evaluated chunk count). |
-| `code_lookup` | Routes `mode="search"` queries to semantic search and `mode="bundle"` to context bundles, forwarding the same metadata/diagnostics so downstream prompts can cite confidently. |
+| `semantic_search` | Hybrid lexical + embedding retrieval. Results suppress chunks served recently in this session (pass `recent_hits` to override), return trimmed focus spans instead of the entire chunk, and include `source` (`embedding`/`lexical`), `confidence`, chunk metadata (`summary`, `symbol`, `identifier`, `sourceType`, `metadata`), plus `diagnostics` (model, backend, quantization, latency, evaluated chunk count). |
+| `code_lookup` | Routes `mode="search"` queries to semantic search and `mode="bundle"` to context bundles, forwarding deduped results, focus spans, and the same metadata/diagnostics so downstream prompts can cite confidently. |
 | `context_bundle` | Returns file metadata, focus definitions, nearby snippets, and quick links within a token budget. Accepts optional natural-language `query` to re-rank snippets via embeddings and emits per-snippet similarity scores, symbol metadata, and bundle diagnostics (model/backend, latency, similarity range). |
 | `index_status` | Summarizes index freshness, embedding models, ingestion history, and git parity. |
 | `repository_timeline` | Streams recent git commits with churn stats, directory highlights, optional diffs, and PR URLs. |

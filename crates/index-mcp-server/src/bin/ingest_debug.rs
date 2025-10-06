@@ -627,6 +627,7 @@ async fn run_semantic_search(
         summary_mode: Some(SummaryMode::Brief),
         max_context_before: Some(1),
         max_context_after: Some(1),
+        recent_hits: None,
     };
 
     semantic_search(params).await

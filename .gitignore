@@ -16,6 +16,8 @@ dist/
 # Local SQLite indexes
 .mcp-index.sqlite
 .mcp-index.sqlite-*
+index
+index-mcp
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal

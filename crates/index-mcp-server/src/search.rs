@@ -50,6 +50,15 @@ pub struct SemanticSearchParams {
     pub max_context_before: Option<u32>,
     #[serde(default)]
     pub max_context_after: Option<u32>,
+    #[serde(default)]
+    pub recent_hits: Option<Vec<SearchResultCoordinate>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResultCoordinate {
+    pub path: String,
+    pub chunk_index: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -227,6 +236,7 @@ fn perform_semantic_search(
         summary_mode,
         max_context_before,
         max_context_after,
+        recent_hits,
     } = params;
 
     let trimmed_query = query.trim();
@@ -236,7 +246,13 @@ fn perform_semantic_search(
 
     let summary_mode = summary_mode.unwrap_or_default();
     let normalized_limit = normalize_limit(limit);
-    let lexical_budget = DEFAULT_IDENTIFIER_LIMIT.min(normalized_limit);
+    let should_run_lexical_query = should_run_lexical(trimmed_query);
+    let identifier_query = is_identifier_query(trimmed_query);
+    let lexical_budget = if should_run_lexical_query {
+        normalized_limit
+    } else {
+        DEFAULT_IDENTIFIER_LIMIT.min(normalized_limit)
+    };
     let language_filter = language.map(|value| value.to_lowercase());
     let context_before_lines = max_context_before
         .map(|value| value.min(MAX_CONTEXT_LINES as u32) as usize)
@@ -244,6 +260,12 @@ fn perform_semantic_search(
     let context_after_lines = max_context_after
         .map(|value| value.min(MAX_CONTEXT_LINES as u32) as usize)
         .unwrap_or(DEFAULT_CONTEXT_AFTER);
+
+    let mut seen_hits: HashSet<(String, i32)> = recent_hits
+        .unwrap_or_default()
+        .into_iter()
+        .map(|hit| (hit.path, hit.chunk_index))
+        .collect();
 
     let root_param = root.unwrap_or_else(|| "./".to_string());
     let absolute_root = resolve_root(&root_param)?;
@@ -300,7 +322,7 @@ fn perform_semantic_search(
 
     let mut lexical_matches: Vec<PendingMatch> = Vec::new();
     let mut lexical_latency_ms: Option<u128> = None;
-    if should_run_lexical(trimmed_query) && lexical_budget > 0 {
+    if should_run_lexical_query && lexical_budget > 0 {
         let lexical_timer = Instant::now();
         lexical_matches = collect_lexical_matches(
             &conn,
@@ -314,124 +336,150 @@ fn perform_semantic_search(
         lexical_latency_ms = Some(lexical_timer.elapsed().as_millis());
     }
 
-    let embedding_timer = Instant::now();
-    let mut top_matches: Vec<PendingMatch> = Vec::new();
+    if !lexical_matches.is_empty() {
+        let mut filtered = Vec::with_capacity(lexical_matches.len());
+        for pending in lexical_matches.into_iter() {
+            let key = (pending.path.clone(), pending.chunk_index);
+            if seen_hits.contains(&key) {
+                continue;
+            }
+            seen_hits.insert(key);
+            filtered.push(pending);
+        }
+        lexical_matches = filtered;
+    }
+
+    let skip_embedding = identifier_query && !lexical_matches.is_empty();
+
+    let mut embedding_matches: Vec<PendingMatch> = Vec::new();
     let mut evaluated_chunks: u64 = 0;
+    let mut embedding_latency_ms: Option<u128> = None;
 
-    let mut stmt = conn.prepare(
-        "SELECT id, path, chunk_index, content, summary, symbol, identifier, source_type, language, metadata, embedding, embedding_model, byte_start, byte_end, line_start, line_end FROM file_chunks WHERE embedding_model = ?1",
-    )?;
-    let mut rows = stmt.query(params![&requested_model])?;
+    if !skip_embedding && lexical_matches.len() < normalized_limit {
+        let embedding_timer = Instant::now();
+        let mut stmt = conn.prepare(
+            "SELECT id, path, chunk_index, content, summary, symbol, identifier, source_type, language, metadata, embedding, embedding_model, byte_start, byte_end, line_start, line_end FROM file_chunks WHERE embedding_model = ?1",
+        )?;
+        let mut rows = stmt.query(params![&requested_model])?;
 
-    let mut embedder = create_embedder(&requested_model)?;
-    let mut cached_query: Option<(String, Vec<f32>)> = None;
+        let mut embedder = create_embedder(&requested_model)?;
+        let mut cached_query: Option<(String, Vec<f32>)> = None;
+        let mut top_matches: Vec<PendingMatch> = Vec::new();
 
-    while let Some(row) = rows.next()? {
-        evaluated_chunks += 1;
-        let id: String = row.get(0)?;
-        let path: String = row.get(1)?;
-        let chunk_index: i32 = row.get(2)?;
-        let content: String = row.get(3)?;
-        let summary: Option<String> = row.get(4)?;
-        let symbol: Option<String> = row.get(5)?;
-        let identifier: Option<String> = row.get(6)?;
-        let source_type: Option<String> = row.get(7)?;
-        let stored_language: Option<String> = row.get(8)?;
-        let metadata_raw: Option<String> = row.get(9)?;
-        let embedding_blob: Vec<u8> = row.get(10)?;
-        let embedding_model: String = row.get(11)?;
-        let byte_start: Option<i64> = row.get(12)?;
-        let byte_end: Option<i64> = row.get(13)?;
-        let line_start: Option<i64> = row.get(14)?;
-        let line_end: Option<i64> = row.get(15)?;
+        while let Some(row) = rows.next()? {
+            evaluated_chunks += 1;
+            let id: String = row.get(0)?;
+            let path: String = row.get(1)?;
+            let chunk_index: i32 = row.get(2)?;
+            let content: String = row.get(3)?;
+            let summary: Option<String> = row.get(4)?;
+            let symbol: Option<String> = row.get(5)?;
+            let identifier: Option<String> = row.get(6)?;
+            let source_type: Option<String> = row.get(7)?;
+            let stored_language: Option<String> = row.get(8)?;
+            let metadata_raw: Option<String> = row.get(9)?;
+            let embedding_blob: Vec<u8> = row.get(10)?;
+            let embedding_model: String = row.get(11)?;
+            let byte_start: Option<i64> = row.get(12)?;
+            let byte_end: Option<i64> = row.get(13)?;
+            let line_start: Option<i64> = row.get(14)?;
+            let line_end: Option<i64> = row.get(15)?;
 
-        let classification_value = classify_snippet(&content);
-        if let Some(required) = &classification {
-            if &classification_value != required {
+            let chunk_key = (path.clone(), chunk_index);
+            if seen_hits.contains(&chunk_key) {
                 continue;
             }
-        }
 
-        if let Some(prefix) = &path_prefix {
-            if !path.starts_with(prefix) {
+            let classification_value = classify_snippet(&content);
+            if let Some(required) = &classification {
+                if &classification_value != required {
+                    continue;
+                }
+            }
+
+            if let Some(prefix) = &path_prefix {
+                if !path.starts_with(prefix) {
+                    continue;
+                }
+            }
+
+            if let Some(fragment) = &path_contains {
+                if !path.contains(fragment) {
+                    continue;
+                }
+            }
+
+            let detected_language = stored_language.clone().or_else(|| detect_language(&path));
+            if let Some(required_lang) = &language_filter {
+                match detected_language.as_ref().map(|value| value.to_lowercase()) {
+                    Some(ref lang) if lang == required_lang => {}
+                    Some(_) => continue,
+                    None => continue,
+                }
+            }
+
+            let chunk_embedding = blob_to_vec(&embedding_blob);
+            if chunk_embedding.is_empty() {
                 continue;
             }
-        }
 
-        if let Some(fragment) = &path_contains {
-            if !path.contains(fragment) {
-                continue;
-            }
-        }
-
-        let detected_language = stored_language.clone().or_else(|| detect_language(&path));
-        if let Some(required_lang) = &language_filter {
-            match detected_language.as_ref().map(|value| value.to_lowercase()) {
-                Some(ref lang) if lang == required_lang => {}
-                Some(_) => continue,
-                None => continue,
-            }
-        }
-
-        let chunk_embedding = blob_to_vec(&embedding_blob);
-        if chunk_embedding.is_empty() {
-            continue;
-        }
-
-        let query_embedding = if let Some((cached_text, cached_vector)) = &cached_query {
-            if cached_text == trimmed_query {
-                cached_vector.clone()
+            let query_embedding = if let Some((cached_text, cached_vector)) = &cached_query {
+                if cached_text == trimmed_query {
+                    cached_vector.clone()
+                } else {
+                    let vector = embed_query(&mut embedder, trimmed_query)?;
+                    cached_query = Some((trimmed_query.to_string(), vector.clone()));
+                    vector
+                }
             } else {
                 let vector = embed_query(&mut embedder, trimmed_query)?;
                 cached_query = Some((trimmed_query.to_string(), vector.clone()));
                 vector
-            }
-        } else {
-            let vector = embed_query(&mut embedder, trimmed_query)?;
-            cached_query = Some((trimmed_query.to_string(), vector.clone()));
-            vector
-        };
+            };
 
-        let score = dot_product(&query_embedding, &chunk_embedding);
-        let metadata_value = metadata_raw
-            .as_ref()
-            .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+            let score = dot_product(&query_embedding, &chunk_embedding);
+            let metadata_value = metadata_raw
+                .as_ref()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
 
-        insert_into_top_matches(
-            &mut top_matches,
-            PendingMatch {
-                id,
-                path,
-                chunk_index,
-                content,
-                summary,
-                symbol,
-                identifier,
-                source_type,
-                metadata: metadata_value,
-                byte_start,
-                byte_end,
-                line_start,
-                line_end,
-                embedding_model,
-                score,
-                classification: classification_value,
-                language: detected_language,
-                source: SearchSource::Embedding,
-            },
-            normalized_limit.max(DEFAULT_RESULT_LIMIT),
-        );
+            insert_into_top_matches(
+                &mut top_matches,
+                PendingMatch {
+                    id,
+                    path,
+                    chunk_index,
+                    content,
+                    summary,
+                    symbol,
+                    identifier,
+                    source_type,
+                    metadata: metadata_value,
+                    byte_start,
+                    byte_end,
+                    line_start,
+                    line_end,
+                    embedding_model,
+                    score,
+                    classification: classification_value,
+                    language: detected_language,
+                    source: SearchSource::Embedding,
+                },
+                normalized_limit.max(DEFAULT_RESULT_LIMIT),
+            );
+        }
+
+        embedding_latency_ms = Some(embedding_timer.elapsed().as_millis());
+        embedding_matches = top_matches.into_iter().rev().collect();
     }
 
-    diagnostics.embedding_latency_ms = Some(embedding_timer.elapsed().as_millis());
+    diagnostics.embedding_latency_ms = embedding_latency_ms;
     diagnostics.evaluated_chunk_count = Some(evaluated_chunks);
-
-    let embedding_matches: Vec<PendingMatch> = top_matches.into_iter().rev().collect();
     let mut combined: Vec<PendingMatch> = Vec::new();
-    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut seen_chunk_ids: HashSet<String> = HashSet::new();
+    let mut seen_symbol_keys: HashSet<String> = HashSet::new();
 
     for pending in lexical_matches.into_iter() {
-        if seen_ids.insert(pending.id.clone()) {
+        if should_keep_match(&mut seen_chunk_ids, &mut seen_symbol_keys, &pending) {
             combined.push(pending);
             if combined.len() >= normalized_limit {
                 break;
@@ -441,7 +489,7 @@ fn perform_semantic_search(
 
     if combined.len() < normalized_limit {
         for pending in embedding_matches.into_iter() {
-            if seen_ids.insert(pending.id.clone()) {
+            if should_keep_match(&mut seen_chunk_ids, &mut seen_symbol_keys, &pending) {
                 combined.push(pending);
                 if combined.len() >= normalized_limit {
                     break;
@@ -486,12 +534,18 @@ fn perform_semantic_search(
             context_before_lines,
             context_after_lines,
         );
+        let focus_content = extract_focus_span(file_entry.lines.as_ref(), line_start, line_end);
 
         update_stmt.execute(params![&id])?;
 
+        let mut base_content = focus_content.unwrap_or_else(|| content.clone());
+        if base_content.trim().is_empty() {
+            base_content = content.clone();
+        }
+
         let final_content = match summary_mode {
-            SummaryMode::Brief => trim_with_ellipsis(&content, MAX_BRIEF_CONTENT_CHARS),
-            SummaryMode::Full => content,
+            SummaryMode::Brief => trim_with_ellipsis(&base_content, MAX_BRIEF_CONTENT_CHARS),
+            SummaryMode::Full => base_content,
         };
 
         let mut before_context = context_before;
@@ -694,97 +748,353 @@ fn collect_lexical_matches(
         return Ok(Vec::new());
     }
 
-    let like = format!("%{}%", query);
-    let mut stmt = conn.prepare(
-        "SELECT id, path, chunk_index, content, summary, symbol, identifier, source_type, language, metadata, embedding_model, byte_start, byte_end, line_start, line_end \
-         FROM file_chunks \
-         WHERE content LIKE ?1 \
-         ORDER BY hits ASC \
-         LIMIT ?2",
-    )?;
+    let fetch_limit = (limit.saturating_mul(4)).max(limit);
+    let like_pattern = format!("%{}%", escape_like_pattern(query));
+    let identifier_mode = is_identifier_query(query);
+    let core_identifier = query
+        .rsplit(|c| [':', '.', '#'].contains(&c))
+        .find(|token| !token.trim().is_empty())
+        .map(|token| token.trim());
 
-    let mut rows = stmt.query(params![like, (limit * 4) as i64])?;
     let mut matches = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
 
-    while let Some(row) = rows.next()? {
-        let id: String = row.get(0)?;
-        let path: String = row.get(1)?;
-        let chunk_index: i32 = row.get(2)?;
-        let content: String = row.get(3)?;
-        let summary: Option<String> = row.get(4)?;
-        let symbol: Option<String> = row.get(5)?;
-        let identifier: Option<String> = row.get(6)?;
-        let source_type: Option<String> = row.get(7)?;
-        let stored_language: Option<String> = row.get(8)?;
-        let metadata_raw: Option<String> = row.get(9)?;
-        let embedding_model: String = row.get(10)?;
-        let byte_start: Option<i64> = row.get(11)?;
-        let byte_end: Option<i64> = row.get(12)?;
-        let line_start: Option<i64> = row.get(13)?;
-        let line_end: Option<i64> = row.get(14)?;
-
-        let classification_value = classify_snippet(&content);
-        if let Some(required) = classification_filter {
-            if &classification_value != required {
-                continue;
+    if identifier_mode {
+        let mut stmt = conn.prepare(
+            "SELECT id, path, chunk_index, content, summary, symbol, identifier, source_type, language, metadata, embedding_model, byte_start, byte_end, line_start, line_end \
+             FROM file_chunks \
+             WHERE identifier = ?1 \
+             ORDER BY hits ASC, chunk_index ASC \
+             LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![query, fetch_limit as i64])?;
+        while let Some(row) = rows.next()? {
+            if matches.len() >= limit {
+                return Ok(matches);
+            }
+            if push_lexical_match(
+                &mut matches,
+                &mut seen_ids,
+                row,
+                classification_filter,
+                path_prefix,
+                path_contains,
+                language_filter,
+            )? && matches.len() >= limit
+            {
+                return Ok(matches);
             }
         }
 
-        if let Some(prefix) = path_prefix {
-            if !path.starts_with(prefix) {
-                continue;
+        if matches.len() < limit {
+            let mut stmt = conn.prepare(
+                "SELECT id, path, chunk_index, content, summary, symbol, identifier, source_type, language, metadata, embedding_model, byte_start, byte_end, line_start, line_end \
+                 FROM file_chunks \
+                 WHERE symbol = ?1 \
+                 ORDER BY hits ASC, chunk_index ASC \
+                 LIMIT ?2",
+            )?;
+            let mut rows = stmt.query(params![query, fetch_limit as i64])?;
+            while let Some(row) = rows.next()? {
+                if matches.len() >= limit {
+                    return Ok(matches);
+                }
+                if push_lexical_match(
+                    &mut matches,
+                    &mut seen_ids,
+                    row,
+                    classification_filter,
+                    path_prefix,
+                    path_contains,
+                    language_filter,
+                )? && matches.len() >= limit
+                {
+                    return Ok(matches);
+                }
             }
         }
 
-        if let Some(fragment) = path_contains {
-            if !path.contains(fragment) {
-                continue;
+        if matches.len() < limit {
+            let mut stmt = conn.prepare(
+                "SELECT id, path, chunk_index, content, summary, symbol, identifier, source_type, language, metadata, embedding_model, byte_start, byte_end, line_start, line_end \
+                 FROM file_chunks \
+                 WHERE identifier LIKE ?1 ESCAPE '\\' \
+                 ORDER BY hits ASC, chunk_index ASC \
+                 LIMIT ?2",
+            )?;
+            let mut rows = stmt.query(params![&like_pattern, fetch_limit as i64])?;
+            while let Some(row) = rows.next()? {
+                if matches.len() >= limit {
+                    return Ok(matches);
+                }
+                if push_lexical_match(
+                    &mut matches,
+                    &mut seen_ids,
+                    row,
+                    classification_filter,
+                    path_prefix,
+                    path_contains,
+                    language_filter,
+                )? && matches.len() >= limit
+                {
+                    return Ok(matches);
+                }
             }
         }
 
-        let detected_language = stored_language.clone().or_else(|| detect_language(&path));
-        if let Some(required_lang) = language_filter {
-            match detected_language.as_ref().map(|value| value.to_lowercase()) {
-                Some(ref lang) if lang == required_lang => {}
-                Some(_) => continue,
-                None => continue,
+        if matches.len() < limit {
+            let mut stmt = conn.prepare(
+                "SELECT id, path, chunk_index, content, summary, symbol, identifier, source_type, language, metadata, embedding_model, byte_start, byte_end, line_start, line_end \
+                 FROM file_chunks \
+                 WHERE symbol LIKE ?1 ESCAPE '\\' \
+                 ORDER BY hits ASC, chunk_index ASC \
+                 LIMIT ?2",
+            )?;
+            let mut rows = stmt.query(params![&like_pattern, fetch_limit as i64])?;
+            while let Some(row) = rows.next()? {
+                if matches.len() >= limit {
+                    return Ok(matches);
+                }
+                if push_lexical_match(
+                    &mut matches,
+                    &mut seen_ids,
+                    row,
+                    classification_filter,
+                    path_prefix,
+                    path_contains,
+                    language_filter,
+                )? && matches.len() >= limit
+                {
+                    return Ok(matches);
+                }
             }
         }
 
-        let metadata_value = metadata_raw
-            .as_ref()
-            .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+        if matches.len() < limit {
+            if let Some(token) = core_identifier {
+                if token != query {
+                    let token_like = format!("%{}%", escape_like_pattern(token));
 
-        let penalty = matches.len() as f32 * 0.05;
-        let score = 1.0 - penalty;
+                    let mut stmt = conn.prepare(
+                        "SELECT id, path, chunk_index, content, summary, symbol, identifier, source_type, language, metadata, embedding_model, byte_start, byte_end, line_start, line_end \
+                         FROM file_chunks \
+                         WHERE identifier LIKE ?1 ESCAPE '\\' \
+                         ORDER BY hits ASC, chunk_index ASC \
+                         LIMIT ?2",
+                    )?;
+                    let mut rows = stmt.query(params![&token_like, fetch_limit as i64])?;
+                    while let Some(row) = rows.next()? {
+                        if matches.len() >= limit {
+                            return Ok(matches);
+                        }
+                        if push_lexical_match(
+                            &mut matches,
+                            &mut seen_ids,
+                            row,
+                            classification_filter,
+                            path_prefix,
+                            path_contains,
+                            language_filter,
+                        )? && matches.len() >= limit
+                        {
+                            return Ok(matches);
+                        }
+                    }
 
-        matches.push(PendingMatch {
-            id,
-            path,
-            chunk_index,
-            content,
-            summary,
-            symbol,
-            identifier,
-            source_type,
-            metadata: metadata_value,
-            byte_start,
-            byte_end,
-            line_start,
-            line_end,
-            embedding_model,
-            score,
-            classification: classification_value,
-            language: detected_language,
-            source: SearchSource::Lexical,
-        });
+                    if matches.len() < limit {
+                        let mut stmt = conn.prepare(
+                            "SELECT id, path, chunk_index, content, summary, symbol, identifier, source_type, language, metadata, embedding_model, byte_start, byte_end, line_start, line_end \
+                             FROM file_chunks \
+                             WHERE symbol LIKE ?1 ESCAPE '\\' \
+                             ORDER BY hits ASC, chunk_index ASC \
+                             LIMIT ?2",
+                        )?;
+                        let mut rows = stmt.query(params![&token_like, fetch_limit as i64])?;
+                        while let Some(row) = rows.next()? {
+                            if matches.len() >= limit {
+                                return Ok(matches);
+                            }
+                            if push_lexical_match(
+                                &mut matches,
+                                &mut seen_ids,
+                                row,
+                                classification_filter,
+                                path_prefix,
+                                path_contains,
+                                language_filter,
+                            )? && matches.len() >= limit
+                            {
+                                return Ok(matches);
+                            }
+                        }
+                    }
 
-        if matches.len() >= limit {
-            break;
+                    if matches.len() < limit {
+                        let mut stmt = conn.prepare(
+                            "SELECT id, path, chunk_index, content, summary, symbol, identifier, source_type, language, metadata, embedding_model, byte_start, byte_end, line_start, line_end \
+                             FROM file_chunks \
+                             WHERE content LIKE ?1 ESCAPE '\\' \
+                             ORDER BY hits ASC \
+                             LIMIT ?2",
+                        )?;
+                        let mut rows = stmt.query(params![&token_like, fetch_limit as i64])?;
+                        while let Some(row) = rows.next()? {
+                            if matches.len() >= limit {
+                                return Ok(matches);
+                            }
+                            if push_lexical_match(
+                                &mut matches,
+                                &mut seen_ids,
+                                row,
+                                classification_filter,
+                                path_prefix,
+                                path_contains,
+                                language_filter,
+                            )? && matches.len() >= limit
+                            {
+                                return Ok(matches);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if matches.len() < limit {
+        let mut stmt = conn.prepare(
+            "SELECT id, path, chunk_index, content, summary, symbol, identifier, source_type, language, metadata, embedding_model, byte_start, byte_end, line_start, line_end \
+             FROM file_chunks \
+             WHERE content LIKE ?1 ESCAPE '\\' \
+             ORDER BY hits ASC \
+             LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![&like_pattern, fetch_limit as i64])?;
+        while let Some(row) = rows.next()? {
+            if matches.len() >= limit {
+                return Ok(matches);
+            }
+            if push_lexical_match(
+                &mut matches,
+                &mut seen_ids,
+                row,
+                classification_filter,
+                path_prefix,
+                path_contains,
+                language_filter,
+            )? && matches.len() >= limit
+            {
+                return Ok(matches);
+            }
         }
     }
 
     Ok(matches)
+}
+
+fn escape_like_pattern(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '%' | '_' | '\\' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn push_lexical_match(
+    matches: &mut Vec<PendingMatch>,
+    seen_ids: &mut HashSet<String>,
+    row: &rusqlite::Row<'_>,
+    classification_filter: Option<&Classification>,
+    path_prefix: Option<&str>,
+    path_contains: Option<&str>,
+    language_filter: Option<&str>,
+) -> Result<bool, SemanticSearchError> {
+    let id: String = row.get(0)?;
+    let path: String = row.get(1)?;
+    let chunk_index: i32 = row.get(2)?;
+    let content: String = row.get(3)?;
+    let summary: Option<String> = row.get(4)?;
+    let symbol: Option<String> = row.get(5)?;
+    let identifier: Option<String> = row.get(6)?;
+    let source_type: Option<String> = row.get(7)?;
+    let stored_language: Option<String> = row.get(8)?;
+    let metadata_raw: Option<String> = row.get(9)?;
+    let embedding_model: String = row.get(10)?;
+    let byte_start: Option<i64> = row.get(11)?;
+    let byte_end: Option<i64> = row.get(12)?;
+    let line_start: Option<i64> = row.get(13)?;
+    let line_end: Option<i64> = row.get(14)?;
+
+    let classification_value = classify_snippet(&content);
+    if let Some(required) = classification_filter {
+        if &classification_value != required {
+            return Ok(false);
+        }
+    }
+
+    if let Some(prefix) = path_prefix {
+        if !path.starts_with(prefix) {
+            return Ok(false);
+        }
+    }
+
+    if let Some(fragment) = path_contains {
+        if !path.contains(fragment) {
+            return Ok(false);
+        }
+    }
+
+    let detected_language = stored_language.clone().or_else(|| detect_language(&path));
+    if let Some(required_lang) = language_filter {
+        match detected_language.as_ref().map(|value| value.to_lowercase()) {
+            Some(ref lang) if lang == required_lang => {}
+            Some(_) => return Ok(false),
+            None => return Ok(false),
+        }
+    }
+
+    if !seen_ids.insert(id.clone()) {
+        return Ok(false);
+    }
+
+    let metadata_value = metadata_raw
+        .as_ref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+
+    let penalty = matches.len() as f32 * 0.05;
+    let mut score = 1.0 - penalty;
+    if score < 0.0 {
+        score = 0.0;
+    }
+
+    matches.push(PendingMatch {
+        id,
+        path,
+        chunk_index,
+        content,
+        summary,
+        symbol,
+        identifier,
+        source_type,
+        metadata: metadata_value,
+        byte_start,
+        byte_end,
+        line_start,
+        line_end,
+        embedding_model,
+        score,
+        classification: classification_value,
+        language: detected_language,
+        source: SearchSource::Lexical,
+    });
+
+    Ok(true)
 }
 
 fn load_meta_value(conn: &Connection, key: &str) -> Option<String> {
@@ -869,6 +1179,70 @@ fn extract_context(
     };
 
     (before, after)
+}
+
+fn extract_focus_span(
+    lines: Option<&Vec<String>>,
+    line_start: Option<i64>,
+    line_end: Option<i64>,
+) -> Option<String> {
+    let lines = lines?;
+    let start = line_start.unwrap_or(0).max(1) as usize;
+    if start == 0 || start > lines.len() {
+        return None;
+    }
+
+    let mut end = line_end.unwrap_or(line_start.unwrap_or(0)).max(1) as usize;
+    if end < start {
+        end = start;
+    }
+    end = end.min(lines.len());
+
+    if end < start {
+        return None;
+    }
+
+    let slice = &lines[start.saturating_sub(1)..end];
+    if slice.is_empty() {
+        None
+    } else {
+        Some(slice.join("\n"))
+    }
+}
+
+fn build_symbol_key(
+    path: &str,
+    identifier: &Option<String>,
+    symbol: &Option<String>,
+) -> Option<String> {
+    if let Some(identifier) = identifier.as_ref() {
+        return Some(format!("{path}::identifier::{identifier}"));
+    }
+    if let Some(symbol) = symbol.as_ref() {
+        return Some(format!("{path}::symbol::{symbol}"));
+    }
+    None
+}
+
+fn should_keep_match(
+    seen_chunk_ids: &mut HashSet<String>,
+    seen_symbol_keys: &mut HashSet<String>,
+    pending: &PendingMatch,
+) -> bool {
+    if seen_chunk_ids.contains(&pending.id) {
+        return false;
+    }
+
+    if let Some(symbol_key) = build_symbol_key(&pending.path, &pending.identifier, &pending.symbol)
+    {
+        if seen_symbol_keys.contains(&symbol_key) {
+            return false;
+        }
+        seen_symbol_keys.insert(symbol_key);
+    }
+
+    seen_chunk_ids.insert(pending.id.clone());
+    true
 }
 
 fn normalize_score(score: f32) -> f32 {
@@ -1024,4 +1398,123 @@ pub fn summarize_semantic_search(payload: &SemanticSearchResponse) -> String {
     }
 
     summary
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use rusqlite::{params, Connection};
+    use tempfile::tempdir;
+
+    #[test]
+    fn identifier_query_short_circuits_embedding() -> Result<()> {
+        let temp_dir = tempdir()?;
+        let db_path = temp_dir.path().join("default.sqlite");
+        let conn = Connection::open(&db_path)?;
+
+        conn.execute_batch(
+            r#"
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE files (
+                path TEXT PRIMARY KEY,
+                content TEXT
+            );
+            CREATE TABLE file_chunks (
+                id TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                summary TEXT,
+                symbol TEXT,
+                identifier TEXT,
+                source_type TEXT,
+                language TEXT,
+                metadata TEXT,
+                embedding BLOB NOT NULL,
+                embedding_model TEXT NOT NULL,
+                byte_start INTEGER,
+                byte_end INTEGER,
+                line_start INTEGER,
+                line_end INTEGER,
+                hits INTEGER DEFAULT 0
+            );
+            "#,
+        )?;
+
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('embedding_backend', 'onnx-quantized')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('embedding_quantized', 'true')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('embedding_dimension', '384')",
+            [],
+        )?;
+
+        let file_path = "crates/index-mcp-server/src/service.rs";
+        let chunk_content =
+            "impl EnvironmentSnapshot { fn bundle_budget(&self) -> usize { 1024 } }";
+
+        conn.execute(
+            "INSERT INTO files (path, content) VALUES (?1, ?2)",
+            params![file_path, chunk_content],
+        )?;
+
+        conn.execute(
+            "INSERT INTO file_chunks (id, path, chunk_index, content, summary, symbol, identifier, source_type, language, metadata, embedding, embedding_model, byte_start, byte_end, line_start, line_end, hits) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14, 0)",
+            params![
+                "chunk-1",
+                file_path,
+                0,
+                chunk_content,
+                Some("bundle_budget".to_string()),
+                Some("EnvironmentSnapshot::bundle_budget".to_string()),
+                Some("EnvironmentSnapshot::bundle_budget".to_string()),
+                Some("Rust".to_string()),
+                vec![0u8; 4],
+                DEFAULT_EMBEDDING_MODEL,
+                0i64,
+                chunk_content.len() as i64,
+                1i64,
+                3i64
+            ],
+        )?;
+
+        let params = SemanticSearchParams {
+            root: Some(temp_dir.path().to_string_lossy().to_string()),
+            query: "EnvironmentSnapshot::bundle_budget".to_string(),
+            database_name: Some("default.sqlite".to_string()),
+            limit: Some(3),
+            model: None,
+            language: None,
+            path_prefix: None,
+            path_contains: None,
+            classification: None,
+            summary_mode: Some(SummaryMode::Brief),
+            max_context_before: None,
+            max_context_after: None,
+            recent_hits: None,
+        };
+
+        let response = perform_semantic_search(params)?;
+        let diagnostics = response.diagnostics.expect("diagnostics");
+
+        assert!(diagnostics.embedding_latency_ms.is_none());
+        assert_eq!(diagnostics.evaluated_chunk_count, Some(0));
+        assert_eq!(response.evaluated_chunks, 0);
+        assert_eq!(response.results.len(), 1);
+        assert!(matches!(response.results[0].source, SearchSource::Lexical));
+        assert_eq!(
+            response.results[0].identifier.as_deref(),
+            Some("EnvironmentSnapshot::bundle_budget")
+        );
+        assert!(diagnostics.lexical_latency_ms.is_some());
+
+        Ok(())
+    }
 }

@@ -20,8 +20,9 @@ use crate::index_status::{
 use crate::ingest::{ingest_codebase, warm_up_embedder, IngestError, IngestParams, IngestResponse};
 use crate::remote_proxy::RemoteProxyRegistry;
 use crate::search::{
-    semantic_search, summarize_semantic_search, Classification, SemanticSearchError,
-    SemanticSearchMatch, SemanticSearchParams, SemanticSearchResponse, SuggestedTool, SummaryMode,
+    semantic_search, summarize_semantic_search, Classification, SearchResultCoordinate,
+    SemanticSearchError, SemanticSearchMatch, SemanticSearchParams, SemanticSearchResponse,
+    SuggestedTool, SummaryMode,
 };
 use tracing::warn;
 
@@ -409,9 +410,9 @@ const SERVER_INSTRUCTIONS_TEMPLATE: &str = r#"Rust rewrite is production-ready. 
 1. Prime the index at session start with ingest_codebase {"root": "{ABSOLUTE_ROOT}"} or --watch. Honor .gitignore, skip files larger than 8 MiB, and tune autoEvict/maxDatabaseSizeBytes before the SQLite file balloons. Always pass the absolute workspace root; relative paths often target the wrong codebase.
 2. Check index_status before planning or answering. If HEAD moved or isStale is true, ingest again before proceeding.
 3. Brief yourself with repository_timeline (and repository_timeline_entry for deep dives) so your plan reflects the latest commits.
-4. Use code_lookup in auto mode to assemble payloads: start with query="..." to explore, then request file/symbol bundles for snippets you will cite.
-5. Deliver compact payloads—prefer context_bundle with budgetTokens or INDEX_MCP_BUDGET_TOKENS, include citations, and avoid dumping whole files.
-6. When you need additional detail, follow up with semantic_search or focused context_bundle calls instead of broad re-ingests.
+4. Use code_lookup in auto mode to assemble payloads: start with query="..." to explore, then request file/symbol bundles for snippets you will cite. The server tracks recently delivered chunks—subsequent searches automatically suppress duplicates, and clients can pass recent_hits when chaining custom workflows.
+5. Deliver compact payloads—semantic_search now prioritizes the precise focus span for each hit. Prefer context_bundle with budgetTokens or INDEX_MCP_BUDGET_TOKENS when you need broader context, include citations, and avoid dumping whole files.
+6. When you need additional detail, follow up with semantic_search or focused context_bundle calls instead of broad re-ingests; if dedupe hides something you truly need, request a different chunk index or reset your recent_hits list.
 7. After modifying files, re-run ingest_codebase or rely on watch mode, then confirm freshness with index_status/info so the next task sees the updated payload.
 
 Available tools: ingest_codebase, index_status, code_lookup (search/bundle), semantic_search, context_bundle, repository_timeline, repository_timeline_entry, indexing_guidance, indexing_guidance_tool, info."#;
@@ -540,6 +541,15 @@ impl IndexMcpService {
     ) -> Result<CallToolResult, McpError> {
         self.environment.update_from_meta(&ctx.meta);
         self.environment.apply_semantic_defaults(&mut params);
+        let snapshot = self.environment.snapshot();
+        let recent_hits_param: Vec<SearchResultCoordinate> = snapshot
+            .recent_hits
+            .iter()
+            .map(|hit| SearchResultCoordinate {
+                path: hit.path.clone(),
+                chunk_index: hit.chunk_index,
+            })
+            .collect();
         let filter_summary = build_search_filter_summary(&params);
         let search_params = SemanticSearchParams {
             root: params.root.clone(),
@@ -554,6 +564,11 @@ impl IndexMcpService {
             summary_mode: params.summary_mode,
             max_context_before: params.max_context_before,
             max_context_after: params.max_context_after,
+            recent_hits: if recent_hits_param.is_empty() {
+                None
+            } else {
+                Some(recent_hits_param)
+            },
         };
 
         let mut response = semantic_search(search_params)
@@ -646,6 +661,16 @@ impl IndexMcpService {
                     McpError::invalid_params("code_lookup search mode requires a query.", None)
                 })?;
 
+                let lookup_snapshot = self.environment.snapshot();
+                let lookup_recent_hits: Vec<SearchResultCoordinate> = lookup_snapshot
+                    .recent_hits
+                    .iter()
+                    .map(|hit| SearchResultCoordinate {
+                        path: hit.path.clone(),
+                        chunk_index: hit.chunk_index,
+                    })
+                    .collect();
+
                 let search_params = SemanticSearchParams {
                     root,
                     query,
@@ -659,6 +684,11 @@ impl IndexMcpService {
                     summary_mode,
                     max_context_before,
                     max_context_after,
+                    recent_hits: if lookup_recent_hits.is_empty() {
+                        None
+                    } else {
+                        Some(lookup_recent_hits)
+                    },
                 };
 
                 let mut response = semantic_search(search_params)
