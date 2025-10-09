@@ -14,6 +14,8 @@ use crate::ann::{self, ANN_META_BASENAME_KEY};
 use crate::embedding::{
     build_candle_backend, build_fastembed_backend, get_or_create_embedding_runner, EmbeddingHandle,
 };
+#[cfg(test)]
+use crate::embedding::build_mock_backend;
 use crate::index_status::DEFAULT_DB_FILENAME;
 use crate::ingest::DEFAULT_EMBEDDING_MODEL;
 use tracing::warn;
@@ -389,8 +391,21 @@ fn perform_semantic_search(
             build_candle_backend(&requested_model, None)
                 .map_err(|error| SemanticSearchError::Embedding(error.to_string()))?
         } else {
-            build_fastembed_backend(&requested_model)
-                .map_err(|error| SemanticSearchError::Embedding(error.to_string()))?
+            #[cfg(test)]
+            {
+                if backend_label.eq_ignore_ascii_case("mock") {
+                    build_mock_backend()
+                        .map_err(|error| SemanticSearchError::Embedding(error.to_string()))?
+                } else {
+                    build_fastembed_backend(&requested_model)
+                        .map_err(|error| SemanticSearchError::Embedding(error.to_string()))?
+                }
+            }
+            #[cfg(not(test))]
+            {
+                build_fastembed_backend(&requested_model)
+                    .map_err(|error| SemanticSearchError::Embedding(error.to_string()))?
+            }
         };
 
         let embedder_handle = get_or_create_embedding_runner(&backend, &requested_model, None)

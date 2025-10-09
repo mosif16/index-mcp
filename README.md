@@ -84,6 +84,7 @@ INDEX_MCP_MODE=dev INDEX_MCP_ARGS="--watch-debounce=250" ./start.sh
 - `model`: Case-sensitive identifier understood by the chosen backend (for example `Xenova/all-MiniLM-L6-v2`, `BAAI/bge-base-en-v1.5`, or the Candle variants listed in `embedding.rs`).
 - `enabled`: Toggle embeddings entirely—lexical search continues to work when set to `false`.
 - `chunkSizeTokens`, `chunkOverlapTokens`, and `batchSize`: Tune tokenizer slice length, overlap, and embedding batch size. Quantized FastEmbed models ignore batch size, while Candle honours whichever value is provided.
+- `backend`: Defaults to `fastembed`. Set to `candle` to switch runtimes, or to `mock` when running the Rust test suite—`mock` is only compiled under `cfg(test)` and exists to unblock deterministic integration tests without downloading real models.
 
 Embedders are cached per `(backend, model, batchSize)` tuple, so watches, search, and bundle operations reuse the warmed runner without paying model start-up costs.
 

@@ -5,9 +5,13 @@ mod git_timeline;
 mod graph;
 mod index_status;
 mod ingest;
+#[cfg(test)]
+mod integration_tests;
 mod remote_proxy;
 mod search;
 mod service;
+#[cfg(test)]
+mod test_support;
 mod watcher;
 
 use anyhow::Result;

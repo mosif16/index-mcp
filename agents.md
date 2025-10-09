@@ -16,7 +16,7 @@ Update both documents together when workflows change so global expectations and 
 
 With the GitHub workflows removed, agents must run these checks before handing work back to the user:
 
-- `cargo fmt --all -- --check"
+- `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --all --all-targets`
 
@@ -32,3 +32,14 @@ When a user asks for a runnable binary or release artifact:
 
 Keep these notes aligned with `agents_repo.md` when workflows change.
 
+## Release tagging
+
+When cutting a new release from the `Rust-rewrite` branch:
+
+- Run `git status -sb` to confirm there are no stray changes.
+- Commit the version bump and metadata updates (for example `git commit -am "chore: release vX.Y.Z"`).
+- Tag it with `git tag -a vX.Y.Z -m "Release vX.Y.Z"`.
+- Push branch and tag: `git push origin Rust-rewrite` and `git push origin vX.Y.Z`.
+- Publish the GitHub release for that tag; the CI workflow uploads `target/release/index-mcp-server` automatically.
+
+Keep these release steps in sync with the workflow if triggers change.

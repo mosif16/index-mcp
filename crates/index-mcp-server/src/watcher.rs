@@ -360,3 +360,47 @@ fn resolve_root(root: &Path) -> Result<PathBuf, WatcherError> {
 
     Ok(candidate)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_context(include: &[&str], exclude: &[&str]) -> WatchContext {
+        let include_vec: Vec<String> = include.iter().map(|pattern| pattern.to_string()).collect();
+        let exclude_vec: Vec<String> = exclude.iter().map(|pattern| pattern.to_string()).collect();
+        let include_matcher = compile_globs(&include_vec).expect("include glob").unwrap();
+        let exclude_matcher = compile_globs(&exclude_vec).expect("exclude glob").unwrap();
+
+        WatchContext {
+            absolute_root: PathBuf::from("/workspace"),
+            database_name: "test.sqlite".into(),
+            include_matcher: Some(include_matcher),
+            exclude_matcher: Some(exclude_matcher),
+            include_patterns: include_vec,
+            exclude_patterns: exclude_vec,
+            debounce: Duration::from_millis(50),
+            quiet: false,
+        }
+    }
+
+    #[test]
+    fn normalize_relative_path_rejects_out_of_root() {
+        let root = Path::new("/workspace");
+        assert!(normalize_relative_path(root, Path::new("/etc/passwd")).is_none());
+        assert_eq!(
+            normalize_relative_path(root, Path::new("src/lib.rs")).as_deref(),
+            Some("src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn should_track_respects_patterns() {
+        let context = build_context(&["**/*.rs"], &["**/*.generated.rs", "**/target/**"]);
+        assert!(should_track(&context, Path::new("src/main.rs")));
+        assert!(!should_track(
+            &context,
+            Path::new("src/schema.generated.rs")
+        ));
+        assert!(!should_track(&context, Path::new("target/debug/build.rs")));
+    }
+}

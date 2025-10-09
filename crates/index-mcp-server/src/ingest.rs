@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::embedding::build_mock_backend;
 use crate::{
     ann,
     embedding::{
@@ -894,6 +896,18 @@ fn resolve_embedding_config(
             .map_err(|error| IngestError::Embedding(error.to_string()))?,
         "candle" => build_candle_backend(&model, requested_batch_size)
             .map_err(|error| IngestError::Embedding(error.to_string()))?,
+        "mock" => {
+            #[cfg(test)]
+            {
+                build_mock_backend().map_err(|error| IngestError::Embedding(error.to_string()))?
+            }
+            #[cfg(not(test))]
+            {
+                return Err(IngestError::Embedding(
+                    "Mock embedding backend is only available in tests".to_string(),
+                ));
+            }
+        }
         other => {
             return Err(IngestError::Embedding(format!(
                 "Unsupported embedding backend '{other}'"

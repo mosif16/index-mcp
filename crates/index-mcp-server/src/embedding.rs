@@ -66,6 +66,8 @@ pub enum EmbeddingBackend {
         model: CandleModel,
         batch_size: Option<usize>,
     },
+    #[cfg(test)]
+    Mock,
 }
 
 impl EmbeddingBackend {
@@ -79,6 +81,8 @@ impl EmbeddingBackend {
                 }
             }
             EmbeddingBackend::Candle { .. } => "candle".to_string(),
+            #[cfg(test)]
+            EmbeddingBackend::Mock => "mock".to_string(),
         }
     }
 
@@ -86,17 +90,18 @@ impl EmbeddingBackend {
         match self {
             EmbeddingBackend::FastEmbed { .. } => "fastembed",
             EmbeddingBackend::Candle { .. } => "candle",
+            #[cfg(test)]
+            EmbeddingBackend::Mock => "mock",
         }
     }
 
     pub fn is_quantized(&self) -> bool {
-        matches!(
-            self,
-            EmbeddingBackend::FastEmbed {
-                quantized: true,
-                ..
-            }
-        )
+        match self {
+            EmbeddingBackend::FastEmbed { quantized, .. } => *quantized,
+            EmbeddingBackend::Candle { .. } => false,
+            #[cfg(test)]
+            EmbeddingBackend::Mock => false,
+        }
     }
 }
 
@@ -200,6 +205,8 @@ fn create_runner(
                 model: sentence_transformer,
             }))
         }
+        #[cfg(test)]
+        EmbeddingBackend::Mock => Ok(Box::new(MockRunner)),
     }
 }
 
@@ -283,4 +290,84 @@ pub fn build_candle_backend(
         model: candle_model,
         batch_size,
     })
+}
+
+#[cfg(test)]
+pub fn build_mock_backend() -> Result<EmbeddingBackend, EmbeddingError> {
+    Ok(EmbeddingBackend::Mock)
+}
+
+#[cfg(test)]
+const MOCK_DIMENSION: usize = 8;
+
+#[cfg(test)]
+struct MockRunner;
+
+#[cfg(test)]
+impl EmbeddingRunner for MockRunner {
+    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        Ok(texts.iter().map(|text| mock_embed(text)).collect())
+    }
+}
+
+#[cfg(test)]
+fn mock_embed(text: &str) -> Vec<f32> {
+    if text.is_empty() {
+        let mut baseline = vec![0.0; MOCK_DIMENSION];
+        baseline[0] = 1.0;
+        return baseline;
+    }
+
+    let mut accum = vec![0.0_f32; MOCK_DIMENSION];
+    for (index, byte) in text.bytes().enumerate() {
+        let bucket = index % MOCK_DIMENSION;
+        let contribution = (byte as f32) / 255.0;
+        accum[bucket] += contribution;
+    }
+
+    let norm = accum
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt()
+        .max(1e-6);
+    for value in accum.iter_mut() {
+        *value /= norm;
+    }
+    accum
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mock_runner_produces_deterministic_vectors() {
+        let mut runner = MockRunner;
+        let inputs = vec![
+            "fn alpha() {}".to_string(),
+            "struct Beta {}".to_string(),
+            "fn alpha() {}".to_string(),
+        ];
+        let embeddings = runner.embed_batch(&inputs).expect("mock embed");
+        assert_eq!(embeddings.len(), 3);
+        assert_eq!(embeddings[0], embeddings[2], "identical inputs must match");
+        let dot = embeddings[0]
+            .iter()
+            .zip(embeddings[1].iter())
+            .map(|(a, b)| a * b)
+            .sum::<f32>();
+        assert!(
+            dot.abs() < 0.99,
+            "different inputs should not collapse to identical vectors"
+        );
+    }
+
+    #[test]
+    fn mock_embed_handles_empty_input() {
+        let vector = mock_embed("");
+        assert_eq!(vector.len(), MOCK_DIMENSION);
+        assert_eq!(vector[0], 1.0);
+        assert!(vector.iter().skip(1).all(|value| value.abs() < 1e-6));
+    }
 }

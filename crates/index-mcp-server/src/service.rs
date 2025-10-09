@@ -1605,6 +1605,89 @@ mod tests {
     };
     use serde_json::json;
 
+    fn sample_match(path: &str, chunk_index: i32) -> SemanticSearchMatch {
+        SemanticSearchMatch {
+            path: path.to_string(),
+            chunk_index,
+            score: 0.9,
+            normalized_score: 0.9,
+            language: Some("Rust".to_string()),
+            classification: Classification::Function,
+            content: format!("fn sample_{chunk_index}() {{}}"),
+            embedding_model: "mock".to_string(),
+            byte_start: Some(0),
+            byte_end: Some(16),
+            line_start: Some(1),
+            line_end: Some(1),
+            context_before: None,
+            context_after: None,
+            source: SearchSource::Embedding,
+            summary: None,
+            symbol: None,
+            identifier: None,
+            source_type: None,
+            metadata: None,
+            confidence: 0.9,
+        }
+    }
+
+    #[test]
+    fn environment_defaults_fill_missing_semantic_fields() {
+        let env = EnvironmentState::new();
+        let mut meta = Meta::new();
+        meta.insert("cwd".to_string(), json!("/workspace"));
+        meta.insert(
+            "tokenUsage".to_string(),
+            json!({ "remainingContextTokens": 2048 }),
+        );
+        env.update_from_meta(&meta);
+
+        let mut request = SemanticSearchRequest {
+            root: None,
+            query: "alpha".to_string(),
+            database_name: None,
+            limit: None,
+            model: None,
+            language: None,
+            path_prefix: None,
+            path_contains: None,
+            classification: None,
+            summary_mode: None,
+            max_context_before: None,
+            max_context_after: None,
+        };
+
+        env.apply_semantic_defaults(&mut request);
+
+        assert_eq!(request.root.as_deref(), Some("/workspace"));
+        assert_eq!(request.limit, Some(DEFAULT_SEARCH_LIMIT_HINT));
+        assert_eq!(request.summary_mode, Some(SummaryMode::Brief));
+        assert_eq!(request.max_context_before, Some(1));
+        assert_eq!(request.max_context_after, Some(1));
+    }
+
+    #[test]
+    fn deduplicate_search_results_tracks_history() {
+        let env = EnvironmentState::new();
+        let first_batch = vec![
+            sample_match("src/lib.rs", 0),
+            sample_match("src/lib.rs", 0),
+            sample_match("src/lib.rs", 1),
+        ];
+        let (retained, duplicates) = env.deduplicate_search_results(first_batch);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(duplicates, 1);
+
+        let second_batch = vec![
+            sample_match("src/lib.rs", 0),
+            sample_match("src/other.rs", 0),
+        ];
+        let (retained_again, duplicates_again) = env.deduplicate_search_results(second_batch);
+        assert_eq!(retained_again.len(), 1);
+        assert_eq!(retained_again[0].path, "src/other.rs");
+        assert_eq!(duplicates_again, 1);
+    }
+
     #[test]
     fn summarize_ingest_reports_key_metrics() {
         let payload = IngestResponse {
