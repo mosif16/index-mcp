@@ -50,3 +50,4 @@ Keep these release steps in sync with the workflow if triggers change.
 - 2025-10-09: Added Swift classification heuristic, integration coverage, and cleared plan.
 - 2025-10-09: Expanded Swift classification/tests, enriched bundle summaries, and documented Swift support.
 - 2025-10-09: Prepared v0.1.2 release (version bump, dependency refresh, rebuilt binary).
+- 2025-10-09: Removed legacy GitHub Actions workflow in favor of manual local checks.
