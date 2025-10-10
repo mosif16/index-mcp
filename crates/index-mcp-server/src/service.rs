@@ -6,8 +6,8 @@ use std::io::ErrorKind;
 use std::sync::{Arc, RwLock};
 
 use crate::bundle::{
-    context_bundle, ContextBundleError, ContextBundleParams, ContextBundleResponse, LineRange,
-    QuickLinkType, SnippetSource, SymbolSelector,
+    context_bundle, BundleDefinition, ContextBundleError, ContextBundleParams,
+    ContextBundleResponse, LineRange, QuickLinkType, SnippetSource, SymbolSelector,
 };
 use crate::git_timeline::{
     repository_timeline, repository_timeline_entry_detail, RepositoryTimelineEntryLookupParams,
@@ -1229,11 +1229,17 @@ fn summarize_bundle(bundle: &ContextBundleResponse) -> String {
 
     if let Some(focus) = &bundle.focus_definition {
         parts.push(format!("Focus on {} {}.", focus.kind, focus.name));
+        if let Some(metadata) = summarize_definition_metadata(focus) {
+            parts.push(metadata);
+        }
     } else if let Some(primary) = bundle.definitions.first() {
         parts.push(format!(
             "Primary definition {} {}.",
             primary.kind, primary.name
         ));
+        if let Some(metadata) = summarize_definition_metadata(primary) {
+            parts.push(metadata);
+        }
     }
 
     match summarize_snippets(bundle) {
@@ -1322,6 +1328,50 @@ fn summarize_snippets(bundle: &ContextBundleResponse) -> Option<String> {
         descriptors.join(", "),
         token_estimate
     ))
+}
+
+fn summarize_definition_metadata(definition: &BundleDefinition) -> Option<String> {
+    let mut segments = Vec::new();
+
+    if let Some(visibility) = definition
+        .visibility
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        segments.push(format!("visibility {}", visibility.trim()));
+    }
+
+    if let Some(docstring) = definition.docstring.as_deref() {
+        if let Some(line) = docstring
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+        {
+            segments.push(format!("doc {}", truncate_summary_line(line, 96)));
+        }
+    }
+
+    if segments.is_empty() {
+        None
+    } else {
+        Some(format!("Details: {}.", segments.join("; ")))
+    }
+}
+
+fn truncate_summary_line(line: &str, max_len: usize) -> String {
+    if line.chars().count() <= max_len {
+        return line.to_string();
+    }
+    let mut truncated: String = line.chars().take(max_len).collect();
+    while truncated
+        .chars()
+        .last()
+        .is_some_and(|ch| ch.is_whitespace())
+    {
+        truncated.pop();
+    }
+    truncated.push_str("...");
+    truncated
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1831,6 +1881,7 @@ mod tests {
             "Context bundle prepared for src/lib.rs with 1 definition(s) and 1 snippet(s)."
         ));
         assert!(summary.contains("Primary definition function foo."));
+        assert!(summary.contains("Details: visibility pub."));
         assert!(summary.contains("Snippets: chunk line 1 (~3 token(s))."));
         assert!(summary.contains("First quick link: file src/lib.rs."));
         assert!(summary.contains("Warning: No graph metadata."));

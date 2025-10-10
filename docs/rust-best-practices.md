@@ -83,6 +83,7 @@ Code Quality, Testing and Release
 Native and Cross‑Language Considerations
 	•	Platform compatibility:  If the tool includes a native binary (e.g., written in Swift or compiled C/C++), ensure it is universal (e.g., supports both Apple Silicon and Intel) and includes the correct compiler flags for minimal size ￼.
 	•	Native testing and formatting:  Apply linters and formatters appropriate for the language (e.g., SwiftLint/SwiftFormat for Swift).  Provide robust test suites for the native component ￼.
+	•	Swift ingestion coverage:  Maintain integration fixtures that exercise initializers, protocol extensions and docstring extraction so MCP bundles surface accurate metadata for Swift code.
 	•	Synchronization of versions:  Synchronize the version of the native binary with the version of the MCP package.  Inject the version at build time rather than hard‑coding it ￼.
 	•	Communication protocol:  Support JSON communication between the native binary and the MCP server and implement a helpful --help command using a robust argument parser ￼.
 	•	Distribution:  When feasible, distribute a single, statically linked binary to simplify installation for end users ￼.

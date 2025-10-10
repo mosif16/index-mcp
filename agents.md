@@ -43,3 +43,10 @@ When cutting a new release from the `Rust-rewrite` branch:
 - Publish the GitHub release for that tag; the CI workflow uploads `target/release/index-mcp-server` automatically.
 
 Keep these release steps in sync with the workflow if triggers change.
+
+## Decision Log
+
+- 2025-10-09: Begin Swift support extension across search tools.
+- 2025-10-09: Added Swift classification heuristic, integration coverage, and cleared plan.
+- 2025-10-09: Expanded Swift classification/tests, enriched bundle summaries, and documented Swift support.
+- 2025-10-09: Prepared v0.1.2 release (version bump, dependency refresh, rebuilt binary).

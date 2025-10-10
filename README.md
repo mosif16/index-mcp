@@ -13,6 +13,7 @@ The project previously shipped a Node/TypeScript runtime. That implementation ha
 - **Watch mode** – Optional filesystem watcher re-ingests changed paths automatically for long-running agent sessions.
 - **Remote proxies** – Mount additional MCP servers behind the same process by declaring JSON descriptors in `INDEX_MCP_REMOTE_SERVERS`.
 - **Context budgeting & observability** – Bundles respect a configurable token budget, track per-chunk usage, and emit diagnostics (model, backend, latency, similarity range) to help tune downstream prompting.
+- **Language coverage** – Chunk classification and bundle summaries recognise Rust, TypeScript, Python, Swift (including initializers, protocol extensions, and docstrings), and other common languages so tool filters remain precise across mixed-language repositories.
 
 ## Requirements
 

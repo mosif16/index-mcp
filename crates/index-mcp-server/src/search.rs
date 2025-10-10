@@ -11,11 +11,11 @@ use thiserror::Error;
 use tokio::task::JoinError;
 
 use crate::ann::{self, ANN_META_BASENAME_KEY};
+#[cfg(test)]
+use crate::embedding::build_mock_backend;
 use crate::embedding::{
     build_candle_backend, build_fastembed_backend, get_or_create_embedding_runner, EmbeddingHandle,
 };
-#[cfg(test)]
-use crate::embedding::build_mock_backend;
 use crate::index_status::DEFAULT_DB_FILENAME;
 use crate::ingest::DEFAULT_EMBEDDING_MODEL;
 use tracing::warn;
@@ -1451,11 +1451,26 @@ fn classify_snippet(snippet: &str) -> Classification {
         return Classification::Comment;
     }
 
+    let contains_func_token = trimmed.split_whitespace().any(|token| token == "func");
+    let swift_initializer = trimmed.starts_with("init(")
+        || trimmed.starts_with("init ")
+        || trimmed.contains(" init(")
+        || trimmed.contains(" init?(")
+        || trimmed.contains(" init!(")
+        || trimmed.contains(" convenience init")
+        || trimmed.contains(" required init");
+    let swift_deinitializer = trimmed.starts_with("deinit")
+        || trimmed.starts_with("deinit ")
+        || trimmed.contains(" deinit");
+
     if trimmed.contains("class ")
         || trimmed.contains("def ")
         || trimmed.contains("fn ")
         || trimmed.contains("function ")
         || trimmed.contains("=>")
+        || contains_func_token
+        || swift_initializer
+        || swift_deinitializer
     {
         Classification::Function
     } else {
@@ -1746,5 +1761,29 @@ mod tests {
         );
         assert!(filtered.is_none());
         assert!(fresh_seen.is_empty());
+    }
+
+    #[test]
+    fn classify_snippet_flags_swift_functions() {
+        let snippet = "public func greet(name: String) -> String { return \"Hi\" }";
+        assert_eq!(classify_snippet(snippet), Classification::Function);
+    }
+
+    #[test]
+    fn classify_snippet_handles_swift_init() {
+        let snippet = "public convenience init?(rawValue: String) { self.init() }";
+        assert_eq!(classify_snippet(snippet), Classification::Function);
+    }
+
+    #[test]
+    fn classify_snippet_handles_swift_deinit() {
+        let snippet = "deinit { cleanup() }";
+        assert_eq!(classify_snippet(snippet), Classification::Function);
+    }
+
+    #[test]
+    fn classify_snippet_treats_comment_with_func_as_comment() {
+        let snippet = "// func pretend() {}";
+        assert_eq!(classify_snippet(snippet), Classification::Comment);
     }
 }
