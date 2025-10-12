@@ -161,6 +161,7 @@ async fn swift_semantic_and_bundle_support() -> Result<()> {
                 "Hello, \(name)!"
             }
 
+            /// Failable initializer bridging raw values.
             public convenience init?(rawValue: String) {
                 self.init()
             }
@@ -216,6 +217,13 @@ async fn swift_semantic_and_bundle_support() -> Result<()> {
             .any(|definition| definition.name == "greet"),
         "bundle should expose Swift definitions"
     );
+    assert!(
+        bundle
+            .definitions
+            .iter()
+            .any(|definition| definition.name == "init"),
+        "bundle should surface Swift initializers"
+    );
     assert_eq!(
         bundle
             .focus_definition
@@ -244,6 +252,17 @@ async fn swift_semantic_and_bundle_support() -> Result<()> {
         welcome_definition.visibility.is_some(),
         "extension method should record a visibility level"
     );
+
+    let failable_init = bundle
+        .definitions
+        .iter()
+        .find(|definition| definition.name == "init?")
+        .expect("convenience initializer present");
+    assert_eq!(failable_init.visibility.as_deref(), Some("public"));
+    assert!(failable_init
+        .docstring
+        .as_deref()
+        .is_some_and(|doc| doc.contains("Failable initializer")));
 
     Ok(())
 }

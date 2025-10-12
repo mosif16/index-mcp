@@ -1,28 +1,36 @@
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::sync::{Arc, RwLock};
 
 use crate::bundle::{
-    context_bundle, BundleDefinition, ContextBundleError, ContextBundleParams,
-    ContextBundleResponse, LineRange, QuickLinkType, SnippetSource, SymbolSelector,
+    context_bundle, BundleDefinition, BundleDiagnostics, BundleEdgeNeighbor, BundleFileMetadata,
+    BundleIngestionSummary, BundleSnippet, BundleUsageStats, ContextBundleError,
+    ContextBundleParams, ContextBundleQuickLink, ContextBundleResponse, LineRange,
+    NeighborDirection, NeighborNode, QuickLinkType, SnippetSource, SymbolSelector,
 };
 use crate::git_timeline::{
-    repository_timeline, repository_timeline_entry_detail, RepositoryTimelineEntryLookupParams,
-    RepositoryTimelineEntryLookupResponse, RepositoryTimelineError, RepositoryTimelineParams,
-    RepositoryTimelineResponse,
+    repository_timeline, repository_timeline_entry_detail, RepositoryTimelineDiffSummary,
+    RepositoryTimelineDirectoryChurn, RepositoryTimelineEntry, RepositoryTimelineEntryLookupParams,
+    RepositoryTimelineEntryLookupResponse, RepositoryTimelineError, RepositoryTimelineFileChange,
+    RepositoryTimelineParams, RepositoryTimelineResponse, RepositoryTimelineTopFile,
+    TimelineIdentity,
 };
 use crate::index_status::{
-    get_index_status, IndexStatusError, IndexStatusParams, IndexStatusResponse,
+    get_index_status, IndexStatusError, IndexStatusIngestion, IndexStatusParams,
+    IndexStatusResponse,
 };
-use crate::ingest::{ingest_codebase, warm_up_embedder, IngestError, IngestParams, IngestResponse};
+use crate::ingest::{
+    ingest_codebase, warm_up_embedder, EvictionReport, IngestError, IngestParams, IngestResponse,
+    SkippedFile,
+};
 use crate::remote_proxy::RemoteProxyRegistry;
 use crate::search::{
-    semantic_search, summarize_semantic_search, Classification, SearchResultCoordinate,
-    SemanticSearchError, SemanticSearchMatch, SemanticSearchParams, SemanticSearchResponse,
-    SuggestedTool, SummaryMode,
+    semantic_search, summarize_semantic_search, Classification, SearchDiagnostics,
+    SearchResultCoordinate, SearchSource, SemanticSearchError, SemanticSearchMatch,
+    SemanticSearchParams, SemanticSearchResponse, SuggestedTool, SummaryMode,
 };
 use tracing::warn;
 
@@ -366,17 +374,6 @@ struct CodeLookupParams {
     max_context_after: Option<u32>,
 }
 
-#[derive(Debug, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-struct CodeLookupResponse {
-    mode: String,
-    summary: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    search_result: Option<SemanticSearchResponse>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bundle_result: Option<Value>,
-}
-
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct SemanticSearchRequest {
@@ -414,6 +411,7 @@ const SERVER_INSTRUCTIONS_TEMPLATE: &str = r#"Rust rewrite is production-ready. 
 5. Shape bundles to your window: supply budgetTokens (or INDEX_MCP_BUDGET_TOKENS), trim snippet limits, and only escalate to context_bundle when you truly need neighboring lines. semantic_search already highlights the focus span, so avoid whole-file dumps unless explicitly required.
 6. Add detail iteratively: chain additional semantic_search or narrowly scoped context_bundle calls instead of broad re-ingests. If dedupe hides something important, request a different chunk index or clear recent_hits rather than re-requesting the entire file.
 7. After modifying files, re-run ingest_codebase or rely on watch mode, then confirm freshness with index_status/info so the next task sees the updated payload.
+Responses now return compact structured_content: summaries stay in the text content, while JSON payloads use short keys (for example t:"sem"/"ctx", defs/sn for bundles, r for results). Prefer the structured data for programmatic handling and avoid relying on legacy CamelCase fields.
 
 Available tools: ingest_codebase, index_status, code_lookup (search/bundle), semantic_search, context_bundle, repository_timeline, repository_timeline_entry, indexing_guidance, indexing_guidance_tool, info."#;
 const INDEXING_GUIDANCE_PROMPT_TEMPLATE: &str = r#"Workflow reminder:
@@ -858,8 +856,8 @@ fn convert_ingest_error(error: IngestError) -> McpError {
 
 fn build_ingest_result(response: IngestResponse) -> Result<CallToolResult, McpError> {
     let summary = summarize_ingest(&response);
-    let value: Value = serde_json::to_value(&response).map_err(|error| {
-        McpError::internal_error(format!("Failed to serialize ingest result: {error}"), None)
+    let value = compact::ingest(response).map_err(|error| {
+        McpError::internal_error(format!("Failed to compact ingest result: {error}"), None)
     })?;
 
     Ok(CallToolResult {
@@ -923,8 +921,8 @@ fn summarize_ingest(payload: &IngestResponse) -> String {
 
 fn build_index_status_result(response: IndexStatusResponse) -> Result<CallToolResult, McpError> {
     let summary = summarize_index_status(&response);
-    let value: Value = serde_json::to_value(&response).map_err(|error| {
-        McpError::internal_error(format!("Failed to serialize status: {error}"), None)
+    let value = compact::index_status(response).map_err(|error| {
+        McpError::internal_error(format!("Failed to compact status result: {error}"), None)
     })?;
 
     Ok(CallToolResult {
@@ -1026,9 +1024,9 @@ fn build_semantic_search_result(
     meta: Meta,
 ) -> Result<CallToolResult, McpError> {
     let summary = summarize_semantic_search(&response);
-    let value: Value = serde_json::to_value(&response).map_err(|error| {
+    let value = compact::semantic_search(response).map_err(|error| {
         McpError::internal_error(
-            format!("Failed to serialize semantic search result: {error}"),
+            format!("Failed to compact semantic search result: {error}"),
             None,
         )
     })?;
@@ -1162,16 +1160,9 @@ fn build_code_lookup_result(
     meta: Option<Meta>,
 ) -> Result<CallToolResult, McpError> {
     let summary = summarize_semantic_search(&search_result);
-    let payload = CodeLookupResponse {
-        mode,
-        summary: summary.clone(),
-        search_result: Some(search_result),
-        bundle_result: None,
-    };
-
-    let value: Value = serde_json::to_value(&payload).map_err(|error| {
+    let value = compact::code_lookup_search(mode, search_result).map_err(|error| {
         McpError::internal_error(
-            format!("Failed to serialize code_lookup result: {error}"),
+            format!("Failed to compact code_lookup search result: {error}"),
             None,
         )
     })?;
@@ -1190,22 +1181,9 @@ fn build_code_lookup_bundle_response(
     meta: Option<Meta>,
 ) -> Result<CallToolResult, McpError> {
     let summary = summarize_bundle(&bundle);
-
-    let payload = CodeLookupResponse {
-        mode,
-        summary: summary.clone(),
-        search_result: None,
-        bundle_result: Some(serde_json::to_value(&bundle).map_err(|error| {
-            McpError::internal_error(
-                format!("Failed to serialize context bundle result: {error}"),
-                None,
-            )
-        })?),
-    };
-
-    let value: Value = serde_json::to_value(&payload).map_err(|error| {
+    let value = compact::code_lookup_bundle(mode, bundle).map_err(|error| {
         McpError::internal_error(
-            format!("Failed to serialize code_lookup result: {error}"),
+            format!("Failed to compact code_lookup bundle result: {error}"),
             None,
         )
     })?;
@@ -1529,9 +1507,9 @@ fn build_context_bundle_result(
 ) -> Result<CallToolResult, McpError> {
     let summary = summarize_bundle(&response);
 
-    let value: Value = serde_json::to_value(&response).map_err(|error| {
+    let value = compact::context_bundle(response).map_err(|error| {
         McpError::internal_error(
-            format!("Failed to serialize context bundle result: {error}"),
+            format!("Failed to compact context bundle result: {error}"),
             None,
         )
     })?;
@@ -1594,9 +1572,9 @@ fn build_repository_timeline_result(
             .push_str(" Diffs cached in SQLite; call repository_timeline_entry for full output.");
     }
 
-    let value: Value = serde_json::to_value(&response).map_err(|error| {
+    let value = compact::repository_timeline(response).map_err(|error| {
         McpError::internal_error(
-            format!("Failed to serialize repository timeline result: {error}"),
+            format!("Failed to compact repository timeline result: {error}"),
             None,
         )
     })?;
@@ -1625,9 +1603,9 @@ fn build_repository_timeline_entry_result(
         )
     };
 
-    let value: Value = serde_json::to_value(&response).map_err(|error| {
+    let value = compact::repository_timeline_entry(response).map_err(|error| {
         McpError::internal_error(
-            format!("Failed to serialize repository timeline entry result: {error}"),
+            format!("Failed to compact repository timeline entry result: {error}"),
             None,
         )
     })?;
@@ -1640,12 +1618,1057 @@ fn build_repository_timeline_entry_result(
     })
 }
 
+mod compact {
+    use super::*;
+    use serde::Serialize;
+    use serde_json::Value;
+
+    pub(super) fn ingest(response: IngestResponse) -> serde_json::Result<Value> {
+        serde_json::to_value(CompactIngestResponse::from(response))
+    }
+
+    pub(super) fn index_status(response: IndexStatusResponse) -> serde_json::Result<Value> {
+        serde_json::to_value(CompactIndexStatusResponse::from(response))
+    }
+
+    pub(super) fn semantic_search(response: SemanticSearchResponse) -> serde_json::Result<Value> {
+        serde_json::to_value(CompactSemanticSearchResponse::from(response))
+    }
+
+    pub(super) fn code_lookup_search(
+        mode: String,
+        search: SemanticSearchResponse,
+    ) -> serde_json::Result<Value> {
+        serde_json::to_value(CompactCodeLookupResponse::search(mode, search))
+    }
+
+    pub(super) fn code_lookup_bundle(
+        mode: String,
+        bundle: ContextBundleResponse,
+    ) -> serde_json::Result<Value> {
+        serde_json::to_value(CompactCodeLookupResponse::bundle(mode, bundle))
+    }
+
+    pub(super) fn context_bundle(response: ContextBundleResponse) -> serde_json::Result<Value> {
+        serde_json::to_value(CompactContextBundleResponse::from(response))
+    }
+
+    pub(super) fn repository_timeline(
+        response: RepositoryTimelineResponse,
+    ) -> serde_json::Result<Value> {
+        serde_json::to_value(CompactRepositoryTimelineResponse::from(response))
+    }
+
+    pub(super) fn repository_timeline_entry(
+        response: RepositoryTimelineEntryLookupResponse,
+    ) -> serde_json::Result<Value> {
+        serde_json::to_value(CompactRepositoryTimelineEntryResponse::from(response))
+    }
+
+    #[derive(Serialize)]
+    struct CompactIngestResponse {
+        t: &'static str,
+        r: String,
+        db: String,
+        sz: u64,
+        fc: usize,
+        ec: usize,
+        gc: CompactGraphCounts,
+        du: u128,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mdl: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mb: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        md: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ml: Option<u128>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mq: Option<bool>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        sk: Vec<CompactSkippedFile>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        del: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ev: Option<CompactEviction>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rf: Option<usize>,
+    }
+
+    impl From<IngestResponse> for CompactIngestResponse {
+        fn from(response: IngestResponse) -> Self {
+            Self {
+                t: "ingest",
+                r: response.root,
+                db: response.database_path,
+                sz: response.database_size_bytes,
+                fc: response.ingested_file_count,
+                ec: response.embedded_chunk_count,
+                gc: CompactGraphCounts {
+                    n: response.graph_node_count as u64,
+                    e: response.graph_edge_count as u64,
+                },
+                du: response.duration_ms,
+                mdl: response.embedding_model,
+                mb: response.embedding_backend,
+                md: response.embedding_dimension,
+                ml: response.embedding_latency_ms,
+                mq: response.embedding_quantized,
+                sk: response
+                    .skipped
+                    .into_iter()
+                    .map(CompactSkippedFile::from)
+                    .collect(),
+                del: response.deleted_paths,
+                ev: response.evicted.map(CompactEviction::from),
+                rf: response.reused_file_count,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactGraphCounts {
+        n: u64,
+        e: u64,
+    }
+
+    #[derive(Serialize)]
+    struct CompactSkippedFile {
+        p: String,
+        why: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sz: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        msg: Option<String>,
+    }
+
+    impl From<SkippedFile> for CompactSkippedFile {
+        fn from(file: SkippedFile) -> Self {
+            Self {
+                p: file.path,
+                why: file.reason,
+                sz: file.size,
+                msg: file.message,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactEviction {
+        db: String,
+        sb: u64,
+        sa: u64,
+        ec: usize,
+        en: usize,
+    }
+
+    impl From<EvictionReport> for CompactEviction {
+        fn from(report: EvictionReport) -> Self {
+            Self {
+                db: report.database_path,
+                sb: report.size_before,
+                sa: report.size_after,
+                ec: report.evicted_chunks,
+                en: report.evicted_nodes,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactIndexStatusResponse {
+        t: &'static str,
+        db: String,
+        exists: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sz: Option<u64>,
+        tf: u64,
+        tc: u64,
+        gc: CompactGraphCounts,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        mdl: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        latest: Option<CompactIndexStatusIngestion>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        recent: Vec<CompactIndexStatusIngestion>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sha: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        curr_sha: Option<String>,
+        stale: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        indexed_at: Option<i64>,
+    }
+
+    impl From<IndexStatusResponse> for CompactIndexStatusResponse {
+        fn from(response: IndexStatusResponse) -> Self {
+            Self {
+                t: "status",
+                db: response.database_path,
+                exists: response.database_exists,
+                sz: response.database_size_bytes,
+                tf: response.total_files,
+                tc: response.total_chunks,
+                gc: CompactGraphCounts {
+                    n: response.total_graph_nodes,
+                    e: response.total_graph_edges,
+                },
+                mdl: response.embedding_models,
+                latest: response
+                    .latest_ingestion
+                    .map(CompactIndexStatusIngestion::from),
+                recent: response
+                    .recent_ingestions
+                    .into_iter()
+                    .map(CompactIndexStatusIngestion::from)
+                    .collect(),
+                sha: response.commit_sha,
+                curr_sha: response.current_commit_sha,
+                stale: response.is_stale,
+                indexed_at: response.indexed_at,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactIndexStatusIngestion {
+        id: String,
+        r: String,
+        start: i64,
+        end: i64,
+        dur: i64,
+        fc: i64,
+        sk: i64,
+        del: i64,
+    }
+
+    impl From<IndexStatusIngestion> for CompactIndexStatusIngestion {
+        fn from(ingestion: IndexStatusIngestion) -> Self {
+            Self {
+                id: ingestion.id,
+                r: ingestion.root,
+                start: ingestion.started_at,
+                end: ingestion.finished_at,
+                dur: ingestion.duration_ms,
+                fc: ingestion.file_count,
+                sk: ingestion.skipped_count,
+                del: ingestion.deleted_count,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactSemanticSearchResponse {
+        t: &'static str,
+        db: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mdl: Option<String>,
+        tc: u64,
+        ec: u64,
+        r: Vec<CompactSemanticMatch>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        sg: Vec<CompactSuggestedTool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        diag: Option<CompactSearchDiagnostics>,
+    }
+
+    impl From<SemanticSearchResponse> for CompactSemanticSearchResponse {
+        fn from(response: SemanticSearchResponse) -> Self {
+            Self {
+                t: "sem",
+                db: response.database_path,
+                name: response.database_name,
+                mdl: response.embedding_model,
+                tc: response.total_chunks,
+                ec: response.evaluated_chunks,
+                r: response
+                    .results
+                    .into_iter()
+                    .map(CompactSemanticMatch::from)
+                    .collect(),
+                sg: response
+                    .suggested_tools
+                    .into_iter()
+                    .map(CompactSuggestedTool::from)
+                    .collect(),
+                diag: response.diagnostics.map(CompactSearchDiagnostics::from),
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactSemanticMatch {
+        p: String,
+        ci: i32,
+        ns: f32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sc: Option<f32>,
+        cl: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lang: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ls: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        le: Option<i64>,
+        src: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cb: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ca: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sum: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sym: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ident: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        st: Option<String>,
+        src_kind: &'static str,
+        cf: f32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
+    }
+
+    impl From<SemanticSearchMatch> for CompactSemanticMatch {
+        fn from(result: SemanticSearchMatch) -> Self {
+            Self {
+                p: result.path,
+                ci: result.chunk_index,
+                ns: result.normalized_score,
+                sc: Some(result.score),
+                cl: classification_name(result.classification),
+                lang: result.language,
+                ls: result.line_start,
+                le: result.line_end,
+                src: result.content,
+                cb: result.context_before,
+                ca: result.context_after,
+                sum: result.summary,
+                sym: result.symbol,
+                ident: result.identifier,
+                st: result.source_type,
+                src_kind: search_source_name(result.source),
+                cf: result.confidence,
+                meta: result.metadata,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactSuggestedTool {
+        id: String,
+        r: u32,
+        s: f32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        d: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pv: Option<String>,
+        params: Value,
+    }
+
+    impl From<SuggestedTool> for CompactSuggestedTool {
+        fn from(tool: SuggestedTool) -> Self {
+            Self {
+                id: tool.tool,
+                r: tool.rank,
+                s: tool.score,
+                d: tool.description,
+                pv: tool.preview,
+                params: tool.parameters,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactSearchDiagnostics {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mdl: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        be: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        q: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dim: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        emb_ms: Option<u128>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lex_ms: Option<u128>,
+        tot_ms: u128,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        eval: Option<u64>,
+    }
+
+    impl From<SearchDiagnostics> for CompactSearchDiagnostics {
+        fn from(diag: SearchDiagnostics) -> Self {
+            Self {
+                mdl: diag.model,
+                be: diag.backend,
+                q: diag.quantized,
+                dim: diag.dimension,
+                emb_ms: diag.embedding_latency_ms,
+                lex_ms: diag.lexical_latency_ms,
+                tot_ms: diag.total_latency_ms,
+                eval: diag.evaluated_chunk_count,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactCodeLookupResponse {
+        t: &'static str,
+        mode: String,
+        sem: Option<CompactSemanticSearchResponse>,
+        bundle: Option<CompactContextBundleResponse>,
+    }
+
+    impl CompactCodeLookupResponse {
+        fn search(mode: String, search: SemanticSearchResponse) -> Self {
+            Self {
+                t: "code",
+                mode,
+                sem: Some(CompactSemanticSearchResponse::from(search)),
+                bundle: None,
+            }
+        }
+
+        fn bundle(mode: String, bundle: ContextBundleResponse) -> Self {
+            Self {
+                t: "code",
+                mode,
+                sem: None,
+                bundle: Some(CompactContextBundleResponse::from(bundle)),
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactContextBundleResponse {
+        t: &'static str,
+        db: String,
+        file: CompactBundleFile,
+        defs: Vec<CompactBundleDefinition>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        focus: Option<CompactBundleDefinition>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        rel: Vec<CompactBundleNeighbor>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        sn: Vec<CompactBundleSnippet>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        latest: Option<CompactBundleIngestion>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        warn: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        quick: Vec<CompactQuickLink>,
+        use_stats: CompactBundleUsage,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        diag: Option<CompactBundleDiagnostics>,
+    }
+
+    impl From<ContextBundleResponse> for CompactContextBundleResponse {
+        fn from(response: ContextBundleResponse) -> Self {
+            Self {
+                t: "ctx",
+                db: response.database_path,
+                file: CompactBundleFile::from(response.file),
+                defs: response
+                    .definitions
+                    .into_iter()
+                    .map(CompactBundleDefinition::from)
+                    .collect(),
+                focus: response.focus_definition.map(CompactBundleDefinition::from),
+                rel: response
+                    .related
+                    .into_iter()
+                    .map(CompactBundleNeighbor::from)
+                    .collect(),
+                sn: response
+                    .snippets
+                    .into_iter()
+                    .map(CompactBundleSnippet::from)
+                    .collect(),
+                latest: response.latest_ingestion.map(CompactBundleIngestion::from),
+                warn: response.warnings,
+                quick: response
+                    .quick_links
+                    .into_iter()
+                    .map(CompactQuickLink::from)
+                    .collect(),
+                use_stats: CompactBundleUsage::from(response.usage),
+                diag: response.diagnostics.map(CompactBundleDiagnostics::from),
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactBundleFile {
+        p: String,
+        sz: i64,
+        m: i64,
+        hash: String,
+        idx: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        brief: Option<String>,
+    }
+
+    impl From<BundleFileMetadata> for CompactBundleFile {
+        fn from(file: BundleFileMetadata) -> Self {
+            Self {
+                p: file.path,
+                sz: file.size,
+                m: file.modified,
+                hash: file.hash,
+                idx: file.last_indexed_at,
+                brief: file.brief,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactBundleDefinition {
+        id: String,
+        name: String,
+        kind: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sig: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rs: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        re: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        vis: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        doc: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        todo: Option<u32>,
+    }
+
+    impl From<BundleDefinition> for CompactBundleDefinition {
+        fn from(def: BundleDefinition) -> Self {
+            Self {
+                id: def.id,
+                name: def.name,
+                kind: def.kind,
+                sig: def.signature,
+                rs: def.range_start,
+                re: def.range_end,
+                meta: def.metadata,
+                vis: def.visibility,
+                doc: def.docstring,
+                todo: def.todo_count,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactBundleNeighbor {
+        id: String,
+        ty: String,
+        dir: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sp: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tp: Option<String>,
+        node: CompactNeighborNode,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
+    }
+
+    impl From<BundleEdgeNeighbor> for CompactBundleNeighbor {
+        fn from(neighbor: BundleEdgeNeighbor) -> Self {
+            Self {
+                id: neighbor.id,
+                ty: neighbor.r#type,
+                dir: neighbor_direction_name(neighbor.direction),
+                sp: neighbor.source_path,
+                tp: neighbor.target_path,
+                node: CompactNeighborNode::from(neighbor.neighbor),
+                meta: neighbor.metadata,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactNeighborNode {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        p: Option<String>,
+        kind: String,
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sig: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rs: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        re: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
+    }
+
+    impl From<NeighborNode> for CompactNeighborNode {
+        fn from(node: NeighborNode) -> Self {
+            Self {
+                id: node.id,
+                p: node.path,
+                kind: node.kind,
+                name: node.name,
+                sig: node.signature,
+                rs: node.range_start,
+                re: node.range_end,
+                meta: node.metadata,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactBundleSnippet {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        p: Option<String>,
+        src: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ci: Option<i32>,
+        txt: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ls: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        le: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sum: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sym: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ident: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        st: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sc: Option<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sim: Option<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mdl: Option<String>,
+    }
+
+    impl From<BundleSnippet> for CompactBundleSnippet {
+        fn from(snippet: BundleSnippet) -> Self {
+            Self {
+                p: snippet.path,
+                src: snippet_source_name(snippet.source),
+                ci: snippet.chunk_index,
+                txt: snippet.content,
+                ls: snippet.line_start,
+                le: snippet.line_end,
+                sum: snippet.summary,
+                sym: snippet.symbol,
+                ident: snippet.identifier,
+                st: snippet.source_type,
+                meta: snippet.metadata,
+                sc: snippet.score,
+                sim: snippet.similarity,
+                mdl: snippet.embedding_model,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactBundleIngestion {
+        id: String,
+        ts: i64,
+        dur: i64,
+        fc: i64,
+    }
+
+    impl From<BundleIngestionSummary> for CompactBundleIngestion {
+        fn from(summary: BundleIngestionSummary) -> Self {
+            Self {
+                id: summary.id,
+                ts: summary.finished_at,
+                dur: summary.duration_ms,
+                fc: summary.file_count,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactQuickLink {
+        ty: &'static str,
+        label: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dir: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sym: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+    }
+
+    impl From<ContextBundleQuickLink> for CompactQuickLink {
+        fn from(link: ContextBundleQuickLink) -> Self {
+            Self {
+                ty: quick_link_type_name(link.r#type),
+                label: link.label,
+                path: link.path,
+                dir: link.direction.map(neighbor_direction_name),
+                sym: link.symbol_id,
+                kind: link.symbol_kind,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactBundleUsage {
+        def: usize,
+        sn: usize,
+        used: usize,
+        bud: usize,
+        rem: usize,
+        omit: usize,
+        exc: usize,
+        sum: usize,
+        cache: bool,
+    }
+
+    impl From<BundleUsageStats> for CompactBundleUsage {
+        fn from(stats: BundleUsageStats) -> Self {
+            Self {
+                def: stats.definitions_tokens,
+                sn: stats.snippet_tokens,
+                used: stats.used_tokens,
+                bud: stats.budget_tokens,
+                rem: stats.remaining_tokens,
+                omit: stats.omitted_snippets,
+                exc: stats.excerpt_snippets,
+                sum: stats.summary_snippets,
+                cache: stats.cache_hit,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactBundleDiagnostics {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        q: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mdl: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        be: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ms: Option<u128>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        smin: Option<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        smax: Option<f32>,
+    }
+
+    impl From<BundleDiagnostics> for CompactBundleDiagnostics {
+        fn from(d: BundleDiagnostics) -> Self {
+            Self {
+                q: d.query,
+                mdl: d.embedding_model,
+                be: d.embedding_backend,
+                ms: d.embedding_latency_ms,
+                smin: d.similarity_min,
+                smax: d.similarity_max,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactRepositoryTimelineResponse {
+        t: &'static str,
+        root: String,
+        br: String,
+        limit: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        since: Option<String>,
+        merges: bool,
+        stats: bool,
+        diffs: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        paths: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        diff: Option<String>,
+        total: usize,
+        merges_count: usize,
+        ins: i64,
+        del: i64,
+        entries: Vec<CompactTimelineEntry>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        remote: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        db: Option<String>,
+    }
+
+    impl From<RepositoryTimelineResponse> for CompactRepositoryTimelineResponse {
+        fn from(response: RepositoryTimelineResponse) -> Self {
+            Self {
+                t: "timeline",
+                root: response.repository_root,
+                br: response.branch,
+                limit: response.limit,
+                since: response.since,
+                merges: response.include_merges,
+                stats: response.include_file_stats,
+                diffs: response.include_diffs,
+                paths: response.paths,
+                diff: response.diff_pattern,
+                total: response.total_commits,
+                merges_count: response.merge_commits,
+                ins: response.total_insertions,
+                del: response.total_deletions,
+                entries: response
+                    .entries
+                    .into_iter()
+                    .map(CompactTimelineEntry::from)
+                    .collect(),
+                remote: response.remote_url,
+                db: response.database_path,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactTimelineEntry {
+        sha: String,
+        subj: String,
+        sum: String,
+        auth: CompactIdentity,
+        auth_ts: String,
+        comm: CompactIdentity,
+        comm_ts: String,
+        parents: Vec<String>,
+        merge: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pr: Option<i64>,
+        files: usize,
+        ins: i64,
+        del: i64,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        changes: Vec<CompactFileChange>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        diff: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        diff_preview: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        diff_ptr: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        top: Vec<CompactTopFile>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        churn: Vec<CompactDirectoryChurn>,
+        diff_stats: CompactDiffSummary,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        highlights: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pr_url: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        captured: Option<i64>,
+    }
+
+    impl From<RepositoryTimelineEntry> for CompactTimelineEntry {
+        fn from(entry: RepositoryTimelineEntry) -> Self {
+            Self {
+                sha: entry.sha,
+                subj: entry.subject,
+                sum: entry.summary,
+                auth: CompactIdentity::from(entry.author),
+                auth_ts: entry.author_date,
+                comm: CompactIdentity::from(entry.committer),
+                comm_ts: entry.committer_date,
+                parents: entry.parents,
+                merge: entry.is_merge,
+                pr: entry.pull_request_number,
+                files: entry.files_changed,
+                ins: entry.insertions,
+                del: entry.deletions,
+                changes: entry
+                    .file_changes
+                    .into_iter()
+                    .map(CompactFileChange::from)
+                    .collect(),
+                diff: entry.diff,
+                diff_preview: entry.diff_preview,
+                diff_ptr: entry.diff_pointer,
+                top: entry
+                    .top_files
+                    .into_iter()
+                    .map(CompactTopFile::from)
+                    .collect(),
+                churn: entry
+                    .directory_churn
+                    .into_iter()
+                    .map(CompactDirectoryChurn::from)
+                    .collect(),
+                diff_stats: CompactDiffSummary::from(entry.diff_summary),
+                highlights: entry.highlights,
+                pr_url: entry.pull_request_url,
+                captured: entry.captured_at,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactIdentity {
+        name: String,
+        email: String,
+    }
+
+    impl From<TimelineIdentity> for CompactIdentity {
+        fn from(identity: TimelineIdentity) -> Self {
+            Self {
+                name: identity.name,
+                email: identity.email,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactFileChange {
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ins: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        del: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        net: Option<i64>,
+    }
+
+    impl From<RepositoryTimelineFileChange> for CompactFileChange {
+        fn from(change: RepositoryTimelineFileChange) -> Self {
+            Self {
+                path: change.path,
+                ins: change.insertions,
+                del: change.deletions,
+                net: change.net,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactTopFile {
+        path: String,
+        ins: i64,
+        del: i64,
+        net: i64,
+    }
+
+    impl From<RepositoryTimelineTopFile> for CompactTopFile {
+        fn from(file: RepositoryTimelineTopFile) -> Self {
+            Self {
+                path: file.path,
+                ins: file.insertions,
+                del: file.deletions,
+                net: file.net,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactDirectoryChurn {
+        path: String,
+        ins: i64,
+        del: i64,
+        net: i64,
+        files: usize,
+    }
+
+    impl From<RepositoryTimelineDirectoryChurn> for CompactDirectoryChurn {
+        fn from(churn: RepositoryTimelineDirectoryChurn) -> Self {
+            Self {
+                path: churn.path,
+                ins: churn.insertions,
+                del: churn.deletions,
+                net: churn.net,
+                files: churn.files_changed,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactDiffSummary {
+        files: usize,
+        ins: i64,
+        del: i64,
+        net: i64,
+    }
+
+    impl From<RepositoryTimelineDiffSummary> for CompactDiffSummary {
+        fn from(summary: RepositoryTimelineDiffSummary) -> Self {
+            Self {
+                files: summary.files_changed,
+                ins: summary.insertions,
+                del: summary.deletions,
+                net: summary.net,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactRepositoryTimelineEntryResponse {
+        t: &'static str,
+        db: String,
+        entry: CompactTimelineEntry,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        diff: Option<String>,
+    }
+
+    impl From<RepositoryTimelineEntryLookupResponse> for CompactRepositoryTimelineEntryResponse {
+        fn from(response: RepositoryTimelineEntryLookupResponse) -> Self {
+            Self {
+                t: "timeline_entry",
+                db: response.database_path,
+                entry: CompactTimelineEntry::from(response.entry),
+                diff: response.diff,
+            }
+        }
+    }
+
+    fn classification_name(classification: Classification) -> &'static str {
+        match classification {
+            Classification::Function => "function",
+            Classification::Comment => "comment",
+            Classification::Code => "code",
+        }
+    }
+
+    fn search_source_name(source: SearchSource) -> &'static str {
+        match source {
+            SearchSource::Embedding => "embedding",
+            SearchSource::Lexical => "lexical",
+        }
+    }
+
+    fn neighbor_direction_name(direction: NeighborDirection) -> &'static str {
+        match direction {
+            NeighborDirection::Incoming => "in",
+            NeighborDirection::Outgoing => "out",
+        }
+    }
+
+    fn snippet_source_name(source: SnippetSource) -> &'static str {
+        match source {
+            SnippetSource::Chunk => "chunk",
+            SnippetSource::Content => "content",
+        }
+    }
+
+    fn quick_link_type_name(kind: QuickLinkType) -> &'static str {
+        match kind {
+            QuickLinkType::File => "file",
+            QuickLinkType::RelatedSymbol => "symbol",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bundle::{
-        BundleDefinition, BundleFileMetadata, BundleSnippet, ContextBundleQuickLink,
-        ContextBundleResponse, QuickLinkType, SnippetSource,
+        BundleDefinition, BundleFileMetadata, BundleSnippet, BundleUsageStats,
+        ContextBundleQuickLink, ContextBundleResponse, QuickLinkType, SnippetSource,
     };
     use crate::index_status::{IndexStatusIngestion, IndexStatusResponse};
     use crate::ingest::IngestResponse;
@@ -1678,6 +2701,122 @@ mod tests {
             source_type: None,
             metadata: None,
             confidence: 0.9,
+        }
+    }
+
+    fn sample_bundle_response() -> ContextBundleResponse {
+        ContextBundleResponse {
+            database_path: "db.sqlite".into(),
+            file: BundleFileMetadata {
+                path: "src/lib.rs".into(),
+                size: 128,
+                modified: 1_710_000_000,
+                hash: "abc123".into(),
+                last_indexed_at: 1_710_000_123,
+                brief: None,
+                content: None,
+            },
+            definitions: vec![BundleDefinition {
+                id: "def-1".into(),
+                name: "foo".into(),
+                kind: "function".into(),
+                signature: Some("fn foo()".into()),
+                range_start: Some(1),
+                range_end: Some(10),
+                metadata: None,
+                visibility: Some("pub".into()),
+                docstring: None,
+                todo_count: None,
+            }],
+            focus_definition: None,
+            related: Vec::new(),
+            snippets: vec![BundleSnippet {
+                path: None,
+                source: SnippetSource::Chunk,
+                chunk_index: Some(0),
+                content: "fn foo() {}".into(),
+                byte_start: Some(0),
+                byte_end: Some(12),
+                line_start: Some(1),
+                line_end: Some(1),
+                served_count: None,
+                summary: None,
+                symbol: None,
+                identifier: None,
+                source_type: None,
+                metadata: None,
+                score: None,
+                similarity: None,
+                embedding_model: None,
+                embedding: None,
+            }],
+            latest_ingestion: None,
+            warnings: vec!["No graph metadata".into()],
+            quick_links: vec![ContextBundleQuickLink {
+                r#type: QuickLinkType::File,
+                label: "src/lib.rs".into(),
+                path: Some("src/lib.rs".into()),
+                direction: None,
+                symbol_id: None,
+                symbol_kind: None,
+            }],
+            usage: BundleUsageStats {
+                definitions_tokens: 10,
+                snippet_tokens: 12,
+                used_tokens: 22,
+                budget_tokens: 3_000,
+                remaining_tokens: 2_978,
+                omitted_snippets: 0,
+                excerpt_snippets: 0,
+                summary_snippets: 0,
+                cache_hit: false,
+            },
+            diagnostics: None,
+        }
+    }
+
+    fn sample_semantic_response() -> SemanticSearchResponse {
+        SemanticSearchResponse {
+            database_path: "db.sqlite".into(),
+            database_name: Some("db.sqlite".into()),
+            embedding_model: Some("custom-model".into()),
+            total_chunks: 200,
+            evaluated_chunks: 150,
+            results: vec![SemanticSearchMatch {
+                path: "src/main.rs".into(),
+                chunk_index: 0,
+                score: 1.0,
+                normalized_score: 0.92,
+                language: Some("Rust".into()),
+                classification: Classification::Function,
+                content: "fn example() {}".into(),
+                embedding_model: "custom-model".into(),
+                byte_start: Some(10),
+                byte_end: Some(20),
+                line_start: Some(44),
+                line_end: Some(47),
+                context_before: None,
+                context_after: None,
+                source: SearchSource::Lexical,
+                summary: None,
+                symbol: None,
+                identifier: None,
+                source_type: None,
+                metadata: None,
+                confidence: 0.92,
+            }],
+            summary_mode: SummaryMode::Brief,
+            suggested_tools: Vec::new(),
+            diagnostics: Some(SearchDiagnostics {
+                model: Some("custom-model".into()),
+                backend: None,
+                quantized: None,
+                dimension: None,
+                embedding_latency_ms: None,
+                lexical_latency_ms: Some(5),
+                total_latency_ms: 25,
+                evaluated_chunk_count: Some(150),
+            }),
         }
     }
 
@@ -1806,75 +2945,7 @@ mod tests {
 
     #[test]
     fn summarize_bundle_surfaces_primary_snippets_and_links() {
-        let bundle = ContextBundleResponse {
-            database_path: "db.sqlite".into(),
-            file: BundleFileMetadata {
-                path: "src/lib.rs".into(),
-                size: 128,
-                modified: 1_710_000_000,
-                hash: "abc123".into(),
-                last_indexed_at: 1_710_000_123,
-                brief: None,
-                content: None,
-            },
-            definitions: vec![BundleDefinition {
-                id: "def-1".into(),
-                name: "foo".into(),
-                kind: "function".into(),
-                signature: Some("fn foo()".into()),
-                range_start: Some(1),
-                range_end: Some(10),
-                metadata: None,
-                visibility: Some("pub".into()),
-                docstring: None,
-                todo_count: None,
-            }],
-            focus_definition: None,
-            related: Vec::new(),
-            snippets: vec![BundleSnippet {
-                path: None,
-                source: SnippetSource::Chunk,
-                chunk_index: Some(0),
-                content: "fn foo() {}".into(),
-                byte_start: Some(0),
-                byte_end: Some(12),
-                line_start: Some(1),
-                line_end: Some(1),
-                served_count: None,
-                summary: None,
-                symbol: None,
-                identifier: None,
-                source_type: None,
-                metadata: None,
-                score: None,
-                similarity: None,
-                embedding_model: None,
-                embedding: None,
-            }],
-            latest_ingestion: None,
-            warnings: vec!["No graph metadata".into()],
-            quick_links: vec![ContextBundleQuickLink {
-                r#type: QuickLinkType::File,
-                label: "src/lib.rs".into(),
-                path: Some("src/lib.rs".into()),
-                direction: None,
-                symbol_id: None,
-                symbol_kind: None,
-            }],
-            usage: crate::bundle::BundleUsageStats {
-                definitions_tokens: 10,
-                snippet_tokens: 12,
-                used_tokens: 22,
-                budget_tokens: 3_000,
-                remaining_tokens: 2_978,
-                omitted_snippets: 0,
-                excerpt_snippets: 0,
-                summary_snippets: 0,
-                cache_hit: false,
-            },
-            diagnostics: None,
-        };
-
+        let bundle = sample_bundle_response();
         let summary = summarize_bundle(&bundle);
 
         assert!(summary.contains(
@@ -1978,6 +3049,18 @@ mod tests {
         ));
         assert!(summary.contains("1 lexical match(es) promoted ahead of semantic ranks."));
         assert!(summary.contains("Top hit: src/main.rs#L44 (confidence 0.92)."));
+    }
+
+    #[test]
+    fn semantic_search_structured_content_is_compact() {
+        let response = sample_semantic_response();
+        let meta = Meta::new();
+        let result = build_semantic_search_result(response, meta).expect("result");
+        let structured = result.structured_content.expect("structured content");
+        let object = structured.as_object().expect("object");
+        assert_eq!(object.get("t"), Some(&json!("sem")));
+        assert!(object.contains_key("r"));
+        assert!(!object.contains_key("results"));
     }
 
     #[test]
@@ -2090,5 +3173,16 @@ mod tests {
         });
 
         assert_eq!(resolved_mode, "bundle");
+    }
+
+    #[test]
+    fn context_bundle_structured_content_is_compact() {
+        let bundle = sample_bundle_response();
+        let result = build_context_bundle_result(bundle, None).expect("context bundle result");
+        let structured = result.structured_content.expect("structured content");
+        let object = structured.as_object().expect("object");
+        assert_eq!(object.get("t"), Some(&json!("ctx")));
+        assert!(object.contains_key("defs"));
+        assert!(!object.contains_key("definitions"));
     }
 }

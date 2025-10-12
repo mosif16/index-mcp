@@ -378,10 +378,55 @@ mod swift_simple {
     static FUNC_RE: Lazy<Regex> = Lazy::new(|| {
         Regex::new(r"(?m)^(?P<indent>\s*)(?P<prefix>[A-Za-z0-9_\s@:<>=\(\)\[\]]*?)func\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\((?P<params>[^)]*)\)").unwrap()
     });
+    static INIT_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r"(?m)^(?P<indent>\s*)(?P<prefix>[A-Za-z0-9_\s@:<>=\(\)\[\]]*?)\binit(?P<suffix>[!?]?)\s*(?P<params>\([^)]*\))",
+        )
+        .unwrap()
+    });
+    static DEINIT_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"(?m)^(?P<indent>\s*)(?P<prefix>[A-Za-z0-9_\s@:<>=\(\)\[\]]*?)\bdeinit\b")
+            .unwrap()
+    });
 
     const FORBIDDEN: &[&str] = &[
         "if", "for", "while", "switch", "catch", "guard", "return", "init", "deinit",
     ];
+
+    fn record_definition(
+        extractor: &mut SimpleExtractor<'_>,
+        source: &str,
+        full_match: regex::Match<'_>,
+        name: &str,
+        signature: String,
+    ) {
+        let brace_pos = source[full_match.end()..]
+            .find('{')
+            .map(|offset| full_match.end() + offset)
+            .unwrap_or(full_match.end());
+
+        let body_start = match source[brace_pos..].chars().next() {
+            Some('{') => brace_pos,
+            _ => return,
+        };
+
+        let body_end = match find_matching_brace(source, body_start) {
+            Some(end) => end,
+            None => source.len(),
+        };
+
+        let function_id = extractor.add_function(
+            name,
+            "function",
+            full_match.start(),
+            body_end,
+            Some(signature),
+            None,
+        );
+        extractor.push_scope(function_id);
+        extractor.scan_calls(body_start, body_end, FORBIDDEN);
+        extractor.pop_scope();
+    }
 
     pub(super) fn extract(path: &str, source: &str) -> Option<super::GraphExtraction> {
         let mut extractor = SimpleExtractor::new(path, source);
@@ -389,34 +434,23 @@ mod swift_simple {
             let name = capture.name("name").unwrap().as_str();
             let params = capture.name("params").map(|m| m.as_str()).unwrap_or("");
             let full_match = capture.get(0).unwrap();
-
-            let brace_pos = source[full_match.end()..]
-                .find('{')
-                .map(|offset| full_match.end() + offset)
-                .unwrap_or(full_match.end());
-
-            let body_start = match source[brace_pos..].chars().next() {
-                Some('{') => brace_pos,
-                _ => continue,
-            };
-
-            let body_end = match find_matching_brace(source, body_start) {
-                Some(end) => end,
-                None => source.len(),
-            };
-
             let signature = format!("func {}({})", name, params.trim());
-            let function_id = extractor.add_function(
-                name,
-                "function",
-                full_match.start(),
-                body_end,
-                Some(signature),
-                None,
-            );
-            extractor.push_scope(function_id);
-            extractor.scan_calls(body_start, body_end, FORBIDDEN);
-            extractor.pop_scope();
+            record_definition(&mut extractor, source, full_match, name, signature);
+        }
+
+        for capture in INIT_RE.captures_iter(source) {
+            let suffix = capture.name("suffix").map(|m| m.as_str()).unwrap_or("");
+            let name = format!("init{}", suffix);
+            let params = capture.name("params").map(|m| m.as_str()).unwrap_or("()");
+            let full_match = capture.get(0).unwrap();
+            let signature = format!("init{}{}", suffix, params.trim());
+            record_definition(&mut extractor, source, full_match, &name, signature);
+        }
+
+        for capture in DEINIT_RE.captures_iter(source) {
+            let full_match = capture.get(0).unwrap();
+            let signature = "deinit".to_string();
+            record_definition(&mut extractor, source, full_match, "deinit", signature);
         }
         extractor.finish()
     }
