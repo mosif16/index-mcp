@@ -20,4 +20,4 @@ Add `--watch` to keep the index fresh as files change, or see `./start.sh` in th
 
 ## License
 
-MIT
+MIT 
