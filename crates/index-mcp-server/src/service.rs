@@ -3,6 +3,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::io::ErrorKind;
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use crate::bundle::{
@@ -376,6 +377,15 @@ struct CodeLookupParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+struct IngestWithStatusParams {
+    #[serde(flatten)]
+    ingest: IngestParams,
+    #[serde(default)]
+    history_limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct SemanticSearchRequest {
     #[serde(default)]
     root: Option<String>,
@@ -404,22 +414,44 @@ struct SemanticSearchRequest {
 
 /// Textual instructions shared with MCP clients.
 const SERVER_INSTRUCTIONS_TEMPLATE: &str = r#"Rust rewrite is production-ready. Treat this server as the workspace source of truth and follow this proactive workflow:
-1. Prime the index at session start with ingest_codebase {"root": "{ABSOLUTE_ROOT}"} or --watch. Honor .gitignore, skip files larger than 8 MiB, and tune autoEvict/maxDatabaseSizeBytes before the SQLite file balloons. Always pass the absolute workspace root; relative paths often target the wrong codebase. If you override databaseName, supply a filename (for example ".mcp-index.sqlite"); directory-style values like "." cause SQLite to reject the request.
-2. Check index_status before planning or answering. If HEAD moved or isStale is true, ingest again before proceeding.
+1. Prime the index at session start with index_refresh {"root": "{ABSOLUTE_ROOT}"} (combines ingest_codebase + index_status in one response) or --watch. Honor .gitignore, skip files larger than 8 MiB, and tune autoEvict/maxDatabaseSizeBytes before the SQLite file balloons. Always pass the absolute workspace root; relative paths often target the wrong codebase. If you override databaseName, supply a filename (for example ".mcp-index.sqlite"); directory-style values like "." cause SQLite to reject the request.
+2. If you skip index_refresh (or only need a quick status check), call index_status before planning or answering. If HEAD moved or isStale is true, ingest again before proceeding.
 3. Brief yourself with repository_timeline (and repository_timeline_entry for deep dives) so your plan reflects the latest commits.
 4. Locate targets with semantic_search or code_lookup (query mode), then request the precise snippet with code_lookup ranges or file+symbol. Bundle mode requires a file (or a query that resolves to one), and the symbol parameter must be an object such as {"name": "perform_ingest"} rather than a bare string. Set summaryMode (brief/compressed), focusDefinition, and maxSnippets/maxNeighbors to keep the response limited to what you intend to cite. The server tracks recently delivered chunks—pass recent_hits to suppress repeats or reset it when you need fresh spans.
 5. Shape bundles to your window: supply budgetTokens (or INDEX_MCP_BUDGET_TOKENS), trim snippet limits, and only escalate to context_bundle when you truly need neighboring lines. semantic_search already highlights the focus span, so avoid whole-file dumps unless explicitly required.
 6. Add detail iteratively: chain additional semantic_search or narrowly scoped context_bundle calls instead of broad re-ingests. If dedupe hides something important, request a different chunk index or clear recent_hits rather than re-requesting the entire file.
-7. After modifying files, re-run ingest_codebase or rely on watch mode, then confirm freshness with index_status/info so the next task sees the updated payload.
+7. After modifying files, re-run index_refresh (or ingest_codebase followed by index_status) or rely on watch mode so the next task sees the updated payload.
 Responses now return compact structured_content: summaries stay in the text content, while JSON payloads use short keys (for example t:"sem"/"ctx", defs/sn for bundles, r for results). Prefer the structured data for programmatic handling and avoid relying on legacy CamelCase fields.
 
-Available tools: ingest_codebase, index_status, code_lookup (search/bundle), semantic_search, context_bundle, repository_timeline, repository_timeline_entry, indexing_guidance, indexing_guidance_tool, info."#;
+Available tools: index_refresh, code_lookup (search/bundle), semantic_search, context_bundle, repository_timeline, repository_timeline_entry, indexing_guidance, indexing_guidance_tool, info."#;
 const INDEXING_GUIDANCE_PROMPT_TEMPLATE: &str = r#"Workflow reminder:
-1. Prime the index after a checkout, pull, or edit by running ingest_codebase {"root": "{ABSOLUTE_ROOT}"} (or enabling watch mode); respect .gitignore, skip files >8 MiB, and configure autoEvict/maxDatabaseSizeBytes when needed. Always provide the absolute workspace root to avoid indexing the wrong project. If you override databaseName, make it a filename (for example ".mcp-index.sqlite"); directory-like values will fail to open.
-2. Call index_status before reasoning. If it reports staleness or a HEAD mismatch, ingest before continuing.
+1. Prime the index after a checkout, pull, or edit by running index_refresh {"root": "{ABSOLUTE_ROOT}"} (combines ingest_codebase + index_status in one response) or enabling watch mode; respect .gitignore, skip files >8 MiB, and configure autoEvict/maxDatabaseSizeBytes when needed. Always provide the absolute workspace root to avoid indexing the wrong project. If you override databaseName, make it a filename (for example ".mcp-index.sqlite"); directory-like values will fail to open.
+2. If you skip index_refresh (or only need a quick status check), call index_status before reasoning. If it reports staleness or a HEAD mismatch, ingest before continuing.
 3. Start with semantic_search or code_lookup query mode to pinpoint targets, then request precise snippets with code_lookup ranges or file+symbol. Bundle mode needs a file (or query that resolves to one), and symbol must be supplied as an object such as {"name": "perform_ingest"}. Set summaryMode and snippet limits to keep responses focused, escalating to context_bundle only when you need neighboring lines.
 4. repository_timeline and repository_timeline_entry before planning or applying changes.
 5. Keep answers tight: set INDEX_MCP_BUDGET_TOKENS or pass budgetTokens, trim maxSnippets/maxNeighbors, and prefer info/indexing_guidance_tool for diagnostics."#;
+
+fn derive_database_name_for_status(
+    ingest: &IngestResponse,
+    original: Option<String>,
+) -> Option<String> {
+    if let Some(name) = original {
+        return Some(name);
+    }
+
+    let database_path = Path::new(&ingest.database_path);
+    let root_path = Path::new(&ingest.root);
+
+    if let Ok(relative) = database_path.strip_prefix(root_path) {
+        if !relative.as_os_str().is_empty() {
+            return Some(relative.to_string_lossy().to_string());
+        }
+    }
+
+    database_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+}
 
 fn workspace_root_for_instructions() -> String {
     std::env::current_dir()
@@ -526,6 +558,42 @@ impl IndexMcpService {
             .map_err(convert_ingest_error)?;
 
         build_ingest_result(response)
+    }
+
+    #[tool(
+        name = "index_refresh",
+        description = "Ingest the workspace and return index_status in a single response."
+    )]
+    async fn index_refresh(
+        &self,
+        Parameters(params): Parameters<IngestWithStatusParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        self.environment.update_from_meta(&ctx.meta);
+
+        let history_limit = params.history_limit;
+        let mut ingest_params = params.ingest;
+        self.environment.apply_ingest_defaults(&mut ingest_params);
+        let database_name_override = ingest_params.database_name.clone();
+
+        let ingest_response = ingest_codebase(ingest_params)
+            .await
+            .map_err(convert_ingest_error)?;
+
+        let database_name =
+            derive_database_name_for_status(&ingest_response, database_name_override);
+
+        let status_params = IndexStatusParams {
+            root: Some(ingest_response.root.clone()),
+            database_name,
+            history_limit,
+        };
+
+        let status_response = get_index_status(status_params)
+            .await
+            .map_err(convert_index_status_error)?;
+
+        build_ingest_with_status_result(ingest_response, status_response)
     }
 
     #[tool(
@@ -858,6 +926,30 @@ fn build_ingest_result(response: IngestResponse) -> Result<CallToolResult, McpEr
     let summary = summarize_ingest(&response);
     let value = compact::ingest(response).map_err(|error| {
         McpError::internal_error(format!("Failed to compact ingest result: {error}"), None)
+    })?;
+
+    Ok(CallToolResult {
+        content: vec![Content::text(summary)],
+        structured_content: Some(value),
+        is_error: Some(false),
+        meta: None,
+    })
+}
+
+fn build_ingest_with_status_result(
+    ingest: IngestResponse,
+    status: IndexStatusResponse,
+) -> Result<CallToolResult, McpError> {
+    let summary = format!(
+        "{} {}",
+        summarize_ingest(&ingest),
+        summarize_index_status(&status)
+    );
+    let value = compact::ingest_with_status(ingest, status).map_err(|error| {
+        McpError::internal_error(
+            format!("Failed to compact ingest+status result: {error}"),
+            None,
+        )
     })?;
 
     Ok(CallToolResult {
@@ -1627,6 +1719,13 @@ mod compact {
         serde_json::to_value(CompactIngestResponse::from(response))
     }
 
+    pub(super) fn ingest_with_status(
+        ingest: IngestResponse,
+        status: IndexStatusResponse,
+    ) -> serde_json::Result<Value> {
+        serde_json::to_value(CompactIngestWithStatusResponse::new(ingest, status))
+    }
+
     pub(super) fn index_status(response: IndexStatusResponse) -> serde_json::Result<Value> {
         serde_json::to_value(CompactIndexStatusResponse::from(response))
     }
@@ -1722,6 +1821,23 @@ mod compact {
                 del: response.deleted_paths,
                 ev: response.evicted.map(CompactEviction::from),
                 rf: response.reused_file_count,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CompactIngestWithStatusResponse {
+        t: &'static str,
+        ing: CompactIngestResponse,
+        st: CompactIndexStatusResponse,
+    }
+
+    impl CompactIngestWithStatusResponse {
+        fn new(ingest: IngestResponse, status: IndexStatusResponse) -> Self {
+            Self {
+                t: "refresh",
+                ing: CompactIngestResponse::from(ingest),
+                st: CompactIndexStatusResponse::from(status),
             }
         }
     }
@@ -2678,6 +2794,28 @@ mod tests {
     };
     use serde_json::json;
 
+    fn ingest_response_with_paths(root: &str, database_path: &str) -> IngestResponse {
+        IngestResponse {
+            root: root.into(),
+            database_path: database_path.into(),
+            database_size_bytes: 0,
+            ingested_file_count: 0,
+            skipped: Vec::new(),
+            deleted_paths: Vec::new(),
+            duration_ms: 0,
+            embedded_chunk_count: 0,
+            embedding_model: None,
+            embedding_backend: None,
+            embedding_dimension: None,
+            embedding_latency_ms: None,
+            embedding_quantized: None,
+            graph_node_count: 0,
+            graph_edge_count: 0,
+            evicted: None,
+            reused_file_count: None,
+        }
+    }
+
     fn sample_match(path: &str, chunk_index: i32) -> SemanticSearchMatch {
         SemanticSearchMatch {
             path: path.to_string(),
@@ -2941,6 +3079,107 @@ mod tests {
         assert!(summary.contains("Size 10.0 MiB."));
         assert!(summary.contains("Index is stale (stored aaaaaaa vs. workspace bbbbbbb)."));
         assert!(summary.contains("Embedding models: model-A, model-B."));
+    }
+
+    #[test]
+    fn build_ingest_with_status_result_compacts_payload() {
+        let ingest_response = IngestResponse {
+            root: "/workspace".into(),
+            database_path: "/workspace/.mcp-index.sqlite".into(),
+            database_size_bytes: 2_048,
+            ingested_file_count: 5,
+            skipped: Vec::new(),
+            deleted_paths: Vec::new(),
+            duration_ms: 2_000,
+            embedded_chunk_count: 128,
+            embedding_model: None,
+            embedding_backend: None,
+            embedding_dimension: None,
+            embedding_latency_ms: None,
+            embedding_quantized: None,
+            graph_node_count: 1,
+            graph_edge_count: 2,
+            evicted: None,
+            reused_file_count: None,
+        };
+
+        let latest = IndexStatusIngestion {
+            id: "ingest-2".into(),
+            root: "/workspace".into(),
+            started_at: 10,
+            finished_at: 20,
+            duration_ms: 1_000,
+            file_count: 5,
+            skipped_count: 0,
+            deleted_count: 0,
+        };
+
+        let status_response = IndexStatusResponse {
+            database_path: "/workspace/.mcp-index.sqlite".into(),
+            database_exists: true,
+            database_size_bytes: Some(2_048),
+            total_files: 5,
+            total_chunks: 128,
+            embedding_models: vec!["model-A".into()],
+            total_graph_nodes: 1,
+            total_graph_edges: 2,
+            latest_ingestion: Some(latest.clone()),
+            recent_ingestions: vec![latest],
+            commit_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            indexed_at: Some(20),
+            current_commit_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            is_stale: false,
+        };
+
+        let result = build_ingest_with_status_result(ingest_response, status_response)
+            .expect("combined result");
+
+        let summary_text = result
+            .content
+            .first()
+            .and_then(|content| content.raw.as_text())
+            .map(|text| text.text.clone())
+            .unwrap_or_else(|| panic!("expected text content, found {:?}", result.content.first()));
+        assert!(summary_text.contains("Indexed 5 file(s)"));
+        assert!(summary_text.contains("Database /workspace/.mcp-index.sqlite tracks 5 file(s)"));
+
+        let structured = result
+            .structured_content
+            .expect("structured content available");
+        let object = structured.as_object().expect("object payload");
+        assert_eq!(
+            object.get("t").and_then(|value| value.as_str()),
+            Some("refresh")
+        );
+        assert!(object.contains_key("ing"));
+        assert!(object.contains_key("st"));
+    }
+
+    #[test]
+    fn derive_database_name_respects_override_with_directories() {
+        let ingest = ingest_response_with_paths("/workspace", "/workspace/indexes/custom.sqlite");
+
+        let result = derive_database_name_for_status(&ingest, Some("indexes/custom.sqlite".into()));
+
+        assert_eq!(result.as_deref(), Some("indexes/custom.sqlite"));
+    }
+
+    #[test]
+    fn derive_database_name_uses_relative_path_when_override_missing() {
+        let ingest = ingest_response_with_paths("/workspace", "/workspace/indexes/custom.sqlite");
+
+        let result = derive_database_name_for_status(&ingest, None);
+
+        assert_eq!(result.as_deref(), Some("indexes/custom.sqlite"));
+    }
+
+    #[test]
+    fn derive_database_name_falls_back_to_file_name_outside_root() {
+        let ingest = ingest_response_with_paths("/workspace", "/tmp/index.sqlite");
+
+        let result = derive_database_name_for_status(&ingest, None);
+
+        assert_eq!(result.as_deref(), Some("index.sqlite"));
     }
 
     #[test]
