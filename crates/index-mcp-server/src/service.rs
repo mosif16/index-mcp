@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use crate::bundle::{
     context_bundle, BundleDefinition, BundleDiagnostics, BundleEdgeNeighbor, BundleFileMetadata,
@@ -330,7 +331,7 @@ impl EnvironmentState {
     }
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct CodeLookupParams {
     #[serde(default)]
@@ -384,7 +385,7 @@ struct IngestWithStatusParams {
     history_limit: Option<u32>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct SemanticSearchRequest {
     #[serde(default)]
@@ -412,6 +413,257 @@ struct SemanticSearchRequest {
     max_context_after: Option<u32>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SearchInclude {
+    #[serde(default = "default_true")]
+    bundle: bool,
+    #[serde(default = "default_true")]
+    lookup: bool,
+}
+
+impl Default for SearchInclude {
+    fn default() -> Self {
+        Self {
+            bundle: true,
+            lookup: true,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct SharedBudgetSpec {
+    #[serde(default)]
+    total_tokens: Option<u32>,
+    #[serde(default)]
+    search_tokens: Option<u32>,
+    #[serde(default)]
+    bundle_tokens: Option<u32>,
+    #[serde(default)]
+    lookup_tokens: Option<u32>,
+    #[serde(default)]
+    deadline_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+struct UnifiedSemanticSearchRequest {
+    #[serde(flatten)]
+    search: SemanticSearchRequest,
+    #[serde(default)]
+    include: SearchInclude,
+    #[serde(default)]
+    bundle: Option<ContextBundleParams>,
+    #[serde(default)]
+    lookup: Option<CodeLookupParams>,
+    #[serde(default)]
+    shared_budget: Option<SharedBudgetSpec>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SharedBudget {
+    total_tokens: Option<u32>,
+    bundle_tokens: Option<u32>,
+    lookup_tokens: Option<u32>,
+}
+
+impl SharedBudget {
+    fn from_spec(spec: Option<SharedBudgetSpec>) -> Self {
+        if let Some(spec) = spec {
+            Self {
+                total_tokens: spec.total_tokens,
+                bundle_tokens: spec.bundle_tokens,
+                lookup_tokens: spec.lookup_tokens,
+            }
+        } else {
+            Self::default()
+        }
+    }
+
+    fn bundle_budget_hint(&self, snapshot: &EnvironmentSnapshot) -> Option<u32> {
+        let mut budget = snapshot.bundle_budget().min(u32::MAX as usize) as u32;
+        if let Some(limit) = self.total_tokens {
+            budget = budget.min(limit);
+        }
+        if let Some(limit) = self.bundle_tokens {
+            budget = budget.min(limit);
+        }
+        Some(budget.max(MIN_BUNDLE_BUDGET as u32))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OrchestrationPlan {
+    search: SemanticSearchRequest,
+    include_bundle: bool,
+    include_lookup: bool,
+    bundle_override: Option<ContextBundleParams>,
+    lookup_override: Option<CodeLookupParams>,
+    shared_budget: SharedBudget,
+}
+
+impl OrchestrationPlan {
+    fn should_run_bundle(&self) -> bool {
+        self.include_bundle || self.bundle_override.is_some()
+    }
+
+    fn should_run_lookup(&self) -> bool {
+        self.include_lookup || self.lookup_override.is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachmentOutcome {
+    NotRequested,
+    Success,
+    Skipped,
+    Failed,
+}
+
+impl Default for AttachmentOutcome {
+    fn default() -> Self {
+        Self::NotRequested
+    }
+}
+
+impl AttachmentOutcome {
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not_requested",
+            Self::Success => "success",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn is_failure(self) -> bool {
+        matches!(self, Self::Failed)
+    }
+}
+
+impl From<&AttachmentResult> for AttachmentOutcome {
+    fn from(result: &AttachmentResult) -> Self {
+        match result {
+            AttachmentResult::Success { .. } => Self::Success,
+            AttachmentResult::Skipped { .. } => Self::Skipped,
+            AttachmentResult::Failed { .. } => Self::Failed,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SearchAttachmentAccumulator {
+    bundle_value: Option<Value>,
+    bundle_meta: Option<Meta>,
+    bundle_summary: Option<String>,
+    lookup_value: Option<Value>,
+    lookup_meta: Option<Meta>,
+    lookup_summary: Option<String>,
+    warnings: Vec<String>,
+    bundle_outcome: AttachmentOutcome,
+    lookup_outcome: AttachmentOutcome,
+}
+
+impl SearchAttachmentAccumulator {
+    fn push_warning(&mut self, message: String) {
+        self.warnings.push(message);
+    }
+
+    fn bundle(&mut self, result: AttachmentResult) {
+        self.bundle_outcome = AttachmentOutcome::from(&result);
+        match result {
+            AttachmentResult::Success {
+                structured,
+                meta,
+                summary,
+            } => {
+                self.bundle_value = Some(structured);
+                self.bundle_meta = meta;
+                self.bundle_summary = Some(summary);
+            }
+            AttachmentResult::Skipped { warning } => self.push_warning(warning),
+            AttachmentResult::Failed { warning } => self.push_warning(warning),
+        }
+    }
+
+    fn lookup(&mut self, result: AttachmentResult) {
+        self.lookup_outcome = AttachmentOutcome::from(&result);
+        match result {
+            AttachmentResult::Success {
+                structured,
+                meta,
+                summary,
+            } => {
+                self.lookup_value = Some(structured);
+                self.lookup_meta = meta;
+                self.lookup_summary = Some(summary);
+            }
+            AttachmentResult::Skipped { warning } => self.push_warning(warning),
+            AttachmentResult::Failed { warning } => self.push_warning(warning),
+        }
+    }
+
+    fn attachments_value(&self) -> Option<Value> {
+        if self.bundle_value.is_none() && self.lookup_value.is_none() {
+            return None;
+        }
+        let mut map = serde_json::Map::new();
+        if let Some(bundle) = self.bundle_value.clone() {
+            map.insert("bundle".to_string(), bundle);
+        }
+        if let Some(code) = self.lookup_value.clone() {
+            map.insert("code".to_string(), code);
+        }
+        Some(Value::Object(map))
+    }
+
+    fn attachments_meta(&self) -> Option<Value> {
+        if self.bundle_meta.is_none() && self.lookup_meta.is_none() {
+            return None;
+        }
+        let mut map = serde_json::Map::new();
+        if let Some(meta) = self.bundle_meta.clone() {
+            if let Ok(value) = serde_json::to_value(meta) {
+                if !value.is_null() {
+                    map.insert("bundle".to_string(), value);
+                }
+            }
+        }
+        if let Some(meta) = self.lookup_meta.clone() {
+            if let Ok(value) = serde_json::to_value(meta) {
+                if !value.is_null() {
+                    map.insert("code".to_string(), value);
+                }
+            }
+        }
+        if map.is_empty() {
+            None
+        } else {
+            Some(Value::Object(map))
+        }
+    }
+}
+
+enum AttachmentResult {
+    Success {
+        structured: Value,
+        meta: Option<Meta>,
+        summary: String,
+    },
+    Skipped {
+        warning: String,
+    },
+    Failed {
+        warning: String,
+    },
+}
+
 /// Textual instructions shared with MCP clients.
 const SERVER_INSTRUCTIONS_TEMPLATE: &str = r#"Rust rewrite is production-ready. Treat this server as the workspace source of truth and follow this proactive workflow:
 1. Prime the index at session start with index_refresh {"root": "{ABSOLUTE_ROOT}"} (combines ingest_codebase + index_status in one response) or --watch. Honor .gitignore, skip files larger than 8 MiB, and tune autoEvict/maxDatabaseSizeBytes before the SQLite file balloons. Always pass the absolute workspace root; relative paths often target the wrong codebase. If you override databaseName, supply a filename (for example ".mcp-index.sqlite"); directory-style values like "." cause SQLite to reject the request.
@@ -421,15 +673,16 @@ const SERVER_INSTRUCTIONS_TEMPLATE: &str = r#"Rust rewrite is production-ready. 
 5. Shape bundles to your window: supply budgetTokens (or INDEX_MCP_BUDGET_TOKENS), trim snippet limits, and only escalate to context_bundle when you truly need neighboring lines. semantic_search already highlights the focus span, so avoid whole-file dumps unless explicitly required.
 6. Add detail iteratively: chain additional semantic_search or narrowly scoped context_bundle calls instead of broad re-ingests. If dedupe hides something important, request a different chunk index or clear recent_hits rather than re-requesting the entire file.
 7. After modifying files, re-run index_refresh (or ingest_codebase followed by index_status) or rely on watch mode so the next task sees the updated payload.
-Responses now return compact structured_content: summaries stay in the text content, while JSON payloads use short keys (for example t:"sem"/"ctx", defs/sn for bundles, r for results). Prefer the structured data for programmatic handling and avoid relying on legacy CamelCase fields.
+Responses now return compact structured_content: summaries stay in the text content, while JSON payloads use short keys (for example t:"sem"/"ctx", defs/sn for bundles, r for results). Prefer the structured data for programmatic handling and avoid relying on legacy CamelCase fields. Unified semantic_search calls default to returning bundle and code attachments under structured_content.att with any issues surfaced in warn; set include.bundle/include.lookup to false when you need slimmer responses.
 
-Available tools: index_refresh, code_lookup (search/bundle), semantic_search, context_bundle, repository_timeline, repository_timeline_entry, indexing_guidance, indexing_guidance_tool, info."#;
+Available tools: index_refresh, semantic_search, repository_timeline, repository_timeline_entry, indexing_guidance, indexing_guidance_tool, info."#;
 const INDEXING_GUIDANCE_PROMPT_TEMPLATE: &str = r#"Workflow reminder:
 1. Prime the index after a checkout, pull, or edit by running index_refresh {"root": "{ABSOLUTE_ROOT}"} (combines ingest_codebase + index_status in one response) or enabling watch mode; respect .gitignore, skip files >8 MiB, and configure autoEvict/maxDatabaseSizeBytes when needed. Always provide the absolute workspace root to avoid indexing the wrong project. If you override databaseName, make it a filename (for example ".mcp-index.sqlite"); directory-like values will fail to open.
 2. If you skip index_refresh (or only need a quick status check), call index_status before reasoning. If it reports staleness or a HEAD mismatch, ingest before continuing.
 3. Start with semantic_search or code_lookup query mode to pinpoint targets, then request precise snippets with code_lookup ranges or file+symbol. Bundle mode needs a file (or query that resolves to one), and symbol must be supplied as an object such as {"name": "perform_ingest"}. Set summaryMode and snippet limits to keep responses focused, escalating to context_bundle only when you need neighboring lines.
 4. repository_timeline and repository_timeline_entry before planning or applying changes.
-5. Keep answers tight: set INDEX_MCP_BUDGET_TOKENS or pass budgetTokens, trim maxSnippets/maxNeighbors, and prefer info/indexing_guidance_tool for diagnostics."#;
+5. Keep answers tight: set INDEX_MCP_BUDGET_TOKENS or pass budgetTokens, trim maxSnippets/maxNeighbors, and prefer info/indexing_guidance_tool for diagnostics.
+6. semantic_search now defaults to returning bundle and code attachments; disable include.bundle/include.lookup when you prefer lean responses."#;
 
 fn derive_database_name_for_status(
     ingest: &IngestResponse,
@@ -602,11 +855,16 @@ impl IndexMcpService {
     )]
     async fn semantic_search_tool(
         &self,
-        Parameters(mut params): Parameters<SemanticSearchRequest>,
+        Parameters(mut request): Parameters<UnifiedSemanticSearchRequest>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         self.environment.update_from_meta(&ctx.meta);
-        self.environment.apply_semantic_defaults(&mut params);
+        self.environment
+            .apply_semantic_defaults(&mut request.search);
+
+        let plan = self.plan_orchestration(request);
+        let handler_start = Instant::now();
+
         let snapshot = self.environment.snapshot();
         let recent_hits_param: Vec<SearchResultCoordinate> = snapshot
             .recent_hits
@@ -616,20 +874,20 @@ impl IndexMcpService {
                 chunk_index: hit.chunk_index,
             })
             .collect();
-        let filter_summary = build_search_filter_summary(&params);
+        let filter_summary = build_search_filter_summary(&plan.search);
         let search_params = SemanticSearchParams {
-            root: params.root.clone(),
-            query: params.query.clone(),
-            database_name: params.database_name.clone(),
-            limit: params.limit,
-            model: params.model.clone(),
-            language: params.language.clone(),
-            path_prefix: params.path_prefix.clone(),
-            path_contains: params.path_contains.clone(),
-            classification: params.classification.clone(),
-            summary_mode: params.summary_mode,
-            max_context_before: params.max_context_before,
-            max_context_after: params.max_context_after,
+            root: plan.search.root.clone(),
+            query: plan.search.query.clone(),
+            database_name: plan.search.database_name.clone(),
+            limit: plan.search.limit,
+            model: plan.search.model.clone(),
+            language: plan.search.language.clone(),
+            path_prefix: plan.search.path_prefix.clone(),
+            path_contains: plan.search.path_contains.clone(),
+            classification: plan.search.classification.clone(),
+            summary_mode: plan.search.summary_mode,
+            max_context_before: plan.search.max_context_before,
+            max_context_after: plan.search.max_context_after,
             recent_hits: if recent_hits_param.is_empty() {
                 None
             } else {
@@ -637,9 +895,23 @@ impl IndexMcpService {
             },
         };
 
-        let mut response = semantic_search(search_params)
-            .await
-            .map_err(convert_semantic_search_error)?;
+        let mut response = match semantic_search(search_params).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                let elapsed_ms = handler_start.elapsed().as_secs_f64() * 1000.0;
+                metrics::counter!(
+                    "semantic_search_requests_total",
+                    "status" => "error"
+                )
+                .increment(1);
+                metrics::histogram!(
+                    "semantic_search_handler_latency_ms",
+                    "status" => "error"
+                )
+                .record(elapsed_ms);
+                return Err(convert_semantic_search_error(err));
+            }
+        };
 
         let (deduplicated, duplicates_filtered) = self
             .environment
@@ -649,10 +921,100 @@ impl IndexMcpService {
         let snapshot = self.environment.snapshot();
         response.suggested_tools = build_search_suggestions(&snapshot, &response);
 
-        let meta =
+        let mut attachments = SearchAttachmentAccumulator::default();
+
+        if plan.should_run_bundle() {
+            let bundle_result = self.execute_bundle_attachment(&plan, &response).await;
+            attachments.bundle(bundle_result);
+        }
+
+        if plan.should_run_lookup() {
+            let lookup_result = self.execute_lookup_attachment(&plan, &response).await;
+            attachments.lookup(lookup_result);
+        }
+
+        let mut meta =
             self.environment
                 .build_search_meta(&response, duplicates_filtered, filter_summary);
-        build_semantic_search_result(response, meta)
+        if let Some(meta_value) = attachments.attachments_meta() {
+            meta.insert("attachments".to_string(), meta_value);
+        }
+
+        let summary_lines = attachments
+            .bundle_summary
+            .iter()
+            .chain(attachments.lookup_summary.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let warnings_count = attachments.warnings.len();
+        let bundle_outcome = attachments.bundle_outcome;
+        let lookup_outcome = attachments.lookup_outcome;
+        let estimated_tokens = estimate_token_cost(&response.results) as f64;
+        let handler_elapsed_ms = handler_start.elapsed().as_secs_f64() * 1000.0;
+
+        metrics::counter!(
+            "semantic_search_requests_total",
+            "status" => "success"
+        )
+        .increment(1);
+        metrics::histogram!(
+            "semantic_search_handler_latency_ms",
+            "status" => "success"
+        )
+        .record(handler_elapsed_ms);
+        metrics::histogram!("semantic_search_estimated_token_cost").record(estimated_tokens);
+        metrics::counter!(
+            "semantic_search_attachment_outcome_total",
+            "attachment" => "bundle",
+            "outcome" => bundle_outcome.as_label()
+        )
+        .increment(1);
+        metrics::counter!(
+            "semantic_search_attachment_outcome_total",
+            "attachment" => "lookup",
+            "outcome" => lookup_outcome.as_label()
+        )
+        .increment(1);
+        if bundle_outcome.is_failure() {
+            metrics::counter!(
+                "semantic_search_attachment_fallback_total",
+                "attachment" => "bundle"
+            )
+            .increment(1);
+        }
+        if lookup_outcome.is_failure() {
+            metrics::counter!(
+                "semantic_search_attachment_fallback_total",
+                "attachment" => "lookup"
+            )
+            .increment(1);
+        }
+        if warnings_count > 0 {
+            metrics::counter!("semantic_search_attachment_warnings_total")
+                .increment(warnings_count as u64);
+        }
+        if duplicates_filtered > 0 {
+            metrics::counter!("semantic_search_duplicates_filtered_total")
+                .increment(duplicates_filtered as u64);
+        }
+        if let Some(diagnostics) = response.diagnostics.as_ref() {
+            metrics::histogram!("semantic_search_backend_latency_ms")
+                .record(diagnostics.total_latency_ms as f64);
+            if let Some(embedding_latency) = diagnostics.embedding_latency_ms {
+                metrics::histogram!("semantic_search_embedding_latency_ms")
+                    .record(embedding_latency as f64);
+            }
+            if let Some(lexical_latency) = diagnostics.lexical_latency_ms {
+                metrics::histogram!("semantic_search_lexical_latency_ms")
+                    .record(lexical_latency as f64);
+            }
+        }
+
+        let attachments_value = attachments.attachments_value();
+        let warnings = attachments.warnings;
+
+        build_semantic_search_result(response, meta, attachments_value, warnings, summary_lines)
     }
 
     #[tool(
@@ -688,10 +1050,10 @@ impl IndexMcpService {
     ) -> Result<CallToolResult, McpError> {
         self.environment.update_from_meta(&ctx.meta);
         self.environment.apply_code_lookup_defaults(&mut params);
+        let resolved_mode = resolve_lookup_mode(&params);
         let CodeLookupParams {
             root,
             database_name,
-            mode,
             query,
             file,
             symbol,
@@ -709,17 +1071,8 @@ impl IndexMcpService {
             summary_mode,
             max_context_before,
             max_context_after,
+            ..
         } = params;
-
-        let resolved_mode = mode.unwrap_or_else(|| {
-            if query.as_ref().is_some_and(|value| !value.trim().is_empty()) {
-                "search".to_string()
-            } else if file.as_ref().is_some_and(|value| !value.trim().is_empty()) {
-                "bundle".to_string()
-            } else {
-                "search".to_string()
-            }
-        });
 
         match resolved_mode.as_str() {
             "search" => {
@@ -814,6 +1167,229 @@ impl IndexMcpService {
         }
     }
 
+    fn plan_orchestration(&self, request: UnifiedSemanticSearchRequest) -> OrchestrationPlan {
+        OrchestrationPlan {
+            search: request.search,
+            include_bundle: request.include.bundle || request.bundle.is_some(),
+            include_lookup: request.include.lookup || request.lookup.is_some(),
+            bundle_override: request.bundle,
+            lookup_override: request.lookup,
+            shared_budget: SharedBudget::from_spec(request.shared_budget),
+        }
+    }
+
+    async fn execute_bundle_attachment(
+        &self,
+        plan: &OrchestrationPlan,
+        search_response: &SemanticSearchResponse,
+    ) -> AttachmentResult {
+        let environment = self.environment.clone();
+        let mut params = match plan.bundle_override.clone() {
+            Some(mut params) => {
+                environment.apply_bundle_defaults(&mut params);
+                params
+            }
+            None => match derive_bundle_params_from_search(plan, search_response) {
+                Ok(mut params) => {
+                    environment.apply_bundle_defaults(&mut params);
+                    params
+                }
+                Err(warning) => return AttachmentResult::Skipped { warning },
+            },
+        };
+
+        let snapshot = environment.snapshot();
+        if let Some(budget) = plan.shared_budget.bundle_budget_hint(&snapshot) {
+            params.budget_tokens = Some(budget);
+        }
+
+        let response = match context_bundle(params.clone()).await {
+            Ok(response) => response,
+            Err(error) => {
+                return AttachmentResult::Failed {
+                    warning: format!("bundle attachment failed: {error}"),
+                }
+            }
+        };
+
+        let meta = environment.build_bundle_meta(&response.usage, response.usage.cache_hit);
+        let attachment = match build_context_bundle_result(response.clone(), Some(meta.clone())) {
+            Ok(result) => result,
+            Err(error) => {
+                return AttachmentResult::Failed {
+                    warning: format!("bundle attachment failed to build result: {error}"),
+                }
+            }
+        };
+
+        let summary_line = format!("bundle attachment produced context for {}", params.file);
+
+        AttachmentResult::Success {
+            structured: attachment.structured_content.unwrap_or(Value::Null),
+            meta: attachment.meta,
+            summary: summary_line,
+        }
+    }
+
+    async fn execute_lookup_attachment(
+        &self,
+        plan: &OrchestrationPlan,
+        search_response: &SemanticSearchResponse,
+    ) -> AttachmentResult {
+        let environment = self.environment.clone();
+        let mut params = plan
+            .lookup_override
+            .clone()
+            .unwrap_or_else(|| CodeLookupParams {
+                root: plan.search.root.clone(),
+                database_name: plan.search.database_name.clone(),
+                mode: Some("search".to_string()),
+                query: Some(plan.search.query.clone()),
+                file: None,
+                symbol: None,
+                ranges: None,
+                focus_line: None,
+                max_snippets: None,
+                max_neighbors: None,
+                budget_tokens: plan.shared_budget.lookup_tokens,
+                limit: plan.search.limit,
+                model: plan.search.model.clone(),
+                language: plan.search.language.clone(),
+                path_prefix: plan.search.path_prefix.clone(),
+                path_contains: plan.search.path_contains.clone(),
+                classification: plan.search.classification.clone(),
+                summary_mode: plan.search.summary_mode,
+                max_context_before: plan.search.max_context_before,
+                max_context_after: plan.search.max_context_after,
+            });
+
+        environment.apply_code_lookup_defaults(&mut params);
+        let resolved_mode = resolve_lookup_mode(&params);
+
+        match resolved_mode.as_str() {
+            "search" => {
+                if params
+                    .query
+                    .as_ref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    return AttachmentResult::Skipped {
+                        warning: "lookup attachment skipped: query required for search mode"
+                            .to_string(),
+                    };
+                }
+
+                let filter_summary = build_lookup_filter_summary(
+                    &params.language,
+                    &params.path_prefix,
+                    &params.path_contains,
+                    &params.classification,
+                );
+
+                let meta = environment.build_search_meta(search_response, 0, filter_summary);
+
+                let search_clone = search_response.clone();
+                let attachment = match build_code_lookup_result(
+                    resolved_mode.clone(),
+                    search_clone,
+                    Some(meta.clone()),
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return AttachmentResult::Failed {
+                            warning: format!("lookup attachment failed: {error}"),
+                        }
+                    }
+                };
+
+                let summary_line = format!(
+                    "lookup attachment (search mode) reused {} semantic result(s).",
+                    search_response.results.len()
+                );
+
+                AttachmentResult::Success {
+                    structured: attachment.structured_content.unwrap_or(Value::Null),
+                    meta: attachment.meta,
+                    summary: summary_line,
+                }
+            }
+            "bundle" => {
+                let file = if let Some(file) = params.file.clone() {
+                    file
+                } else if let Some(query_file) = params.query.clone() {
+                    query_file
+                } else {
+                    return AttachmentResult::Skipped {
+                        warning: "lookup attachment skipped: bundle mode requires a file path"
+                            .to_string(),
+                    };
+                };
+
+                let mut bundle_params = ContextBundleParams {
+                    root: params.root.clone(),
+                    database_name: params.database_name.clone(),
+                    file,
+                    symbol: params.symbol.clone(),
+                    max_snippets: params.max_snippets.or(params.limit),
+                    max_neighbors: params.max_neighbors,
+                    budget_tokens: params.budget_tokens,
+                    ranges: params.ranges.clone(),
+                    focus_line: params.focus_line,
+                    query: None,
+                };
+
+                environment.apply_bundle_defaults(&mut bundle_params);
+                if bundle_params.budget_tokens.is_none() {
+                    let snapshot = environment.snapshot();
+                    if let Some(budget) = plan.shared_budget.bundle_budget_hint(&snapshot) {
+                        bundle_params.budget_tokens = Some(budget);
+                    }
+                }
+
+                let response = match context_bundle(bundle_params.clone()).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return AttachmentResult::Failed {
+                            warning: format!("lookup bundle attachment failed: {error}"),
+                        }
+                    }
+                };
+
+                let meta = environment.build_bundle_meta(&response.usage, response.usage.cache_hit);
+
+                let attachment = match build_code_lookup_bundle_response(
+                    resolved_mode.clone(),
+                    response.clone(),
+                    Some(meta.clone()),
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return AttachmentResult::Failed {
+                            warning: format!(
+                                "lookup bundle attachment failed to build result: {error}"
+                            ),
+                        }
+                    }
+                };
+
+                let summary_line = format!(
+                    "lookup attachment (bundle mode) produced context for {}",
+                    bundle_params.file
+                );
+
+                AttachmentResult::Success {
+                    structured: attachment.structured_content.unwrap_or(Value::Null),
+                    meta: attachment.meta,
+                    summary: summary_line,
+                }
+            }
+            _ => AttachmentResult::Skipped {
+                warning: format!(
+                    "lookup attachment skipped: mode '{resolved_mode}' is not supported."
+                ),
+            },
+        }
+    }
     #[tool(
         name = "index_status",
         description = "Summarize SQLite index freshness and coverage."
@@ -1113,15 +1689,42 @@ fn convert_semantic_search_error(error: SemanticSearchError) -> McpError {
 
 fn build_semantic_search_result(
     response: SemanticSearchResponse,
-    meta: Meta,
+    mut meta: Meta,
+    attachments: Option<Value>,
+    warnings: Vec<String>,
+    attachment_summaries: Vec<String>,
 ) -> Result<CallToolResult, McpError> {
-    let summary = summarize_semantic_search(&response);
-    let value = compact::semantic_search(response).map_err(|error| {
+    let mut summary_lines = vec![summarize_semantic_search(&response)];
+    summary_lines.extend(attachment_summaries);
+    if !warnings.is_empty() {
+        summary_lines.push(format!("Warnings: {}", warnings.join("; ")));
+    }
+    let summary = summary_lines.join("\n");
+
+    let mut value = compact::semantic_search(response).map_err(|error| {
         McpError::internal_error(
             format!("Failed to compact semantic search result: {error}"),
             None,
         )
     })?;
+
+    if let Value::Object(ref mut map) = value {
+        if let Some(attachments) = attachments {
+            map.insert("att".to_string(), attachments);
+        }
+        if !warnings.is_empty() {
+            map.insert(
+                "warn".to_string(),
+                Value::Array(warnings.into_iter().map(Value::String).collect()),
+            );
+        }
+    }
+
+    if let Some(Value::Object(att_meta)) = meta.get("attachments") {
+        if att_meta.is_empty() {
+            meta.remove("attachments");
+        }
+    }
 
     Ok(CallToolResult {
         content: vec![Content::text(summary)],
@@ -1708,6 +2311,72 @@ fn build_repository_timeline_entry_result(
         is_error: Some(false),
         meta: None,
     })
+}
+
+fn derive_bundle_params_from_search(
+    plan: &OrchestrationPlan,
+    search_response: &SemanticSearchResponse,
+) -> Result<ContextBundleParams, String> {
+    let top = search_response.results.first().ok_or_else(|| {
+        "bundle attachment skipped: semantic search returned no results".to_string()
+    })?;
+
+    let focus_line = top
+        .line_start
+        .and_then(|line| if line > 0 { Some(line as u32) } else { None });
+
+    let range = match (top.line_start, top.line_end) {
+        (Some(start), Some(end)) if start >= 0 && end >= 0 => {
+            let start = start as u32;
+            let end = end as u32;
+            if start <= end {
+                Some(LineRange {
+                    start_line: start,
+                    end_line: end,
+                })
+            } else {
+                Some(LineRange {
+                    start_line: end,
+                    end_line: start,
+                })
+            }
+        }
+        _ => None,
+    };
+
+    Ok(ContextBundleParams {
+        root: plan.search.root.clone(),
+        database_name: plan.search.database_name.clone(),
+        file: top.path.clone(),
+        symbol: None,
+        max_snippets: None,
+        max_neighbors: Some(6),
+        budget_tokens: plan.shared_budget.bundle_tokens,
+        ranges: range.map(|r| vec![r]),
+        focus_line,
+        query: None,
+    })
+}
+
+fn resolve_lookup_mode(params: &CodeLookupParams) -> String {
+    if let Some(mode) = &params.mode {
+        return mode.clone();
+    }
+    if params
+        .query
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        "search".to_string()
+    } else if params
+        .file
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        "bundle".to_string()
+    } else {
+        "search".to_string()
+    }
 }
 
 mod compact {
@@ -3294,12 +3963,217 @@ mod tests {
     fn semantic_search_structured_content_is_compact() {
         let response = sample_semantic_response();
         let meta = Meta::new();
-        let result = build_semantic_search_result(response, meta).expect("result");
+        let result = build_semantic_search_result(response, meta, None, Vec::new(), Vec::new())
+            .expect("result");
         let structured = result.structured_content.expect("structured content");
         let object = structured.as_object().expect("object");
         assert_eq!(object.get("t"), Some(&json!("sem")));
         assert!(object.contains_key("r"));
         assert!(!object.contains_key("results"));
+    }
+
+    #[test]
+    fn semantic_search_result_includes_attachments_and_warnings() {
+        let response = sample_semantic_response();
+        let mut meta = Meta::new();
+        meta.insert(
+            "attachments".to_string(),
+            json!({ "bundle": { "meta": true } }),
+        );
+
+        let mut attachments_map = serde_json::Map::new();
+        attachments_map.insert("bundle".to_string(), json!({ "t": "ctx" }));
+
+        let warnings = vec!["bundle truncated".to_string()];
+        let summary_line = "bundle summary".to_string();
+
+        let result = build_semantic_search_result(
+            response,
+            meta,
+            Some(Value::Object(attachments_map)),
+            warnings,
+            vec![summary_line.clone()],
+        )
+        .expect("result");
+
+        let summary_text = result
+            .content
+            .first()
+            .and_then(|entry| entry.raw.as_text())
+            .map(|text| text.text.clone())
+            .expect("text summary");
+        assert!(summary_text.contains(&summary_line));
+        assert!(summary_text.contains("bundle truncated"));
+
+        let structured = result
+            .structured_content
+            .expect("structured content available");
+        let object = structured.as_object().expect("object payload");
+        let attachments = object
+            .get("att")
+            .and_then(|value| value.as_object())
+            .expect("attachments object");
+        assert!(attachments.contains_key("bundle"));
+
+        let warn = object
+            .get("warn")
+            .and_then(|value| value.as_array())
+            .expect("warnings array");
+        assert_eq!(
+            warn.first().and_then(|value| value.as_str()),
+            Some("bundle truncated")
+        );
+
+        let meta_map = result.meta.expect("meta present");
+        let attachments_meta = meta_map
+            .get("attachments")
+            .and_then(|value| value.as_object())
+            .expect("attachments meta object");
+        assert!(attachments_meta.contains_key("bundle"));
+    }
+
+    #[test]
+    fn attachments_meta_omitted_when_empty() {
+        let acc = SearchAttachmentAccumulator::default();
+        assert!(acc.attachments_meta().is_none());
+    }
+
+    #[test]
+    fn attachments_meta_serializes_successful_entries() {
+        let mut acc = SearchAttachmentAccumulator::default();
+        let mut bundle_meta = Meta::new();
+        bundle_meta.insert("detail".into(), json!("value"));
+        acc.bundle(AttachmentResult::Success {
+            structured: Value::Null,
+            meta: Some(bundle_meta),
+            summary: "bundle".into(),
+        });
+
+        let mut lookup_meta = Meta::new();
+        lookup_meta.insert("lookup".into(), json!(1));
+        acc.lookup(AttachmentResult::Success {
+            structured: Value::Null,
+            meta: Some(lookup_meta),
+            summary: "lookup".into(),
+        });
+
+        let attachments = acc.attachments_meta().expect("meta present");
+        let object = attachments.as_object().expect("meta object");
+        assert_eq!(
+            object
+                .get("bundle")
+                .and_then(|value| value.get("detail"))
+                .and_then(|value| value.as_str()),
+            Some("value")
+        );
+        assert_eq!(
+            object
+                .get("code")
+                .and_then(|value| value.get("lookup"))
+                .and_then(|value| value.as_i64()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn shared_budget_hint_respects_limits() {
+        let snapshot = EnvironmentSnapshot {
+            bundle_budget_override: Some(1_800),
+            remaining_context_tokens: Some(500),
+            ..Default::default()
+        };
+        let shared = SharedBudget {
+            total_tokens: Some(450),
+            bundle_tokens: Some(800),
+            lookup_tokens: None,
+        };
+        assert_eq!(
+            shared.bundle_budget_hint(&snapshot),
+            Some(MIN_BUNDLE_BUDGET as u32)
+        );
+    }
+
+    #[test]
+    fn shared_budget_hint_prefers_bundle_token_cap() {
+        let snapshot = EnvironmentSnapshot {
+            bundle_budget_override: Some(2_000),
+            remaining_context_tokens: None,
+            ..Default::default()
+        };
+        let shared = SharedBudget {
+            total_tokens: None,
+            bundle_tokens: Some(750),
+            lookup_tokens: None,
+        };
+        assert_eq!(shared.bundle_budget_hint(&snapshot), Some(750));
+    }
+
+    #[test]
+    fn derive_bundle_params_require_search_results() {
+        let plan = OrchestrationPlan {
+            search: SemanticSearchRequest {
+                root: Some("/workspace".into()),
+                query: "alpha".into(),
+                database_name: Some("db.sqlite".into()),
+                limit: None,
+                model: None,
+                language: None,
+                path_prefix: None,
+                path_contains: None,
+                classification: None,
+                summary_mode: None,
+                max_context_before: None,
+                max_context_after: None,
+            },
+            include_bundle: true,
+            include_lookup: false,
+            bundle_override: None,
+            lookup_override: None,
+            shared_budget: SharedBudget::default(),
+        };
+
+        let mut response = sample_semantic_response();
+        response.results.clear();
+
+        let err = derive_bundle_params_from_search(&plan, &response).unwrap_err();
+        assert!(err.contains("no results"));
+    }
+
+    #[test]
+    fn resolve_lookup_mode_defaults() {
+        let base = CodeLookupParams {
+            root: Some("/workspace".into()),
+            database_name: Some("db.sqlite".into()),
+            mode: None,
+            query: None,
+            file: None,
+            symbol: None,
+            ranges: None,
+            focus_line: None,
+            max_snippets: None,
+            max_neighbors: None,
+            budget_tokens: None,
+            limit: None,
+            model: None,
+            language: None,
+            path_prefix: None,
+            path_contains: None,
+            classification: None,
+            summary_mode: None,
+            max_context_before: None,
+            max_context_after: None,
+        };
+
+        assert_eq!(resolve_lookup_mode(&base), "search");
+
+        let mut file_mode = base.clone();
+        file_mode.file = Some("src/lib.rs".into());
+        assert_eq!(resolve_lookup_mode(&file_mode), "bundle");
+
+        let mut explicit = base.clone();
+        explicit.mode = Some("search".into());
+        explicit.query = Some("alpha".into());
+        assert_eq!(resolve_lookup_mode(&explicit), "search");
     }
 
     #[test]

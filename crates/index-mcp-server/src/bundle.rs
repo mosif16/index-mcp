@@ -98,7 +98,7 @@ impl BundleCache {
     }
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextBundleParams {
     #[serde(default)]

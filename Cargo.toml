@@ -46,3 +46,4 @@ candle-nn = { version = "0.9.1" }
 candle-transformers = { version = "0.9.1" }
 sentence-transformers-rs = { git = "https://github.com/jwnz/sentence-transformers-rs.git", rev = "2800040c8b14445cd33b34da3d477ae03ec00beb" }
 hnsw_rs = "0.3.2"
+metrics = "0.24.2"

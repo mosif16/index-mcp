@@ -9,6 +9,7 @@ This guide explains how to run the **index-mcp** Rust server with Codex CLI (or 
 - **Purpose:** Build and query a `.mcp-index.sqlite` database (plus optional `.ann` neighbours) that captures file metadata, embeddings, and git history so agents can answer questions without re-parsing the repo.
 - **Primary runtime:** `crates/index-mcp-server` – a Rust binary using the official [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) SDK.
 - **Helper script:** `start.sh` launches the Rust binary via `cargo run`, honouring `INDEX_MCP_ARGS` and `INDEX_MCP_CARGO_PROFILE` overrides.
+- **Design reference:** `docs/semantic_search_orchestration.md` documents the Step 3 orchestration plan for the Semantic Search Tool Consolidation initiative and should be consulted alongside the code when evolving the unified search path.
 - **Watch mode:** `cargo run -p index-mcp-server -- --watch` (or `INDEX_MCP_ARGS="--watch" ./start.sh`) keeps the SQLite index fresh after file edits.
 - **Remote MCP proxy:** Configure `INDEX_MCP_REMOTE_SERVERS` with JSON descriptors to mount additional MCP tools behind the Rust server.
 
@@ -67,7 +68,7 @@ The Rust binary registers the full tool surface that previously lived in the Nod
 | Tool / Prompt | Notes |
 |---------------|-------|
 | `ingest_codebase` | Walks the workspace, respects `.gitignore`, stores metadata, embeddings, and auto-evicts least-used chunks when requested. When overriding `databaseName`, provide a filename (for example `index-alt.sqlite`)—directory values like `"."` cannot be opened by SQLite. |
-| `semantic_search` | Hybrid lexical + embedding retrieval. Results suppress chunks served recently in this session (pass `recent_hits` to override), return trimmed focus spans instead of the entire chunk, and include `source` (`embedding`/`lexical`), `confidence`, chunk metadata (`summary`, `symbol`, `identifier`, `sourceType`, `metadata`), plus `diagnostics` (model, backend, quantization, latency, evaluated chunk count, ANN status). |
+| `semantic_search` | Hybrid lexical + embedding retrieval with optional attachments. Supply `include.bundle` / `include.lookup` or explicit `bundle` / `lookup` objects to orchestrate context bundles and code lookups in the same call. Structured content now adds `att` (attachment payloads) and `warn` (partial-failure notices), while `meta.attachments` captures per-attachment diagnostics. |
 | `code_lookup` | Routes `mode="search"` queries to semantic search and `mode="bundle"` to context bundles, forwarding deduped results, focus spans, and the same metadata/diagnostics so downstream prompts can cite confidently. Bundle mode requires a `file` (or query that resolves to one), and the `symbol` parameter must be a `{ "name": "..." }` object rather than a raw string. |
 | `context_bundle` | Returns file metadata, focus definitions, nearby snippets, and quick links within a token budget. Optional natural-language `query` re-ranks snippets via embeddings, and the bundle now appends graph-linked neighbor snippets from other files (deduped and annotated with edge metadata) before trimming. Diagnostics still report embedding model/backend, latency, and similarity range so prompts can tune follow-up calls. |
 | `index_status` | Summarizes index freshness, embedding models, ingestion history, and git parity. |
@@ -77,6 +78,34 @@ The Rust binary registers the full tool surface that previously lived in the Nod
 | Remote proxies | Any remote declared in `INDEX_MCP_REMOTE_SERVERS` is namespaced and surfaced alongside local tools. |
 
 The server banner reminds clients to re-run `ingest_codebase` after edits, check `index_status` when unsure about freshness, and prefer `code_lookup` for discovery.
+
+### Unified semantic_search quickstart
+
+Most agents should favour the single-call workflow instead of chaining tools manually:
+
+```jsonc
+{
+  "root": "/workspace",
+  "query": "alpha(value: i32)",
+  "databaseName": ".mcp-index.sqlite",
+  "include": { "bundle": true, "lookup": false },
+  "bundle": {
+    "file": "src/lib.rs",
+    "maxSnippets": 6
+  },
+  "sharedBudget": {
+    "totalTokens": 2800,
+    "bundleTokens": 1200
+  }
+}
+```
+
+Key behaviours:
+
+- Omit `bundle` / `lookup` blocks to let the server derive parameters from the top search hit; provide overrides when you need to force snippet counts, symbol selectors, or lookup filters.
+- Use `sharedBudget` to hint overall and per-attachment token ceilings. The orchestrator picks the tightest limit and records effective usage inside `meta.attachments`.
+- Inspect the response summary plus `structured_content.att` for attachment payloads. Non-fatal issues bubble up through the `warn` array so callers can react without retrying the entire search.
+- Legacy `code_lookup` / `context_bundle` calls still work, but the unified path deduplicates results and avoids double-charging token budgets.
 
 ## 5. SQLite Layout
 
