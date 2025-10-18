@@ -4,9 +4,9 @@ This document describes the Rust implementation that now powers the `index-mcp` 
 
 ## Tool Surface & Routing
 
-- `crates/index-mcp-server/src/service.rs` wires the standard MCP tools (`ingest_codebase`, `semantic_search`, `context_bundle`, `code_lookup`, `index_status`, `repository_timeline`, `repository_timeline_entry`, `indexing_guidance`, and `info`) and forwards requests to the underlying modules while applying consistent error handling and summary strings ([service.rs:1-115,293-341]).
+- `crates/index-mcp-server/src/service.rs` wires the standard MCP tools (`ingest_codebase`, `index_refresh`, `semantic_search`, `index_status`, `repository_timeline`, `repository_timeline_entry`, `indexing_guidance`, and `info`) and forwards requests to the underlying modules while applying consistent error handling and summary strings ([service.rs:1-115,293-341]).
 - `RemoteProxyRegistry` loads JSON descriptors from the `INDEX_MCP_REMOTE_SERVERS` environment variable and mounts the advertised remote tools under a namespaced name, allowing the Rust server to proxy additional MCP services ([remote_proxy.rs:1-202]).
-- Prompt instructions embedded in `service.rs` keep clients on the mandated workflow: ingest first, check freshness with `index_status`, gather history via `repository_timeline`, and rely on `code_lookup` bundles for citations.
+- Prompt instructions embedded in `service.rs` keep clients on the mandated workflow: ingest first, check freshness with `index_status`, gather history via `repository_timeline`, and rely on `semantic_search` attachments for citations.
 
 ## Ingestion Pipeline (`crates/index-mcp-server/src/ingest.rs`)
 
@@ -20,8 +20,8 @@ This document describes the Rust implementation that now powers the `index-mcp` 
 ## Semantic Lookup & Bundling
 
 - `semantic_search` opens the SQLite database read-only, resolves the desired embedding model, and hydrates a cached embedder. When an ANN basename is present it queries the on-disk HNSW graph first and automatically falls back to brute-force scoring if loading fails, logging diagnostics either way. Returned chunks carry surrounding context and trigger `UPDATE file_chunks SET hits = hits + 1` so usage influences eviction ([search.rs:1-231,386-504]).
-- `context_bundle` assembles file metadata, symbol definitions, graph neighbors, and related snippets. It now memoizes responses by file hash, selector, ranges, and budget so repeat queries avoid duplicate work, and its multi-tier trimming falls back from full text to focused excerpts and summaries while surfacing explicit token-usage guidance (default 3 000 tokens or `INDEX_MCP_BUDGET_TOKENS`) ([bundle.rs:1-314,586-899]).
-- `code_lookup` inside `service.rs` routes `mode="search"` requests to semantic search and `mode="bundle"` to contextual bundles, mirroring the legacy “auto” router ([service.rs:293-341]).
+- `context_bundle` assembles file metadata, symbol definitions, graph neighbors, and related snippets. It now memoizes responses by file hash, selector, ranges, and budget so repeat queries avoid duplicate work, and its multi-tier trimming falls back from full text to focused excerpts and summaries while surfacing explicit token-usage guidance (default 3 000 tokens or `INDEX_MCP_BUDGET_TOKENS`) ([bundle.rs:1-314,586-899]). These payloads are exposed to clients through `semantic_search` attachments.
+- Lookup attachments reuse `semantic_search` results when possible, deriving bundle parameters from the top hit or explicit overrides while sharing budget hints across the orchestration path ([service.rs:293-341]).
 
 ## Freshness & History Tracking
 

@@ -2,16 +2,15 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
-use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use crate::bundle::{
     context_bundle, BundleDefinition, BundleDiagnostics, BundleEdgeNeighbor, BundleFileMetadata,
-    BundleIngestionSummary, BundleSnippet, BundleUsageStats, ContextBundleError,
-    ContextBundleParams, ContextBundleQuickLink, ContextBundleResponse, LineRange,
-    NeighborDirection, NeighborNode, QuickLinkType, SnippetSource, SymbolSelector,
+    BundleIngestionSummary, BundleSnippet, BundleUsageStats, ContextBundleParams,
+    ContextBundleQuickLink, ContextBundleResponse, LineRange, NeighborDirection, NeighborNode,
+    QuickLinkType, SnippetSource, SymbolSelector,
 };
 use crate::git_timeline::{
     repository_timeline, repository_timeline_entry_detail, RepositoryTimelineDiffSummary,
@@ -358,6 +357,7 @@ struct CodeLookupParams {
     budget_tokens: Option<u32>,
     #[serde(default)]
     limit: Option<u32>,
+    #[allow(dead_code)]
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -669,19 +669,19 @@ const SERVER_INSTRUCTIONS_TEMPLATE: &str = r#"Rust rewrite is production-ready. 
 1. Prime the index at session start with index_refresh {"root": "{ABSOLUTE_ROOT}"} (combines ingest_codebase + index_status in one response) or --watch. Honor .gitignore, skip files larger than 8 MiB, and tune autoEvict/maxDatabaseSizeBytes before the SQLite file balloons. Always pass the absolute workspace root; relative paths often target the wrong codebase. If you override databaseName, supply a filename (for example ".mcp-index.sqlite"); directory-style values like "." cause SQLite to reject the request.
 2. If you skip index_refresh (or only need a quick status check), call index_status before planning or answering. If HEAD moved or isStale is true, ingest again before proceeding.
 3. Brief yourself with repository_timeline (and repository_timeline_entry for deep dives) so your plan reflects the latest commits.
-4. Locate targets with semantic_search or code_lookup (query mode), then request the precise snippet with code_lookup ranges or file+symbol. Bundle mode requires a file (or a query that resolves to one), and the symbol parameter must be an object such as {"name": "perform_ingest"} rather than a bare string. Set summaryMode (brief/compressed), focusDefinition, and maxSnippets/maxNeighbors to keep the response limited to what you intend to cite. The server tracks recently delivered chunks—pass recent_hits to suppress repeats or reset it when you need fresh spans.
-5. Shape bundles to your window: supply budgetTokens (or INDEX_MCP_BUDGET_TOKENS), trim snippet limits, and only escalate to context_bundle when you truly need neighboring lines. semantic_search already highlights the focus span, so avoid whole-file dumps unless explicitly required.
-6. Add detail iteratively: chain additional semantic_search or narrowly scoped context_bundle calls instead of broad re-ingests. If dedupe hides something important, request a different chunk index or clear recent_hits rather than re-requesting the entire file.
+4. Locate targets with semantic_search (query mode) and let the unified attachments decorate results. Set include.bundle/include.lookup or provide override payloads when you need heavier bundles, and keep summaryMode (brief/compressed), focusDefinition, and maxSnippets/maxNeighbors tuned so responses stay focused. The server tracks recently delivered chunks—pass recent_hits to suppress repeats or reset it when you need fresh spans.
+5. Shape attachments to your window: supply budgetTokens (or INDEX_MCP_BUDGET_TOKENS), trim snippet limits, and disable include.bundle/include.lookup for lean responses. semantic_search already highlights the focus span, so avoid whole-file dumps unless explicitly required.
+6. Add detail iteratively: issue additional semantic_search passes with adjusted filters instead of broad re-ingests. If dedupe hides something important, request a different chunk index or clear recent_hits rather than re-requesting the entire query.
 7. After modifying files, re-run index_refresh (or ingest_codebase followed by index_status) or rely on watch mode so the next task sees the updated payload.
 Responses now return compact structured_content: summaries stay in the text content, while JSON payloads use short keys (for example t:"sem"/"ctx", defs/sn for bundles, r for results). Prefer the structured data for programmatic handling and avoid relying on legacy CamelCase fields. Unified semantic_search calls default to returning bundle and code attachments under structured_content.att with any issues surfaced in warn; set include.bundle/include.lookup to false when you need slimmer responses.
 
-Available tools: index_refresh, semantic_search, repository_timeline, repository_timeline_entry, indexing_guidance, indexing_guidance_tool, info."#;
+Available tools: ingest_codebase, index_refresh, semantic_search, index_status, repository_timeline, repository_timeline_entry, info."#;
 const INDEXING_GUIDANCE_PROMPT_TEMPLATE: &str = r#"Workflow reminder:
 1. Prime the index after a checkout, pull, or edit by running index_refresh {"root": "{ABSOLUTE_ROOT}"} (combines ingest_codebase + index_status in one response) or enabling watch mode; respect .gitignore, skip files >8 MiB, and configure autoEvict/maxDatabaseSizeBytes when needed. Always provide the absolute workspace root to avoid indexing the wrong project. If you override databaseName, make it a filename (for example ".mcp-index.sqlite"); directory-like values will fail to open.
 2. If you skip index_refresh (or only need a quick status check), call index_status before reasoning. If it reports staleness or a HEAD mismatch, ingest before continuing.
-3. Start with semantic_search or code_lookup query mode to pinpoint targets, then request precise snippets with code_lookup ranges or file+symbol. Bundle mode needs a file (or query that resolves to one), and symbol must be supplied as an object such as {"name": "perform_ingest"}. Set summaryMode and snippet limits to keep responses focused, escalating to context_bundle only when you need neighboring lines.
+3. Start with semantic_search query mode to pinpoint targets and leverage attachments in one call. Use include.bundle/include.lookup (or the override payloads) when you need richer context, and supply precise snippet limits so responses stay focused.
 4. repository_timeline and repository_timeline_entry before planning or applying changes.
-5. Keep answers tight: set INDEX_MCP_BUDGET_TOKENS or pass budgetTokens, trim maxSnippets/maxNeighbors, and prefer info/indexing_guidance_tool for diagnostics.
+5. Keep answers tight: set INDEX_MCP_BUDGET_TOKENS or pass budgetTokens, trim maxSnippets/maxNeighbors, and prefer info or the indexing_guidance prompt for diagnostics.
 6. semantic_search now defaults to returning bundle and code attachments; disable include.bundle/include.lookup when you prefer lean responses."#;
 
 fn derive_database_name_for_status(
@@ -1015,156 +1015,6 @@ impl IndexMcpService {
         let warnings = attachments.warnings;
 
         build_semantic_search_result(response, meta, attachments_value, warnings, summary_lines)
-    }
-
-    #[tool(
-        name = "context_bundle",
-        description = "Return file-level definitions, snippets, and related graph neighbors."
-    )]
-    async fn context_bundle_tool(
-        &self,
-        Parameters(mut params): Parameters<ContextBundleParams>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        self.environment.update_from_meta(&ctx.meta);
-        self.environment.apply_bundle_defaults(&mut params);
-        let response = context_bundle(params)
-            .await
-            .map_err(convert_context_bundle_error)?;
-
-        let meta = self
-            .environment
-            .build_bundle_meta(&response.usage, response.usage.cache_hit);
-
-        build_context_bundle_result(response, Some(meta))
-    }
-
-    #[tool(
-        name = "code_lookup",
-        description = "Route lookups to semantic search (search mode only)."
-    )]
-    async fn code_lookup(
-        &self,
-        Parameters(mut params): Parameters<CodeLookupParams>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        self.environment.update_from_meta(&ctx.meta);
-        self.environment.apply_code_lookup_defaults(&mut params);
-        let resolved_mode = resolve_lookup_mode(&params);
-        let CodeLookupParams {
-            root,
-            database_name,
-            query,
-            file,
-            symbol,
-            ranges,
-            focus_line,
-            max_snippets,
-            max_neighbors,
-            budget_tokens,
-            limit,
-            model,
-            language,
-            path_prefix,
-            path_contains,
-            classification,
-            summary_mode,
-            max_context_before,
-            max_context_after,
-            ..
-        } = params;
-
-        match resolved_mode.as_str() {
-            "search" => {
-                let query = query.ok_or_else(|| {
-                    McpError::invalid_params("code_lookup search mode requires a query.", None)
-                })?;
-
-                let lookup_snapshot = self.environment.snapshot();
-                let lookup_recent_hits: Vec<SearchResultCoordinate> = lookup_snapshot
-                    .recent_hits
-                    .iter()
-                    .map(|hit| SearchResultCoordinate {
-                        path: hit.path.clone(),
-                        chunk_index: hit.chunk_index,
-                    })
-                    .collect();
-
-                let search_params = SemanticSearchParams {
-                    root,
-                    query,
-                    database_name,
-                    limit,
-                    model,
-                    language: language.clone(),
-                    path_prefix: path_prefix.clone(),
-                    path_contains: path_contains.clone(),
-                    classification: classification.clone(),
-                    summary_mode,
-                    max_context_before,
-                    max_context_after,
-                    recent_hits: if lookup_recent_hits.is_empty() {
-                        None
-                    } else {
-                        Some(lookup_recent_hits)
-                    },
-                };
-
-                let mut response = semantic_search(search_params)
-                    .await
-                    .map_err(convert_semantic_search_error)?;
-                let (deduplicated, duplicates_filtered) = self
-                    .environment
-                    .deduplicate_search_results(response.results);
-                response.results = deduplicated;
-                let snapshot = self.environment.snapshot();
-                response.suggested_tools = build_search_suggestions(&snapshot, &response);
-                let filter_summary = build_lookup_filter_summary(
-                    &language,
-                    &path_prefix,
-                    &path_contains,
-                    &classification,
-                );
-                let meta = self.environment.build_search_meta(
-                    &response,
-                    duplicates_filtered,
-                    filter_summary,
-                );
-                build_code_lookup_result(resolved_mode, response, Some(meta))
-            }
-            "bundle" => {
-                let file = file.or(query).ok_or_else(|| {
-                    McpError::invalid_params("code_lookup bundle mode requires a file path.", None)
-                })?;
-
-                let mut bundle_params = ContextBundleParams {
-                    root,
-                    database_name,
-                    file,
-                    symbol,
-                    max_snippets: max_snippets.or(limit),
-                    max_neighbors,
-                    budget_tokens,
-                    ranges,
-                    focus_line,
-                    query: None,
-                };
-                self.environment.apply_bundle_defaults(&mut bundle_params);
-
-                let response = context_bundle(bundle_params)
-                    .await
-                    .map_err(convert_context_bundle_error)?;
-                let meta = self
-                    .environment
-                    .build_bundle_meta(&response.usage, response.usage.cache_hit);
-
-                build_code_lookup_bundle_response(resolved_mode, response, Some(meta))
-            }
-            _ => Err(McpError::invalid_params(
-                "Unsupported code_lookup mode. Supported modes: search, bundle.",
-                None,
-            )),
-        }
     }
 
     fn plan_orchestration(&self, request: UnifiedSemanticSearchRequest) -> OrchestrationPlan {
@@ -2139,32 +1989,6 @@ fn filters_to_value(
         None
     } else {
         Some(Value::Object(map))
-    }
-}
-
-fn convert_context_bundle_error(error: ContextBundleError) -> McpError {
-    match error {
-        ContextBundleError::InvalidRoot { path, source } => {
-            McpError::invalid_params(format!("Unable to resolve root '{path}': {source}"), None)
-        }
-        ContextBundleError::Sqlite(source) => {
-            McpError::internal_error(format!("SQLite error: {source}"), None)
-        }
-        ContextBundleError::Io { path, source } => {
-            if source.kind() == ErrorKind::NotFound {
-                McpError::invalid_params(
-                    format!(
-                        "File '{path}' is not cached; run ingest_codebase to refresh the index."
-                    ),
-                    None,
-                )
-            } else {
-                McpError::internal_error(format!("Failed to access '{path}': {source}"), None)
-            }
-        }
-        ContextBundleError::Join(source) => {
-            McpError::internal_error(format!("Background task failed: {source}"), None)
-        }
     }
 }
 

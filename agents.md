@@ -111,3 +111,4 @@ Keep these release steps in sync with the workflow if triggers change.
 - 2025-10-17 – Published client guidance for the unified call: docs and repo playbooks now spell out request/response schemas, attachment semantics, and the preferred single-call workflow to complete Step 7.
 - 2025-10-17 – Drafted Step 8 rollout controls and monitoring plan (feature flag staging, metrics, dashboards, rollback, post-launch review) pending doc circulation.
 - 2025-10-17 – Completed Step 8 rollout: unified orchestration is default (no feature flag) with dashboards/alerts ready for GA and smoke test.
+- 2025-10-17 – Retired standalone `code_lookup` / `context_bundle` tools so `semantic_search` now owns attachment orchestration end-to-end, and refreshed guidance to match.

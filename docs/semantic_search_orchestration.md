@@ -1,7 +1,7 @@
 # Semantic Search Orchestration Design
 
 ## Context
-- `semantic_search_tool`, `context_bundle_tool`, and `code_lookup` currently execute independently, forcing clients to chain calls and re-hydrate shared metadata.
+- The legacy `context_bundle` and `code_lookup` tools executed independently, forcing clients to chain calls and re-hydrate shared metadata. Those entry points have now been removed in favour of a single orchestration layer.
 - The unified `semantic_search` path must drive lookup and bundle construction in parallel while respecting the single-call contract drafted in Step 2.
 - Existing helpers (`apply_*_defaults`, `deduplicate_search_results`, bundle summarizers) already encode business rules that should remain authoritative.
 
@@ -99,8 +99,8 @@ The text summary concatenates:
 
 ## Operational Runbook
 
-- Prefer the unified call whenever you would otherwise chain `semantic_search` → `context_bundle` / `code_lookup`. The orchestrator deduplicates search results and shares budgets automatically.
+- Prefer the unified call whenever you would otherwise chain `semantic_search` → bundle or lookup operations. The orchestrator deduplicates search results and shares budgets automatically.
 - Use `include.*` for lightweight “give me everything” defaults; pass explicit `bundle` / `lookup` blocks when you need tight control over snippet counts, symbol selection, or lookup filters.
 - Monitor `warn` for degradations. Transient issues (timeouts, missing files) leave the primary search intact but should surface in dashboards.
 - Budget tuning: set `sharedBudget.totalTokens` to the maximum combined payload you can tolerate, then ratchet `bundleTokens` / `lookupTokens` downward to reserve headroom for search results. The server also factors in environment-reported `remainingContextTokens`.
-- Legacy clients can continue to call standalone tools; the unified path is default, and rollback simply involves redeploying the prior release if we need to restore the legacy tool chain.
+- Standalone `context_bundle` / `code_lookup` tools have been removed. Clients must use the unified `semantic_search` call (with `include.*` toggles or overrides) to obtain the same payloads.

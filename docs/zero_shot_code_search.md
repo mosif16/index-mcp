@@ -1,6 +1,6 @@
 # Zero-Shot Code Search Integration
 
-This document describes the embedding-backed retrieval layer that now powers `semantic_search`, `code_lookup`, and `context_bundle`. The goal is to expose the repo through a single hybrid search stack that understands natural language prompts, code symbols, documentation, and file metadata without pre-written rules.
+This document describes the embedding-backed retrieval layer that now powers `semantic_search` and its bundle/lookup attachments. The goal is to expose the repo through a single hybrid search stack that understands natural language prompts, code symbols, documentation, and file metadata without pre-written rules.
 
 ## Model Strategy
 

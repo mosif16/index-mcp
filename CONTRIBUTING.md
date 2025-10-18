@@ -10,7 +10,7 @@ Thank you for caring about this server. Lean improvements compound quickly; the 
 ## Getting Set Up
 1. Install the Rust toolchain (stable) and ensure `cargo` is on your `PATH`.
 2. Clone the repository and run an initial ingest in a scratch workspace to prime `.mcp-index.sqlite` if you plan to exercise the end-to-end flow.
-3. Use the MCP workflow scripts (`ingest_codebase`, `semantic_search`, `context_bundle`) to understand existing behaviour before proposing changes.
+3. Use the MCP workflow scripts (`ingest_codebase`, `semantic_search`) to understand existing behaviour—semantic search now covers bundle/lookup attachments without standalone tools.
 
 ## Required Checks
 Run these for every contribution:

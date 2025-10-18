@@ -69,15 +69,13 @@ The Rust binary registers the full tool surface that previously lived in the Nod
 |---------------|-------|
 | `ingest_codebase` | Walks the workspace, respects `.gitignore`, stores metadata, embeddings, and auto-evicts least-used chunks when requested. When overriding `databaseName`, provide a filename (for example `index-alt.sqlite`)—directory values like `"."` cannot be opened by SQLite. |
 | `semantic_search` | Hybrid lexical + embedding retrieval with optional attachments. Supply `include.bundle` / `include.lookup` or explicit `bundle` / `lookup` objects to orchestrate context bundles and code lookups in the same call. Structured content now adds `att` (attachment payloads) and `warn` (partial-failure notices), while `meta.attachments` captures per-attachment diagnostics. |
-| `code_lookup` | Routes `mode="search"` queries to semantic search and `mode="bundle"` to context bundles, forwarding deduped results, focus spans, and the same metadata/diagnostics so downstream prompts can cite confidently. Bundle mode requires a `file` (or query that resolves to one), and the `symbol` parameter must be a `{ "name": "..." }` object rather than a raw string. |
-| `context_bundle` | Returns file metadata, focus definitions, nearby snippets, and quick links within a token budget. Optional natural-language `query` re-ranks snippets via embeddings, and the bundle now appends graph-linked neighbor snippets from other files (deduped and annotated with edge metadata) before trimming. Diagnostics still report embedding model/backend, latency, and similarity range so prompts can tune follow-up calls. |
 | `index_status` | Summarizes index freshness, embedding models, ingestion history, and git parity. |
 | `repository_timeline` | Streams recent git commits with churn stats, directory highlights, optional diffs, and PR URLs. |
 | `repository_timeline_entry` | Recovers cached commit details and (when available) full diff text for a specific SHA. |
-| `indexing_guidance` / `indexing_guidance_tool` | Prompt and tool variants for ingest reminders. |
+| `indexing_guidance` | Prompt for ingest reminders (also surfaced via the info tool instructions). |
 | Remote proxies | Any remote declared in `INDEX_MCP_REMOTE_SERVERS` is namespaced and surfaced alongside local tools. |
 
-The server banner reminds clients to re-run `ingest_codebase` after edits, check `index_status` when unsure about freshness, and prefer `code_lookup` for discovery.
+The server banner reminds clients to re-run `ingest_codebase` after edits, check `index_status` when unsure about freshness, and lean on `semantic_search` attachments for discovery.
 
 ### Unified semantic_search quickstart
 
@@ -105,7 +103,7 @@ Key behaviours:
 - Omit `bundle` / `lookup` blocks to let the server derive parameters from the top search hit; provide overrides when you need to force snippet counts, symbol selectors, or lookup filters.
 - Use `sharedBudget` to hint overall and per-attachment token ceilings. The orchestrator picks the tightest limit and records effective usage inside `meta.attachments`.
 - Inspect the response summary plus `structured_content.att` for attachment payloads. Non-fatal issues bubble up through the `warn` array so callers can react without retrying the entire search.
-- Legacy `code_lookup` / `context_bundle` calls still work, but the unified path deduplicates results and avoids double-charging token budgets.
+- Legacy `code_lookup` / `context_bundle` tools have been retired now that the unified path deduplicates results and avoids double-charging token budgets; stick with `semantic_search`.
 
 ## 5. SQLite Layout
 

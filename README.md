@@ -7,9 +7,9 @@ The project previously shipped a Node/TypeScript runtime. That implementation ha
 ## Key Capabilities
 
 - **Fast ingestion** – Parallel filesystem walker with `.gitignore` support, hashing, chunking, pluggable embeddings (FastEmbed ONNX by default, Candle sentence-transformers optional), and optional auto-eviction based on database size targets. Each chunk now persists summary, symbol, identifier, language, and graph metadata alongside the embedding payload. When embeddings are enabled the ingest pass can also persist an on-disk HNSW index for fast approximate nearest-neighbour (ANN) search.
-- **Hybrid lookups** – `semantic_search`, `code_lookup`, and `context_bundle` blend lexical sieves with embedding-backed similarity. Results ship with `source` (`embedding` vs `lexical`), `confidence`, and symbol metadata so agents understand why a match was promoted, while automatically falling back to brute-force scoring if the ANN index is unavailable.
+- **Hybrid lookups** – `semantic_search` blends lexical sieves with embedding-backed similarity and can emit bundle/lookup attachments in the same response. Results ship with `source` (`embedding` vs `lexical`), `confidence`, and symbol metadata so agents understand why a match was promoted, while automatically falling back to brute-force scoring if the ANN index is unavailable.
 - **Single-call orchestration** – The unified `semantic_search` request can also emit context-bundle and code-lookup attachments in one response. Attachments live under the `att` key, warnings under `warn`, and `meta.attachments` reports per-section diagnostics so clients can consume everything without extra tool hops.
-- **Cross-file awareness** – `context_bundle` automatically pulls in graph-linked snippets from neighboring files, annotating each excerpt with edge metadata so downstream prompts can cite related definitions without extra calls.
+- **Cross-file awareness** – Bundle attachments automatically pull in graph-linked snippets from neighboring files, annotating each excerpt with edge metadata so downstream prompts can cite related definitions without extra calls.
 - **Git awareness** – `repository_timeline` and `repository_timeline_entry` summarise recent commits and cached diffs so agents can reason about repo history.
 - **Watch mode** – Optional filesystem watcher re-ingests changed paths automatically for long-running agent sessions.
 - **Remote proxies** – Mount additional MCP servers behind the same process by declaring JSON descriptors in `INDEX_MCP_REMOTE_SERVERS`.
@@ -192,9 +192,9 @@ Pass the payload above to the `ingest_codebase` tool (for example via the MCP cl
 - **Prime the index** at the start of every session: run `ingest_codebase { "root": "." }` or launch the server with `--watch`. Respect `.gitignore`, skip artifacts larger than 8 MiB, and configure `autoEvict`/`maxDatabaseSizeBytes` before the database grows out of control. If you need a custom SQLite location, pass `databaseName` as a filename (not a directory path) so the ingestor can create the file safely.
 - **Check freshness before reasoning** by calling `index_status`. If `isStale` is true or HEAD moved, re-run ingest before answering questions.
 - **Brief yourself on recent commits** with `repository_timeline` (and `repository_timeline_entry` when you need detailed diffs) so plans reflect the latest changes.
-- **Assemble payloads with `code_lookup`**: start with `query="..."` to scope results, then request `file="..."` plus optional `symbol` bundles for the snippets you intend to cite. Bundle mode enforces this contract—include `file` (or a `query` that resolves to a file) and provide `symbol` as an object such as `{ "name": "perform_ingest" }` rather than a bare string so the request passes schema validation.
-- **Deliver targeted context** using `context_bundle` with `budgetTokens` (or `INDEX_MCP_BUDGET_TOKENS`), include citations, and avoid dumping entire files into responses.
-- **Refine without re-ingesting** by leaning on `semantic_search` or additional `context_bundle` calls for deeper dives.
+- **Assemble payloads with `semantic_search`**: start with `query="..."` to scope results, then set `include.bundle`/`include.lookup` (or provide override payloads) when you need richer attachments. Provide `bundle.file` or `lookup.file` when you already know the target path, and keep snippet limits tight so responses remain citeable.
+- **Deliver targeted context** by tuning attachment budgets with `budgetTokens` (or `INDEX_MCP_BUDGET_TOKENS`), include citations, and avoid dumping entire files into responses.
+- **Refine without re-ingesting** by issuing additional `semantic_search` passes with adjusted filters instead of falling back to standalone bundle calls.
 - **Close the loop after edits**: re-run ingest (or keep watch mode active) and confirm with `index_status`/`info` so downstream tasks consume fresh data.
 
 ## Remote MCP Proxying
@@ -227,7 +227,7 @@ Remote tools are surfaced under `<namespace>.<tool>` and benefit from the same s
 
 ## Further Reading
 
-- `docs/zero_shot_code_search.md` – deep dive into the hybrid embedding stack that powers `semantic_search`, `code_lookup`, and `context_bundle`.
+- `docs/zero_shot_code_search.md` – deep dive into the hybrid embedding stack that powers `semantic_search` and its bundle/lookup attachments.
 - `rust-migration.md` – status tracker for the Rust rewrite (formerly `docs/rust-migration.md`).
 - `rust-acceleration.md` – design notes and benchmarks for the native pipeline (formerly `docs/rust-acceleration.md`).
 - `agents_repo.md` – repository-specific guidance for wiring the server into MCP-compatible clients.
