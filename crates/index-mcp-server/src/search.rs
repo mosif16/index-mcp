@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -89,6 +90,26 @@ pub enum SearchSource {
     Lexical,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum QueryIntent {
+    Lexical,
+    Embedding,
+    Graph,
+    Docstring,
+    Hybrid,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ContextGoal {
+    Debugging,
+    ApiDiscovery,
+    ChangeImpact,
+    Navigation,
+    GeneralUnderstanding,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchDiagnostics {
@@ -107,6 +128,20 @@ pub struct SearchDiagnostics {
     pub total_latency_ms: u128,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evaluated_chunk_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_intent: Option<QueryIntent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent_confidence: Option<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_goals: Vec<ContextGoal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lexical_limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ann_candidate_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clarification_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -164,6 +199,14 @@ pub struct SemanticSearchResponse {
     pub evaluated_chunks: u64,
     pub results: Vec<SemanticSearchMatch>,
     pub summary_mode: SummaryMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_intent: Option<QueryIntent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent_confidence: Option<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_goals: Vec<ContextGoal>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clarification_prompts: Vec<String>,
     #[serde(default)]
     pub suggested_tools: Vec<SuggestedTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -191,6 +234,306 @@ pub enum SemanticSearchError {
         requested: String,
         available: String,
     },
+}
+
+const MAX_EMBEDDING_CANDIDATES: usize = 256;
+
+#[derive(Debug, Clone)]
+struct QueryAnalysis {
+    primary_intent: QueryIntent,
+    lexical_weight: f32,
+    embedding_weight: f32,
+    confidence: f32,
+    goals: Vec<ContextGoal>,
+}
+
+#[derive(Debug, Clone)]
+struct SearchBudgetProfile {
+    lexical_limit: usize,
+    embedding_probe_factor: usize,
+    lexical_probe_factor: usize,
+    run_lexical: bool,
+}
+
+impl SearchBudgetProfile {
+    fn for_analysis(
+        base_limit: usize,
+        lexical_hint: bool,
+        identifier_like: bool,
+        analysis: &QueryAnalysis,
+    ) -> Self {
+        let base_limit = base_limit.max(1);
+        let embedding_probe_factor = if analysis.embedding_weight >= 0.65 {
+            5
+        } else if analysis.embedding_weight >= 0.45 {
+            4
+        } else if analysis.embedding_weight >= 0.30 {
+            3
+        } else {
+            2
+        };
+
+        let lexical_probe_factor = if analysis.lexical_weight >= 0.5 {
+            3
+        } else if analysis.lexical_weight >= 0.2 {
+            2
+        } else {
+            1
+        };
+
+        let run_lexical = lexical_hint || analysis.lexical_weight >= 0.08 || identifier_like;
+
+        let mut lexical_limit = if run_lexical {
+            ((base_limit as f32) * analysis.lexical_weight.max(0.12)).ceil() as usize
+        } else {
+            0
+        };
+
+        if identifier_like {
+            lexical_limit = lexical_limit.max(DEFAULT_IDENTIFIER_LIMIT);
+        }
+
+        let lexical_ceiling = base_limit.max(DEFAULT_RESULT_LIMIT);
+        lexical_limit = lexical_limit.min(lexical_ceiling);
+        if run_lexical {
+            lexical_limit = lexical_limit.max(1);
+        }
+
+        Self {
+            lexical_limit,
+            embedding_probe_factor,
+            lexical_probe_factor,
+            run_lexical,
+        }
+    }
+
+    fn embedding_top_limit(&self, base_limit: usize) -> usize {
+        let base_limit = base_limit.max(1);
+        let candidate = base_limit
+            .saturating_mul(self.embedding_probe_factor)
+            .max(DEFAULT_RESULT_LIMIT);
+        candidate.min(MAX_EMBEDDING_CANDIDATES)
+    }
+
+    fn ann_search_k(&self, base_limit: usize, lexical_results: usize) -> usize {
+        let base_limit = base_limit.max(1);
+        let embedding_probe = base_limit.saturating_mul(self.embedding_probe_factor);
+        let lexical_influence = lexical_results.saturating_mul(self.lexical_probe_factor);
+        let candidate = embedding_probe
+            .max(lexical_influence)
+            .max(base_limit)
+            .min(MAX_EMBEDDING_CANDIDATES);
+        candidate.max(32)
+    }
+
+    fn should_run_lexical(&self) -> bool {
+        self.run_lexical && self.lexical_limit > 0
+    }
+
+    fn lexical_limit(&self) -> usize {
+        self.lexical_limit
+    }
+}
+
+fn analyze_query(query: &str, identifier_like: bool) -> QueryAnalysis {
+    let trimmed = query.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let word_count = trimmed
+        .split_whitespace()
+        .filter(|token| !token.is_empty())
+        .count();
+    let char_count = trimmed.chars().count();
+
+    let mut lexical_weight: f32 = 0.0;
+    let mut embedding_weight: f32 = 0.0;
+    let mut graph_weight: f32 = 0.0;
+    let mut docstring_weight: f32 = 0.0;
+
+    if identifier_like {
+        lexical_weight += 0.35;
+        graph_weight += 0.45;
+    }
+
+    if trimmed.contains('"')
+        || trimmed.contains('\'')
+        || lower.contains("error")
+        || lower.contains("exception")
+        || lower.contains("failed")
+        || lower.contains("panic")
+        || lower.contains("stack trace")
+    {
+        lexical_weight += 0.5;
+    }
+
+    if trimmed.contains("::")
+        || trimmed.contains("->")
+        || trimmed.contains('.')
+        || trimmed.contains('(')
+        || lower.contains("protocol")
+    {
+        graph_weight += 0.35;
+    }
+
+    if word_count >= 6
+        || char_count >= 48
+        || trimmed.ends_with('?')
+        || lower.contains("how ")
+        || lower.contains("what ")
+        || lower.contains("why ")
+        || lower.contains("explain")
+    {
+        embedding_weight += 0.6;
+    }
+
+    if lower.contains("doc")
+        || lower.contains("comment")
+        || lower.contains("documentation")
+        || trimmed.contains("///")
+        || lower.contains("summary")
+        || lower.contains("remarks")
+    {
+        docstring_weight += 0.7;
+    }
+
+    if lower.contains("todo") || lower.contains("fixme") {
+        docstring_weight += 0.2;
+        lexical_weight += 0.1;
+    }
+
+    if lower.contains("usage") || lower.contains("example") || lower.contains("guide") {
+        embedding_weight += 0.3;
+        docstring_weight += 0.2;
+    }
+
+    if lower.contains("api") || lower.contains("interface") || lower.contains("conformance") {
+        graph_weight += 0.3;
+        embedding_weight += 0.2;
+    }
+
+    if lexical_weight + embedding_weight + graph_weight + docstring_weight == 0.0 {
+        if identifier_like {
+            lexical_weight = 0.35;
+            graph_weight = 0.45;
+            embedding_weight = 0.2;
+        } else if word_count <= 3 {
+            lexical_weight = 0.4;
+            embedding_weight = 0.35;
+            graph_weight = 0.25;
+        } else {
+            embedding_weight = 0.55;
+            lexical_weight = 0.3;
+            graph_weight = 0.15;
+        }
+    }
+
+    let total =
+        (lexical_weight + embedding_weight + graph_weight + docstring_weight).max(f32::EPSILON);
+
+    lexical_weight /= total;
+    embedding_weight /= total;
+    graph_weight /= total;
+    docstring_weight /= total;
+
+    let mut weights = [
+        (QueryIntent::Lexical, lexical_weight),
+        (QueryIntent::Embedding, embedding_weight),
+        (QueryIntent::Graph, graph_weight),
+        (QueryIntent::Docstring, docstring_weight),
+    ];
+    weights.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+
+    let mut primary_intent = weights[0].0;
+    let mut confidence: f32 = weights[0].1;
+    if weights.len() > 1 {
+        let delta = confidence - weights[1].1;
+        if delta < 0.15 {
+            primary_intent = QueryIntent::Hybrid;
+            confidence = confidence.max(weights[1].1);
+        }
+    }
+
+    let goals = detect_context_goals(trimmed);
+
+    QueryAnalysis {
+        primary_intent,
+        lexical_weight,
+        embedding_weight,
+        confidence: confidence.clamp(0.0, 1.0),
+        goals,
+    }
+}
+
+fn detect_context_goals(query: &str) -> Vec<ContextGoal> {
+    let lower = query.to_ascii_lowercase();
+    let mut goals = Vec::new();
+
+    let mut push_unique = |goal| {
+        if !goals.contains(&goal) {
+            goals.push(goal);
+        }
+    };
+
+    const DEBUG_TERMS: &[&str] = &[
+        "error",
+        "fail",
+        "panic",
+        "exception",
+        "debug",
+        "stack trace",
+        "crash",
+        "fix",
+    ];
+    if DEBUG_TERMS.iter().any(|term| lower.contains(term)) {
+        push_unique(ContextGoal::Debugging);
+    }
+
+    const API_TERMS: &[&str] = &[
+        "usage",
+        "example",
+        "api",
+        "interface",
+        "how do",
+        "how to",
+        "docs",
+        "documentation",
+    ];
+    if API_TERMS.iter().any(|term| lower.contains(term)) {
+        push_unique(ContextGoal::ApiDiscovery);
+    }
+
+    const CHANGE_TERMS: &[&str] = &[
+        "impact",
+        "refactor",
+        "change",
+        "diff",
+        "upgrade",
+        "regression",
+        "breaking",
+        "deprecate",
+    ];
+    if CHANGE_TERMS.iter().any(|term| lower.contains(term)) {
+        push_unique(ContextGoal::ChangeImpact);
+    }
+
+    const NAV_TERMS: &[&str] = &[
+        "where",
+        "path",
+        "file",
+        "module",
+        "navigate",
+        "definition",
+        "symbol",
+        "jump",
+    ];
+    if NAV_TERMS.iter().any(|term| lower.contains(term)) {
+        push_unique(ContextGoal::Navigation);
+    }
+
+    if goals.is_empty() {
+        goals.push(ContextGoal::GeneralUnderstanding);
+    }
+
+    goals
 }
 
 pub async fn semantic_search(
@@ -270,13 +613,22 @@ fn perform_semantic_search(
 
     let summary_mode = summary_mode.unwrap_or_default();
     let normalized_limit = normalize_limit(limit);
-    let should_run_lexical_query = should_run_lexical(trimmed_query);
     let identifier_query = is_identifier_query(trimmed_query);
+    let lexical_hint = should_run_lexical(trimmed_query);
+    let query_analysis = analyze_query(trimmed_query, identifier_query);
+    let budget_profile = SearchBudgetProfile::for_analysis(
+        normalized_limit,
+        lexical_hint,
+        identifier_query,
+        &query_analysis,
+    );
+    let should_run_lexical_query = budget_profile.should_run_lexical();
     let lexical_budget = if should_run_lexical_query {
-        normalized_limit
+        budget_profile.lexical_limit()
     } else {
-        DEFAULT_IDENTIFIER_LIMIT.min(normalized_limit)
+        0
     };
+    let embedding_candidate_limit = budget_profile.embedding_top_limit(normalized_limit);
     let language_filter = language.map(|value| value.to_lowercase());
     let context_before_lines = max_context_before
         .map(|value| value.min(MAX_CONTEXT_LINES as u32) as usize)
@@ -317,11 +669,22 @@ fn perform_semantic_search(
     let requested_model = resolve_requested_model(model.clone(), &available_models)?;
 
     let total_timer = Instant::now();
+    let context_goals = query_analysis.goals.clone();
+    let intent_confidence = query_analysis.confidence;
 
     let mut diagnostics = SearchDiagnostics {
         model: Some(requested_model.clone()),
         ..Default::default()
     };
+    diagnostics.query_intent = Some(query_analysis.primary_intent);
+    diagnostics.intent_confidence = Some(intent_confidence);
+    diagnostics.context_goals = context_goals.clone();
+    if should_run_lexical_query && lexical_budget > 0 {
+        diagnostics.lexical_limit = Some(lexical_budget as u32);
+    }
+    if embedding_candidate_limit > 0 {
+        diagnostics.embedding_limit = Some(embedding_candidate_limit as u32);
+    }
 
     let backend_label_meta = load_meta_value(&conn, "embedding_backend");
     diagnostics.backend = backend_label_meta.clone();
@@ -345,6 +708,10 @@ fn perform_semantic_search(
             evaluated_chunks: 0,
             results: Vec::new(),
             summary_mode,
+            query_intent: Some(query_analysis.primary_intent),
+            intent_confidence: Some(intent_confidence),
+            context_goals: context_goals.clone(),
+            clarification_prompts: Vec::new(),
             suggested_tools: Vec::new(),
             diagnostics: Some(diagnostics),
         });
@@ -379,7 +746,11 @@ fn perform_semantic_search(
         lexical_matches = filtered;
     }
 
-    let skip_embedding = identifier_query && !lexical_matches.is_empty();
+    let ann_search_k = budget_profile.ann_search_k(normalized_limit, lexical_matches.len());
+    diagnostics.ann_candidate_count = Some(ann_search_k as u32);
+
+    let skip_embedding =
+        identifier_query && !lexical_matches.is_empty() && query_analysis.embedding_weight < 0.35;
 
     let mut embedding_matches: Vec<PendingMatch> = Vec::new();
     let mut evaluated_chunks: u64 = 0;
@@ -427,13 +798,10 @@ fn perform_semantic_search(
         };
 
         let mut top_matches: Vec<PendingMatch> = Vec::new();
-        let top_limit = normalized_limit.max(DEFAULT_RESULT_LIMIT);
+        let top_limit = embedding_candidate_limit.max(normalized_limit.max(DEFAULT_RESULT_LIMIT));
         let mut ann_used = false;
 
         if let Some(ann_index) = ann_index.as_ref() {
-            let ann_search_k = (normalized_limit * 3)
-                .max(lexical_matches.len() * 2)
-                .min(256);
             let ef = ann_search_k.max(64);
 
             match ann_index.search(&query_embedding, ann_search_k, ef) {
@@ -622,6 +990,15 @@ fn perform_semantic_search(
         });
     }
 
+    let (clarification_prompts, clarification_reasons) = build_clarification_prompts(
+        trimmed_query,
+        &query_analysis,
+        &context_goals,
+        &results,
+        normalized_limit,
+        should_run_lexical_query,
+    );
+
     diagnostics.lexical_latency_ms = lexical_latency_ms;
     diagnostics.total_latency_ms = total_timer.elapsed().as_millis();
     diagnostics.backend = load_meta_value(&conn, "embedding_backend");
@@ -629,6 +1006,7 @@ fn perform_semantic_search(
         load_meta_value(&conn, "embedding_quantized").map(|value| value == "true");
     diagnostics.dimension =
         load_meta_value(&conn, "embedding_dimension").and_then(|value| value.parse::<u32>().ok());
+    diagnostics.clarification_reasons = clarification_reasons.clone();
 
     Ok(SemanticSearchResponse {
         database_path: db_path_string,
@@ -638,6 +1016,10 @@ fn perform_semantic_search(
         evaluated_chunks,
         results,
         summary_mode,
+        query_intent: Some(query_analysis.primary_intent),
+        intent_confidence: Some(intent_confidence),
+        context_goals,
+        clarification_prompts,
         suggested_tools: Vec::new(),
         diagnostics: Some(diagnostics),
     })
@@ -656,6 +1038,10 @@ fn empty_response(
         evaluated_chunks: 0,
         results: Vec::new(),
         summary_mode: SummaryMode::Brief,
+        query_intent: None,
+        intent_confidence: None,
+        context_goals: Vec::new(),
+        clarification_prompts: Vec::new(),
         suggested_tools: Vec::new(),
         diagnostics: None,
     }
@@ -868,6 +1254,80 @@ fn should_run_lexical(query: &str) -> bool {
         || query.contains('.')
         || query.contains('-')
         || query.contains(' ')
+}
+
+fn goals_contains(goals: &[ContextGoal], goal: ContextGoal) -> bool {
+    goals.contains(&goal)
+}
+
+fn build_clarification_prompts(
+    query: &str,
+    analysis: &QueryAnalysis,
+    goals: &[ContextGoal],
+    results: &[SemanticSearchMatch],
+    result_limit: usize,
+    ran_lexical: bool,
+) -> (Vec<String>, Vec<String>) {
+    let mut prompts = Vec::new();
+    let mut reasons = Vec::new();
+
+    if results.is_empty() {
+        prompts.push(format!(
+            "No indexed snippets matched '{query}'. Try naming the file or insert unique keywords."
+        ));
+        reasons.push("no_results".to_string());
+    } else {
+        let top_confidence = results
+            .iter()
+            .map(|entry| entry.confidence)
+            .fold(0.0, f32::max);
+        if top_confidence < 0.35 {
+            prompts.push(
+                "Top matches are low confidence—specify the framework, module, or identifier you're targeting."
+                    .to_string(),
+            );
+            reasons.push("low_confidence".to_string());
+        }
+        if results.len() < result_limit.saturating_sub(1)
+            && result_limit >= 4
+            && top_confidence < 0.65
+        {
+            prompts.push(
+                "Few results matched. Narrow the scope by adding a directory, language filter, or symbol name."
+                    .to_string(),
+            );
+            reasons.push("sparse_results".to_string());
+        }
+    }
+
+    if goals_contains(goals, ContextGoal::Debugging) && ran_lexical && results.is_empty() {
+        prompts.push(
+            "Paste the exact error message or stack trace so the index can find the failing code."
+                .to_string(),
+        );
+        reasons.push("debug_goal_no_hits".to_string());
+    } else if goals_contains(goals, ContextGoal::ApiDiscovery)
+        && analysis.embedding_weight > analysis.lexical_weight
+    {
+        prompts.push(
+            "Mention the target SDK, module, or protocol to surface precise API definitions."
+                .to_string(),
+        );
+        reasons.push("api_goal_disambiguation".to_string());
+    }
+
+    if prompts.is_empty()
+        && analysis.primary_intent == QueryIntent::Hybrid
+        && analysis.confidence < 0.4
+    {
+        prompts.push(
+            "Clarify whether you're searching for code, documentation, or call graphs so the engine can prioritize appropriately."
+                .to_string(),
+        );
+        reasons.push("hybrid_intent".to_string());
+    }
+
+    (prompts, reasons)
 }
 
 fn collect_lexical_matches(
@@ -1537,6 +1997,11 @@ pub fn summarize_semantic_search(payload: &SemanticSearchResponse) -> String {
         ));
     }
 
+    if !payload.clarification_prompts.is_empty() {
+        summary.push_str(" Clarify: ");
+        summary.push_str(&payload.clarification_prompts.join(" "));
+    }
+
     if let Some(diag) = &payload.diagnostics {
         if let Some(latency) = diag.embedding_latency_ms {
             summary.push_str(&format!(" Embedding latency: {} ms.", latency));
@@ -1557,6 +2022,32 @@ mod tests {
     use rusqlite::{params, Connection};
     use std::collections::HashSet;
     use tempfile::tempdir;
+
+    fn semantic_match(confidence: f32) -> SemanticSearchMatch {
+        SemanticSearchMatch {
+            path: "src/lib.rs".into(),
+            chunk_index: 0,
+            score: confidence,
+            normalized_score: confidence,
+            language: Some("Rust".into()),
+            classification: Classification::Code,
+            content: "fn sample() {}".into(),
+            embedding_model: "mock".into(),
+            byte_start: Some(0),
+            byte_end: Some(16),
+            line_start: Some(10),
+            line_end: Some(12),
+            context_before: None,
+            context_after: None,
+            source: SearchSource::Embedding,
+            summary: None,
+            symbol: None,
+            identifier: None,
+            source_type: None,
+            metadata: None,
+            confidence,
+        }
+    }
 
     fn vec_to_blob(values: &[f32]) -> Vec<u8> {
         values
@@ -1761,6 +2252,24 @@ mod tests {
         );
         assert!(filtered.is_none());
         assert!(fresh_seen.is_empty());
+    }
+
+    #[test]
+    fn clarification_prompts_trigger_for_empty_result_sets() {
+        let analysis = analyze_query("alpha", false);
+        let (prompts, reasons) = build_clarification_prompts("alpha", &analysis, &[], &[], 6, true);
+        assert!(!prompts.is_empty());
+        assert!(reasons.iter().any(|reason| reason == "no_results"));
+    }
+
+    #[test]
+    fn clarification_prompts_skip_for_confident_results() {
+        let analysis = analyze_query("beta", false);
+        let result = semantic_match(0.92);
+        let (prompts, reasons) =
+            build_clarification_prompts("beta", &analysis, &[], &[result], 6, true);
+        assert!(prompts.is_empty());
+        assert!(reasons.is_empty());
     }
 
     #[test]

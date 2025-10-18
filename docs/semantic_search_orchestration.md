@@ -46,6 +46,8 @@
 - **Partial failures handled:** Attachment errors surface in the response warning list and do not cancel the primary search.
 - **Summary + diagnostics:** The tool summary now annotates bundle/lookup completion, and attachment metadata is merged into the search meta map for downstream reporting.
 - **Client docs refreshed (2025-10-17):** Request/response schema, examples, and runbook guidance are codified below so agents integrate the unified flow without reverse-engineering test cases.
+- **Query intelligence refresh (2025-10-17):** The search planner now classifies intent (lexical, embedding, graph, docstring), detects context goals, adapts lexical/ANN budgets accordingly, and emits clarification prompts when results are sparse or low confidence. Diagnostics capture both the detected intent and clarification triggers.
+- **Context harvesting enrichment (2025-10-17):** Bundle assembly performs multi-hop graph traversal, augments snippets with recent commit summaries, TODO/test signals, and pulls nearby documentation/runbooks when debugging or API exploration goals are detected.
 
 ## Request Schema & Examples
 
@@ -89,8 +91,14 @@
 
 - `att`: JSON object keyed by attachment (`bundle`, `code`). Each value is the compact payload already returned by the standalone tools (`{"t":"ctx",...}` or `{"t":"code",...}`).
 - `warn`: Array of human-readable warnings. Attachment failures, budget truncation, or skipped operations populate this list instead of aborting the call.
+- `clar`: Optional array of clarification prompts advising the caller how to refine the query when confidence is low.
 
 The `meta` map now nests attachment diagnostics under `attachments`, preserving cache hits, bundle budgets, and any lookup filters. Empty attachment meta is omitted entirely.
+
+Additional telemetry surfaces intent and clarifier details under `semanticSearch` meta:
+
+- `contextGoals` – Detected high-level goal(s) (debugging, API discovery, change impact, navigation).
+- `clarifications` – Same prompt strings returned under `clar`, enabling dashboards to track how often guidance fires.
 
 The text summary concatenates:
 1. The canonical semantic search summary.
@@ -102,5 +110,7 @@ The text summary concatenates:
 - Prefer the unified call whenever you would otherwise chain `semantic_search` → bundle or lookup operations. The orchestrator deduplicates search results and shares budgets automatically.
 - Use `include.*` for lightweight “give me everything” defaults; pass explicit `bundle` / `lookup` blocks when you need tight control over snippet counts, symbol selection, or lookup filters.
 - Monitor `warn` for degradations. Transient issues (timeouts, missing files) leave the primary search intact but should surface in dashboards.
+- When `clar` prompts are returned, surface them to users or automation immediately—refinements dramatically improve subsequent searches because query intent and context goals feed back into budget planning.
 - Budget tuning: set `sharedBudget.totalTokens` to the maximum combined payload you can tolerate, then ratchet `bundleTokens` / `lookupTokens` downward to reserve headroom for search results. The server also factors in environment-reported `remainingContextTokens`.
 - Standalone `context_bundle` / `code_lookup` tools have been removed. Clients must use the unified `semantic_search` call (with `include.*` toggles or overrides) to obtain the same payloads.
+- Expect richer bundle payloads when debugging or API discovery goals are detected—multi-hop graph neighbors, relevant runbooks/docs, and synthetic execution traces (recent commit summaries, TODO/test hints) now ship automatically. Reuse the received metadata to decide whether further context calls are necessary before re-querying.

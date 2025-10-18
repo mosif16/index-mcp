@@ -29,9 +29,9 @@ use crate::ingest::{
 };
 use crate::remote_proxy::RemoteProxyRegistry;
 use crate::search::{
-    semantic_search, summarize_semantic_search, Classification, SearchDiagnostics,
-    SearchResultCoordinate, SearchSource, SemanticSearchError, SemanticSearchMatch,
-    SemanticSearchParams, SemanticSearchResponse, SuggestedTool, SummaryMode,
+    semantic_search, summarize_semantic_search, Classification, ContextGoal, QueryIntent,
+    SearchDiagnostics, SearchResultCoordinate, SearchSource, SemanticSearchError,
+    SemanticSearchMatch, SemanticSearchParams, SemanticSearchResponse, SuggestedTool, SummaryMode,
 };
 use tracing::warn;
 
@@ -294,6 +294,12 @@ impl EnvironmentState {
         });
         if let Some(filters) = filters {
             info["filters"] = filters;
+        }
+        if !response.clarification_prompts.is_empty() {
+            info["clarifications"] = json!(response.clarification_prompts);
+        }
+        if !response.context_goals.is_empty() {
+            info["contextGoals"] = json!(response.context_goals);
         }
         meta.insert("semanticSearch".to_string(), info);
         if let Some(remaining) = snapshot.remaining_context_tokens {
@@ -674,6 +680,7 @@ const SERVER_INSTRUCTIONS_TEMPLATE: &str = r#"Rust rewrite is production-ready. 
 6. Add detail iteratively: issue additional semantic_search passes with adjusted filters instead of broad re-ingests. If dedupe hides something important, request a different chunk index or clear recent_hits rather than re-requesting the entire query.
 7. After modifying files, re-run index_refresh (or ingest_codebase followed by index_status) or rely on watch mode so the next task sees the updated payload.
 Responses now return compact structured_content: summaries stay in the text content, while JSON payloads use short keys (for example t:"sem"/"ctx", defs/sn for bundles, r for results). Prefer the structured data for programmatic handling and avoid relying on legacy CamelCase fields. Unified semantic_search calls default to returning bundle and code attachments under structured_content.att with any issues surfaced in warn; set include.bundle/include.lookup to false when you need slimmer responses.
+Info telemetry now lives under meta.semanticSearch: check clarifications/contextGoals, filter summaries, duplicate counts, and token estimates before re-querying. structured_content.clar repeats the prompts for easy display—surface them and adjust the next query. meta.attachments captures bundle/lookup budgets, cache hits, and remainingContextTokens so you can plan follow-up calls without re-inspecting the raw payload.
 
 Available tools: ingest_codebase, index_refresh, semantic_search, index_status, repository_timeline, repository_timeline_entry, info."#;
 const INDEXING_GUIDANCE_PROMPT_TEMPLATE: &str = r#"Workflow reminder:
@@ -1048,6 +1055,12 @@ impl IndexMcpService {
             },
         };
 
+        if params.context_goals.is_none() && !search_response.context_goals.is_empty() {
+            params.context_goals = Some(search_response.context_goals.clone());
+        }
+        if params.query.is_none() {
+            params.query = Some(plan.search.query.clone());
+        }
         let snapshot = environment.snapshot();
         if let Some(budget) = plan.shared_budget.bundle_budget_hint(&snapshot) {
             params.budget_tokens = Some(budget);
@@ -1186,6 +1199,11 @@ impl IndexMcpService {
                     ranges: params.ranges.clone(),
                     focus_line: params.focus_line,
                     query: None,
+                    context_goals: if search_response.context_goals.is_empty() {
+                        None
+                    } else {
+                        Some(search_response.context_goals.clone())
+                    },
                 };
 
                 environment.apply_bundle_defaults(&mut bundle_params);
@@ -1194,6 +1212,14 @@ impl IndexMcpService {
                     if let Some(budget) = plan.shared_budget.bundle_budget_hint(&snapshot) {
                         bundle_params.budget_tokens = Some(budget);
                     }
+                }
+                if bundle_params.context_goals.is_none()
+                    && !search_response.context_goals.is_empty()
+                {
+                    bundle_params.context_goals = Some(search_response.context_goals.clone());
+                }
+                if bundle_params.query.is_none() {
+                    bundle_params.query = Some(plan.search.query.clone());
                 }
 
                 let response = match context_bundle(bundle_params.clone()).await {
@@ -2179,6 +2205,11 @@ fn derive_bundle_params_from_search(
         ranges: range.map(|r| vec![r]),
         focus_line,
         query: None,
+        context_goals: if search_response.context_goals.is_empty() {
+            None
+        } else {
+            Some(search_response.context_goals.clone())
+        },
     })
 }
 
@@ -2480,6 +2511,14 @@ mod compact {
         sg: Vec<CompactSuggestedTool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         diag: Option<CompactSearchDiagnostics>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        intent: Option<QueryIntent>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        conf: Option<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        goals: Option<Vec<ContextGoal>>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        clar: Vec<String>,
     }
 
     impl From<SemanticSearchResponse> for CompactSemanticSearchResponse {
@@ -2502,6 +2541,14 @@ mod compact {
                     .map(CompactSuggestedTool::from)
                     .collect(),
                 diag: response.diagnostics.map(CompactSearchDiagnostics::from),
+                intent: response.query_intent,
+                conf: response.intent_confidence,
+                goals: if response.context_goals.is_empty() {
+                    None
+                } else {
+                    Some(response.context_goals)
+                },
+                clar: response.clarification_prompts,
             }
         }
     }
@@ -2606,19 +2653,62 @@ mod compact {
         tot_ms: u128,
         #[serde(skip_serializing_if = "Option::is_none")]
         eval: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        intent: Option<QueryIntent>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        conf: Option<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        goals: Option<Vec<ContextGoal>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lex_lim: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        emb_lim: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ann: Option<u32>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        clar: Vec<String>,
     }
 
     impl From<SearchDiagnostics> for CompactSearchDiagnostics {
         fn from(diag: SearchDiagnostics) -> Self {
+            let SearchDiagnostics {
+                model,
+                backend,
+                quantized,
+                dimension,
+                embedding_latency_ms,
+                lexical_latency_ms,
+                total_latency_ms,
+                evaluated_chunk_count,
+                query_intent,
+                intent_confidence,
+                context_goals,
+                lexical_limit,
+                embedding_limit,
+                ann_candidate_count,
+                clarification_reasons,
+            } = diag;
+
             Self {
-                mdl: diag.model,
-                be: diag.backend,
-                q: diag.quantized,
-                dim: diag.dimension,
-                emb_ms: diag.embedding_latency_ms,
-                lex_ms: diag.lexical_latency_ms,
-                tot_ms: diag.total_latency_ms,
-                eval: diag.evaluated_chunk_count,
+                mdl: model,
+                be: backend,
+                q: quantized,
+                dim: dimension,
+                emb_ms: embedding_latency_ms,
+                lex_ms: lexical_latency_ms,
+                tot_ms: total_latency_ms,
+                eval: evaluated_chunk_count,
+                intent: query_intent,
+                conf: intent_confidence,
+                goals: if context_goals.is_empty() {
+                    None
+                } else {
+                    Some(context_goals)
+                },
+                lex_lim: lexical_limit,
+                emb_lim: embedding_limit,
+                ann: ann_candidate_count,
+                clar: clarification_reasons,
             }
         }
     }
@@ -3437,16 +3527,17 @@ mod tests {
                 confidence: 0.92,
             }],
             summary_mode: SummaryMode::Brief,
+            query_intent: Some(QueryIntent::Lexical),
+            intent_confidence: Some(0.8),
+            context_goals: vec![ContextGoal::GeneralUnderstanding],
+            clarification_prompts: Vec::new(),
             suggested_tools: Vec::new(),
             diagnostics: Some(SearchDiagnostics {
                 model: Some("custom-model".into()),
-                backend: None,
-                quantized: None,
-                dimension: None,
-                embedding_latency_ms: None,
                 lexical_latency_ms: Some(5),
                 total_latency_ms: 25,
                 evaluated_chunk_count: Some(150),
+                ..Default::default()
             }),
         }
     }
@@ -3722,6 +3813,10 @@ mod tests {
                 confidence: 0.87,
             }],
             summary_mode: SummaryMode::Brief,
+            query_intent: Some(QueryIntent::Embedding),
+            intent_confidence: Some(0.75),
+            context_goals: vec![ContextGoal::GeneralUnderstanding],
+            clarification_prompts: Vec::new(),
             suggested_tools: Vec::new(),
             diagnostics: None,
         };
@@ -3766,6 +3861,10 @@ mod tests {
                 confidence: 0.92,
             }],
             summary_mode: SummaryMode::Brief,
+            query_intent: Some(QueryIntent::Lexical),
+            intent_confidence: Some(0.85),
+            context_goals: vec![ContextGoal::GeneralUnderstanding],
+            clarification_prompts: Vec::new(),
             suggested_tools: Vec::new(),
             diagnostics: Some(SearchDiagnostics {
                 total_latency_ms: 25,
@@ -3781,6 +3880,43 @@ mod tests {
         ));
         assert!(summary.contains("1 lexical match(es) promoted ahead of semantic ranks."));
         assert!(summary.contains("Top hit: src/main.rs#L44 (confidence 0.92)."));
+    }
+
+    #[test]
+    fn summarize_semantic_search_includes_clarification_prompts() {
+        let mut response = sample_semantic_response();
+        response.clarification_prompts = vec!["Specify the target module or framework.".into()];
+
+        let summary = crate::search::summarize_semantic_search(&response);
+
+        assert!(summary.contains("Clarify: Specify the target module or framework."));
+    }
+
+    #[test]
+    fn build_search_meta_captures_clarifications_and_goals() {
+        let env = EnvironmentState::new();
+        let mut response = sample_semantic_response();
+        response.context_goals = vec![ContextGoal::Debugging];
+        response.clarification_prompts = vec!["Provide the stack trace".into()];
+
+        let meta = env.build_search_meta(&response, 2, None);
+        let info = meta
+            .get("semanticSearch")
+            .and_then(|value| value.as_object())
+            .expect("semanticSearch meta");
+
+        let clarifications = info
+            .get("clarifications")
+            .and_then(|value| value.as_array())
+            .expect("clarifications array");
+        assert_eq!(clarifications.len(), 1);
+        assert_eq!(clarifications[0], json!("Provide the stack trace"));
+
+        let goals = info
+            .get("contextGoals")
+            .and_then(|value| value.as_array())
+            .expect("context goals array");
+        assert_eq!(goals, &vec![json!(ContextGoal::Debugging)]);
     }
 
     #[test]
@@ -4039,6 +4175,10 @@ mod tests {
                 confidence: 0.82,
             }],
             summary_mode: SummaryMode::Brief,
+            query_intent: Some(QueryIntent::Embedding),
+            intent_confidence: Some(0.78),
+            context_goals: vec![ContextGoal::GeneralUnderstanding],
+            clarification_prompts: Vec::new(),
             suggested_tools: Vec::new(),
             diagnostics: None,
         };

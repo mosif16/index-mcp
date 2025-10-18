@@ -652,6 +652,7 @@ async fn run_context_bundle(
         ranges: None,
         focus_line: None,
         query: None,
+        context_goals: None,
     };
 
     context_bundle(params).await

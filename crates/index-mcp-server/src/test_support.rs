@@ -100,6 +100,7 @@ impl TestWorkspace {
             max_neighbors: Some(8),
             budget_tokens: Some(800),
             query: None,
+            context_goals: None,
         };
         configure(&mut params);
         context_bundle(params)

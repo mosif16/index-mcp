@@ -1,7 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -10,12 +12,12 @@ use regex::Regex;
 use rmcp::schemars::{self, JsonSchema};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Number, Value};
 use thiserror::Error;
 use tokio::task::JoinError;
 
 use crate::index_status::DEFAULT_DB_FILENAME;
-use crate::search::create_embedding_runner;
+use crate::search::{create_embedding_runner, ContextGoal};
 
 const DEFAULT_SNIPPET_LIMIT: usize = 3;
 const MAX_SNIPPET_LIMIT: usize = 10;
@@ -27,9 +29,13 @@ const SUMMARY_CHAR_LIMIT: usize = 220;
 const EXCERPT_TOKEN_LIMIT: usize = 320;
 const MIN_SUMMARY_TOKEN_FLOOR: usize = 1;
 const BUNDLE_CACHE_CAPACITY: usize = 32;
+const NON_CODE_ASSET_LIMIT: usize = 3;
+const MAX_SYNTHETIC_LOG_CHARS: usize = 200;
 
 static CONTEXT_BUNDLE_CACHE: Lazy<Mutex<BundleCache>> =
     Lazy::new(|| Mutex::new(BundleCache::new(BUNDLE_CACHE_CAPACITY)));
+
+static TODO_MARKER_RE: Lazy<Regex> = Lazy::new(|| Regex::new("(?i)(TODO|FIXME)").unwrap());
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BundleCacheKey {
@@ -120,6 +126,8 @@ pub struct ContextBundleParams {
     pub focus_line: Option<u32>,
     #[serde(default)]
     pub query: Option<String>,
+    #[serde(default)]
+    pub context_goals: Option<Vec<ContextGoal>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Clone)]
@@ -358,6 +366,7 @@ fn build_bundle(params: ContextBundleParams) -> Result<ContextBundleResponse, Co
         ranges,
         focus_line,
         query,
+        context_goals,
     } = params;
 
     let root_path = resolve_root(root.unwrap_or_else(|| "./".to_string()))?;
@@ -371,6 +380,7 @@ fn build_bundle(params: ContextBundleParams) -> Result<ContextBundleResponse, Co
     let query_clean = query
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let context_goals = context_goals.unwrap_or_default();
 
     let max_snippets = max_snippets
         .map(|value| value.min(MAX_SNIPPET_LIMIT as u32) as usize)
@@ -436,6 +446,7 @@ fn build_bundle(params: ContextBundleParams) -> Result<ContextBundleResponse, Co
         &definitions,
         max_neighbors,
         focus_definition.as_ref(),
+        &context_goals,
     );
 
     let content_ref = file_content.as_deref();
@@ -504,10 +515,20 @@ fn build_bundle(params: ContextBundleParams) -> Result<ContextBundleResponse, Co
         }
     }
 
+    let asset_limit = NON_CODE_ASSET_LIMIT.min(max_snippets.max(1));
+    let asset_snippets = collect_non_code_assets(&conn, &target_file, &context_goals, asset_limit);
+    for snippet in asset_snippets {
+        let key = snippet_key(&snippet, &target_file);
+        if existing_keys.insert(key) {
+            snippets.push(snippet);
+        }
+    }
+
     snippet_warnings.append(&mut neighbor_warnings);
 
-    let (trimmed_snippets, usage_stats, mut trimming_warnings) =
+    let (mut trimmed_snippets, usage_stats, mut trimming_warnings) =
         trim_snippets_to_budget(snippets, &definitions, budget_tokens);
+    enrich_snippets_with_traces(&root_path, &mut trimmed_snippets, &context_goals);
 
     let ingestion = load_latest_ingestion(&conn)?;
     let mut warnings = gather_warnings(&definitions, content_ref);
@@ -826,38 +847,55 @@ fn count_todos(content: &str, start: Option<i64>, end: Option<i64>) -> Option<u3
     if start >= end || end > content.len() {
         return None;
     }
-    static TODO_RE: Lazy<Regex> = Lazy::new(|| Regex::new("(?i)(TODO|FIXME)").unwrap());
     let snippet = &content[start..end];
-    Some(TODO_RE.find_iter(snippet).count() as u32)
+    Some(TODO_MARKER_RE.find_iter(snippet).count() as u32)
 }
 
 fn load_related_neighbors(
     conn: &Connection,
     definitions: &[BundleDefinition],
     limit: usize,
-    _focus: Option<&BundleDefinition>,
+    focus: Option<&BundleDefinition>,
+    goals: &[ContextGoal],
 ) -> Vec<BundleEdgeNeighbor> {
-    if definitions.is_empty() {
+    if definitions.is_empty() || limit == 0 {
         return Vec::new();
     }
 
-    let mut neighbors = Vec::new();
     let mut stmt = match conn.prepare(
         "SELECT id, type, source_id, target_id, source_path, target_path, metadata \
          FROM code_graph_edges \
          WHERE source_id = ?1 OR target_id = ?1",
     ) {
         Ok(stmt) => stmt,
-        Err(_) => return neighbors,
+        Err(_) => return Vec::new(),
     };
 
+    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+    let mut enqueued: HashSet<String> = HashSet::new();
+    let mut seen_neighbors: HashSet<String> = HashSet::new();
+
     for definition in definitions {
-        if neighbors.len() >= limit {
-            break;
+        if enqueued.insert(definition.id.clone()) {
+            queue.push_back((definition.id.clone(), 0));
+        }
+    }
+
+    if let Some(focus) = focus {
+        if enqueued.insert(focus.id.clone()) {
+            queue.push_back((focus.id.clone(), 0));
+        }
+    }
+
+    let mut scored_neighbors: Vec<(f32, BundleEdgeNeighbor)> = Vec::new();
+
+    while let Some((node_id, depth)) = queue.pop_front() {
+        if depth >= 3 {
+            continue;
         }
 
         let rows = stmt
-            .query_map(params![&definition.id], |row| {
+            .query_map(params![&node_id], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -870,52 +908,175 @@ fn load_related_neighbors(
             })
             .ok();
 
-        if let Some(rows) = rows {
-            for row in rows.flatten() {
-                let (
-                    edge_id,
-                    edge_type,
-                    source_id,
-                    target_id,
-                    source_path,
-                    target_path,
-                    metadata_raw,
-                ) = row;
-                let direction = if source_id == definition.id {
-                    NeighborDirection::Outgoing
-                } else {
-                    NeighborDirection::Incoming
+        let Some(rows) = rows else {
+            continue;
+        };
+
+        for row in rows.flatten() {
+            let (edge_id, edge_type, source_id, target_id, source_path, target_path, metadata_raw) =
+                row;
+
+            let direction = if source_id == node_id {
+                NeighborDirection::Outgoing
+            } else {
+                NeighborDirection::Incoming
+            };
+
+            let neighbor_id = if direction == NeighborDirection::Outgoing {
+                target_id
+            } else {
+                source_id
+            };
+
+            if seen_neighbors.contains(&neighbor_id) {
+                continue;
+            }
+
+            let hop = depth + 1;
+            if hop > 2 {
+                continue;
+            }
+
+            if let Some(node) = load_neighbor_node(conn, &neighbor_id) {
+                let priority = neighbor_priority(goals, direction, hop, &edge_type);
+                let metadata = augment_neighbor_metadata(
+                    metadata_raw.as_deref(),
+                    hop,
+                    direction,
+                    goals,
+                    priority,
+                );
+
+                let neighbor = BundleEdgeNeighbor {
+                    id: edge_id.clone(),
+                    r#type: edge_type.clone(),
+                    direction,
+                    metadata,
+                    source_path: source_path.clone(),
+                    target_path: target_path.clone(),
+                    neighbor: node,
                 };
 
-                let neighbor_id = if direction == NeighborDirection::Outgoing {
-                    &target_id
-                } else {
-                    &source_id
-                };
+                scored_neighbors.push((priority, neighbor));
+                seen_neighbors.insert(neighbor_id.clone());
 
-                if let Some(node) = load_neighbor_node(conn, neighbor_id) {
-                    let metadata = metadata_raw
-                        .as_deref()
-                        .and_then(|payload| serde_json::from_str::<Value>(payload).ok());
-                    neighbors.push(BundleEdgeNeighbor {
-                        id: edge_id,
-                        r#type: edge_type,
-                        direction,
-                        metadata,
-                        source_path,
-                        target_path,
-                        neighbor: node,
-                    });
+                if hop < 2 && enqueued.insert(neighbor_id.clone()) {
+                    queue.push_back((neighbor_id, hop));
                 }
+            }
 
-                if neighbors.len() >= limit {
-                    break;
-                }
+            if scored_neighbors.len() >= limit * 3 {
+                break;
             }
         }
     }
 
-    neighbors
+    scored_neighbors.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.1.id.cmp(&b.1.id))
+    });
+
+    scored_neighbors
+        .into_iter()
+        .take(limit)
+        .map(|(_, neighbor)| neighbor)
+        .collect()
+}
+
+fn neighbor_priority(
+    goals: &[ContextGoal],
+    direction: NeighborDirection,
+    hop: usize,
+    edge_type: &str,
+) -> f32 {
+    let mut score = 2.4_f32 - hop as f32 * 0.5;
+
+    match direction {
+        NeighborDirection::Incoming => score += 0.25,
+        NeighborDirection::Outgoing => score += 0.15,
+    }
+
+    if has_goal(goals, ContextGoal::Debugging) && matches!(direction, NeighborDirection::Incoming) {
+        score += 0.7;
+    }
+
+    if has_goal(goals, ContextGoal::ApiDiscovery)
+        && matches!(direction, NeighborDirection::Outgoing)
+    {
+        score += 0.6;
+    }
+
+    if has_goal(goals, ContextGoal::ChangeImpact) && hop <= 2 {
+        score += 0.4;
+    }
+
+    if has_goal(goals, ContextGoal::Navigation) && hop == 1 {
+        score += 0.3;
+    }
+
+    if has_goal(goals, ContextGoal::GeneralUnderstanding) {
+        score += 0.1;
+    }
+
+    if edge_type.contains("implements") || edge_type.contains("extends") {
+        score += 0.2;
+    }
+
+    score.max(0.1)
+}
+
+fn augment_neighbor_metadata(
+    metadata_raw: Option<&str>,
+    hop: usize,
+    direction: NeighborDirection,
+    goals: &[ContextGoal],
+    priority: f32,
+) -> Option<Value> {
+    let mut map = metadata_raw
+        .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+
+    map.insert("hop".to_string(), Value::Number(Number::from(hop as u64)));
+    map.insert(
+        "directionHint".to_string(),
+        Value::String(
+            match direction {
+                NeighborDirection::Incoming => "incoming",
+                NeighborDirection::Outgoing => "outgoing",
+            }
+            .to_string(),
+        ),
+    );
+
+    if !goals.is_empty() {
+        let goal_array = goals
+            .iter()
+            .map(|goal| Value::String(goal_label(*goal).to_string()))
+            .collect();
+        map.insert("goalAlignment".to_string(), Value::Array(goal_array));
+    }
+
+    if let Some(number) = Number::from_f64(priority as f64) {
+        map.insert("priorityHint".to_string(), Value::Number(number));
+    }
+
+    Some(Value::Object(map))
+}
+
+fn goal_label(goal: ContextGoal) -> &'static str {
+    match goal {
+        ContextGoal::Debugging => "debugging",
+        ContextGoal::ApiDiscovery => "apiDiscovery",
+        ContextGoal::ChangeImpact => "changeImpact",
+        ContextGoal::Navigation => "navigation",
+        ContextGoal::GeneralUnderstanding => "general",
+    }
+}
+
+fn has_goal(goals: &[ContextGoal], goal: ContextGoal) -> bool {
+    goals.contains(&goal)
 }
 
 fn load_neighbor_node(conn: &Connection, node_id: &str) -> Option<NeighborNode> {
@@ -984,6 +1145,230 @@ fn collect_neighbor_snippets(
     }
 
     (snippets, warnings)
+}
+
+fn collect_non_code_assets(
+    conn: &Connection,
+    target_file: &str,
+    goals: &[ContextGoal],
+    limit: usize,
+) -> Vec<BundleSnippet> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let target_path = Path::new(target_file);
+    let mut candidates: HashSet<String> = HashSet::new();
+
+    if let Some(dir) = target_path.parent() {
+        let dir_path = dir.to_path_buf();
+        for name in ["README.md", "README.txt", "README"] {
+            candidates.insert(dir_path.join(name).to_string_lossy().into_owned());
+        }
+        if has_goal(goals, ContextGoal::Debugging) {
+            for name in ["RUNBOOK.md", "runbook.md", "TROUBLESHOOTING.md"] {
+                candidates.insert(dir_path.join(name).to_string_lossy().into_owned());
+            }
+        }
+        if has_goal(goals, ContextGoal::ApiDiscovery) {
+            for name in ["USAGE.md", "API.md"] {
+                candidates.insert(dir_path.join(name).to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    candidates.insert("README.md".to_string());
+    if has_goal(goals, ContextGoal::ApiDiscovery) {
+        candidates.insert("docs/api.md".to_string());
+        candidates.insert("docs/usage.md".to_string());
+        candidates.insert("examples/README.md".to_string());
+    }
+    if has_goal(goals, ContextGoal::Debugging) {
+        candidates.insert("docs/runbook.md".to_string());
+        candidates.insert("docs/troubleshooting.md".to_string());
+    }
+    if has_goal(goals, ContextGoal::ChangeImpact) {
+        candidates.insert("CHANGELOG.md".to_string());
+        candidates.insert("docs/architecture.md".to_string());
+        candidates.insert("docs/adr/README.md".to_string());
+    }
+    if let Some(stem) = target_path.file_stem() {
+        let doc_name = format!("docs/{}.md", stem.to_string_lossy());
+        candidates.insert(doc_name);
+    }
+
+    let mut assets = Vec::new();
+    for candidate in candidates {
+        if assets.len() >= limit {
+            break;
+        }
+        if candidate == target_file {
+            continue;
+        }
+        let snippets = load_snippets(conn, &candidate, 1, true);
+        if snippets.is_empty() {
+            continue;
+        }
+        let mut snippet = snippets.into_iter().next().unwrap();
+        annotate_asset_snippet(&mut snippet, &candidate);
+        assets.push(snippet);
+    }
+
+    assets
+}
+
+fn annotate_asset_snippet(snippet: &mut BundleSnippet, path: &str) {
+    let asset_kind = if path.to_ascii_lowercase().contains("runbook")
+        || path.to_ascii_lowercase().contains("troubleshoot")
+    {
+        "runbook"
+    } else if path.to_ascii_lowercase().contains("changelog") {
+        "changelog"
+    } else if path.to_ascii_lowercase().contains("config") || path.ends_with(".yaml") {
+        "config"
+    } else {
+        "documentation"
+    };
+
+    let mut meta = snippet
+        .metadata
+        .take()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    meta.insert(
+        "assetKind".to_string(),
+        Value::String(asset_kind.to_string()),
+    );
+    snippet.metadata = Some(Value::Object(meta));
+    if let Some(existing) = snippet.score {
+        snippet.score = Some(existing + 6.0);
+    } else {
+        snippet.score = Some(6.0);
+    }
+}
+
+fn enrich_snippets_with_traces(root: &Path, snippets: &mut [BundleSnippet], goals: &[ContextGoal]) {
+    for snippet in snippets.iter_mut() {
+        if let Some(trace) = build_synthetic_trace(root, snippet, goals) {
+            let mut metadata = snippet
+                .metadata
+                .take()
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+            metadata.extend(trace.into_iter());
+            snippet.metadata = Some(Value::Object(metadata));
+        }
+    }
+}
+
+fn build_synthetic_trace(
+    root: &Path,
+    snippet: &BundleSnippet,
+    goals: &[ContextGoal],
+) -> Option<Map<String, Value>> {
+    let mut trace = Map::new();
+
+    if let Some(path) = snippet.path.as_deref() {
+        if let Some(commit) = latest_commit_summary(root, path) {
+            trace.insert("recentCommit".to_string(), Value::String(commit));
+        }
+    }
+
+    if has_goal(goals, ContextGoal::Debugging) {
+        if let Some(log_excerpt) = latest_test_log_excerpt(root) {
+            trace.insert("latestTestLog".to_string(), Value::String(log_excerpt));
+        }
+    }
+
+    let todo_count = count_todo_markers_text(&snippet.content);
+    if todo_count > 0 {
+        trace.insert(
+            "todoCount".to_string(),
+            Value::Number(Number::from(todo_count as u64)),
+        );
+    }
+
+    if let Some(path) = snippet.path.as_deref() {
+        if path.contains("test") || path.contains("spec") {
+            trace.insert("testRelated".to_string(), Value::Bool(true));
+        }
+    }
+
+    if !goals.is_empty() {
+        trace.insert(
+            "contextGoals".to_string(),
+            Value::Array(
+                goals
+                    .iter()
+                    .map(|goal| Value::String(goal_label(*goal).to_string()))
+                    .collect(),
+            ),
+        );
+    }
+
+    if trace.is_empty() {
+        None
+    } else {
+        Some(trace)
+    }
+}
+
+fn latest_commit_summary(root: &Path, file: &str) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("log")
+        .arg("-n")
+        .arg("1")
+        .arg("--pretty=format:%h %s")
+        .arg("--")
+        .arg(file)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let summary = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if summary.is_empty() {
+        None
+    } else {
+        Some(summary)
+    }
+}
+
+fn latest_test_log_excerpt(root: &Path) -> Option<String> {
+    const CANDIDATES: &[&str] = &[
+        "logs/test.log",
+        "logs/tests.log",
+        "logs/integration.log",
+        "logs/ci.log",
+    ];
+
+    for candidate in CANDIDATES {
+        let path = root.join(candidate);
+        if !path.exists() {
+            continue;
+        }
+        if let Ok(content) = fs::read_to_string(&path) {
+            if let Some(line) = content.lines().rev().find(|line| !line.trim().is_empty()) {
+                let trimmed = line.trim();
+                let excerpt = if trimmed.len() > MAX_SYNTHETIC_LOG_CHARS {
+                    let start = trimmed.len() - MAX_SYNTHETIC_LOG_CHARS;
+                    &trimmed[start..]
+                } else {
+                    trimmed
+                };
+                return Some(format!("{}: {}", candidate, excerpt));
+            }
+        }
+    }
+    None
+}
+
+fn count_todo_markers_text(text: &str) -> u32 {
+    TODO_MARKER_RE.find_iter(text).count() as u32
 }
 
 fn load_neighbor_snippet(
