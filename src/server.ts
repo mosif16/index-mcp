@@ -30,6 +30,7 @@ import { getIndexStatus } from './status.js';
 import { getContextBundle } from './context-bundle.js';
 import { registerRemoteServers } from './remote-proxy.js';
 import { getRepositoryTimeline } from './git-timeline.js';
+import { resolveWorkspaceIdentity } from './workspace-identity.js';
 
 function rethrowWithContext(toolName: string, error: unknown): never {
   if (error instanceof Error) {
@@ -126,7 +127,8 @@ const ingestToolJsonSchema = {
     },
     databaseName: {
       type: 'string',
-      description: 'Optional SQLite filename (aliases: database, database_path, db). Defaults to .mcp-index.sqlite.'
+      description:
+        'Optional SQLite filename (aliases: database, database_path, db). Defaults to .mcp-index.sqlite stored in the managed index directory.'
     },
     maxFileSizeBytes: {
       type: 'integer',
@@ -276,9 +278,21 @@ const skippedFileSchema = z.object({
   size: z.number().optional(),
   message: z.string().optional()
 });
+const storageSourceSchema = z.enum(['INDEX_MCP_DB', 'INDEX_MCP_DB_DIR', 'home', 'tmp', 'workspace']);
+const identityComponentSchema = z.object({
+  source: z.string(),
+  value: z.string()
+});
 const ingestToolOutputShape = {
   root: z.string(),
   databasePath: z.string(),
+  storage: z.object({
+    directory: z.string(),
+    source: storageSourceSchema,
+    rootHash: z.string(),
+    identityHash: z.string(),
+    identityComponents: z.array(identityComponentSchema)
+  }),
   databaseSizeBytes: z.number(),
   ingestedFileCount: z.number(),
   skipped: z.array(skippedFileSchema),
@@ -481,7 +495,8 @@ const contextBundleJsonSchema = {
     },
     databaseName: {
       type: 'string',
-      description: 'Optional SQLite filename (aliases: database, database_path, db). Defaults to .mcp-index.sqlite.'
+      description:
+        'Optional SQLite filename (aliases: database, database_path, db). Defaults to .mcp-index.sqlite stored in the managed index directory.'
     },
     file: {
       type: 'string',
@@ -716,7 +731,8 @@ const codeLookupJsonSchema = {
     },
     databaseName: {
       type: 'string',
-      description: 'Optional SQLite filename (aliases: database, database_path, db). Defaults to .mcp-index.sqlite.'
+      description:
+        'Optional SQLite filename (aliases: database, database_path, db). Defaults to .mcp-index.sqlite stored in the managed index directory.'
     },
     model: {
       type: 'string',
@@ -1017,7 +1033,8 @@ const indexStatusJsonSchema = {
     },
     databaseName: {
       type: 'string',
-      description: 'Optional SQLite filename (aliases: database, database_path, db). Defaults to .mcp-index.sqlite.'
+      description:
+        'Optional SQLite filename (aliases: database, database_path, db). Defaults to .mcp-index.sqlite stored in the managed index directory.'
     },
     historyLimit: {
       type: 'integer',
@@ -1182,11 +1199,13 @@ async function main() {
     const watchDatabase = cli.values['watch-database'] as string | undefined;
     const runInitial = cli.values['watch-no-initial'] ? false : true;
     const quiet = cli.values['watch-quiet'] ?? false;
+    const watchIdentity = resolveWorkspaceIdentity(watchRoot, { env: process.env });
 
     try {
       watcherHandle = await startIngestWatcher({
         root: watchRoot,
         databaseName: watchDatabase,
+        workspaceIdentity: watchIdentity,
         debounceMs,
         runInitial,
         quiet: quiet === true,
@@ -1230,11 +1249,13 @@ async function main() {
         const parsedInput = ingestToolSchema.parse(normalizedInput);
         const context = createRootResolutionContext(extra);
         const resolvedRoot = resolveRootPath(parsedInput.root, context);
+        const workspaceIdentity = resolveWorkspaceIdentity(resolvedRoot, context);
         const resolvedPaths = resolveIngestPaths(resolvedRoot, context, parsedInput.paths);
         const ingestInput = {
           ...parsedInput,
           root: resolvedRoot,
-          paths: resolvedPaths.length ? resolvedPaths : undefined
+          paths: resolvedPaths.length ? resolvedPaths : undefined,
+          workspaceIdentity
         };
         const result = ingestToolOutputSchema.parse(await ingestCodebase(ingestInput));
 
@@ -1244,7 +1265,7 @@ async function main() {
               type: 'text',
               text: `Indexed ${result.ingestedFileCount} files in ${(result.durationMs / 1000).toFixed(
                 2
-              )}s. Database: ${result.databasePath}. Re-run ingest_codebase after any edits to keep the index fresh.`
+              )}s. Database: ${result.databasePath} (namespace ${result.storage.identityHash}). Re-run ingest_codebase after any edits to keep the index fresh.`
             }
           ],
           structuredContent: result
@@ -1272,6 +1293,7 @@ async function main() {
         const parsedInput = codeLookupInputSchema.parse(normalizedInput);
         const context = createRootResolutionContext(extra);
         const resolvedRoot = resolveRootPath(parsedInput.root, context);
+        const workspaceIdentity = resolveWorkspaceIdentity(resolvedRoot, context);
 
         const resolvedMode =
           parsedInput.mode ?? (parsedInput.query ? 'search' : parsedInput.file ? 'bundle' : 'graph');
@@ -1285,7 +1307,8 @@ async function main() {
             query: parsedInput.query,
             databaseName: parsedInput.databaseName,
             limit: parsedInput.limit,
-            model: parsedInput.model
+            model: parsedInput.model,
+            workspaceIdentity
           };
           const searchResult = semanticSearchOutputSchema.parse(await semanticSearch(searchInput));
           const modelDescriptor = searchResult.embeddingModel ? `model ${searchResult.embeddingModel}` : 'stored embeddings';
@@ -1321,7 +1344,8 @@ async function main() {
             file: parsedInput.file,
             symbol: parsedInput.symbol,
             maxSnippets: parsedInput.maxSnippets,
-            maxNeighbors: parsedInput.maxNeighbors
+            maxNeighbors: parsedInput.maxNeighbors,
+            workspaceIdentity
           };
           const bundleResult = contextBundleOutputSchema.parse(await getContextBundle(bundleInput));
           const summaryPieces: string[] = [
@@ -1403,7 +1427,8 @@ async function main() {
           databaseName: parsedInput.databaseName,
           node: graphNode,
           direction: parsedInput.direction,
-          limit: parsedInput.limit
+          limit: parsedInput.limit,
+          workspaceIdentity
         };
         const graphResult = graphNeighborOutputSchema.parse(await graphNeighbors(graphInput));
         const neighborCount = graphResult.neighbors.length;
@@ -1449,7 +1474,8 @@ async function main() {
         const parsedInput = semanticSearchSchema.parse(normalizedInput);
         const context = createRootResolutionContext(extra);
         const resolvedRoot = resolveRootPath(parsedInput.root, context);
-        const searchInput = { ...parsedInput, root: resolvedRoot };
+        const workspaceIdentity = resolveWorkspaceIdentity(resolvedRoot, context);
+        const searchInput = { ...parsedInput, root: resolvedRoot, workspaceIdentity };
         const result = semanticSearchOutputSchema.parse(await semanticSearch(searchInput));
         const modelDescriptor = result.embeddingModel ? `model ${result.embeddingModel}` : 'stored embeddings';
         const summary = result.results.length
@@ -1486,7 +1512,8 @@ async function main() {
         const parsedInput = graphNeighborSchema.parse(normalizedInput);
         const context = createRootResolutionContext(extra);
         const resolvedRoot = resolveRootPath(parsedInput.root, context);
-        const graphInput = { ...parsedInput, root: resolvedRoot };
+        const workspaceIdentity = resolveWorkspaceIdentity(resolvedRoot, context);
+        const graphInput = { ...parsedInput, root: resolvedRoot, workspaceIdentity };
         const result = graphNeighborOutputSchema.parse(await graphNeighbors(graphInput));
         const neighborCount = result.neighbors.length;
         const directionDescriptor = parsedInput.direction ?? 'outgoing';
@@ -1524,11 +1551,12 @@ async function main() {
         const parsedInput = contextBundleInputSchema.parse(normalizedInput);
         const context = createRootResolutionContext(extra);
         const resolvedRoot = resolveRootPath(parsedInput.root, context);
-        
+        const workspaceIdentity = resolveWorkspaceIdentity(resolvedRoot, context);
+
         // Apply budget tokens from environment if not specified
         const budgetTokens = parsedInput.budgetTokens ?? getBudgetTokens();
-        
-        const bundleInput = { ...parsedInput, root: resolvedRoot, budgetTokens };
+
+        const bundleInput = { ...parsedInput, root: resolvedRoot, budgetTokens, workspaceIdentity };
         const result = contextBundleOutputSchema.parse(await getContextBundle(bundleInput));
 
         const summaryPieces: string[] = [
@@ -1632,7 +1660,8 @@ async function main() {
         const parsedInput = indexStatusSchema.parse(normalizedInput);
         const context = createRootResolutionContext(extra);
         const resolvedRoot = resolveRootPath(parsedInput.root, context);
-        const statusInput = { ...parsedInput, root: resolvedRoot };
+        const workspaceIdentity = resolveWorkspaceIdentity(resolvedRoot, context);
+        const statusInput = { ...parsedInput, root: resolvedRoot, workspaceIdentity };
         const result = indexStatusOutputSchema.parse(await getIndexStatus(statusInput));
 
         let summary: string;

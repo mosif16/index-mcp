@@ -4,7 +4,8 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
-import { DEFAULT_DB_FILENAME } from './constants.js';
+import { resolveIndexDatabasePath } from './index-storage.js';
+import type { WorkspaceIdentity } from './workspace-identity.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -12,6 +13,7 @@ export interface IndexStatusOptions {
   root: string;
   databaseName?: string;
   historyLimit?: number;
+  workspaceIdentity?: WorkspaceIdentity;
 }
 
 export interface IndexStatusIngestion {
@@ -75,7 +77,11 @@ async function getCurrentGitCommitSha(root: string): Promise<string | null> {
 
 export async function getIndexStatus(options: IndexStatusOptions): Promise<IndexStatusResult> {
   const absoluteRoot = path.resolve(options.root);
-  const dbPath = path.join(absoluteRoot, options.databaseName ?? DEFAULT_DB_FILENAME);
+  const { databasePath: dbPath } = resolveIndexDatabasePath(
+    absoluteRoot,
+    options.databaseName,
+    options.workspaceIdentity
+  );
 
   let databaseExists = false;
   let databaseSizeBytes: number | null = null;

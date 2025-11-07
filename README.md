@@ -1,6 +1,6 @@
 # index-mcp
 
-An MCP (Model Context Protocol) server that scans a source-code workspace and builds a searchable SQLite index (`.mcp-index.sqlite` by default) in the project root. The index stores file metadata, hashes, and optionally file contents so MCP-compatible clients can perform fast lookups, semantic search, and graph exploration.
+An MCP (Model Context Protocol) server that scans a source-code workspace and builds a searchable SQLite index managed outside the working tree. By default the server creates `.mcp-index.sqlite` inside a hashed directory under `~/.index-mcp/indexes/`, keeping the repository clean while still storing file metadata, hashes, and optional file contents for fast lookups, semantic search, and graph exploration.
 
 **New in this version:** Context budget control and hotness tracking to prevent overwhelming LLMs with excessive context. Only small, focused bundles are sent based on actual usage patterns.
 
@@ -78,6 +78,20 @@ You can also pass flags through `npm run dev` (e.g. `npm run dev -- --watch`). U
 - `--watch-database=<filename>` – Choose a custom SQLite filename.
 - `--watch-no-initial` – Skip the initial full ingest.
 - `--watch-quiet` – Silence watcher logs.
+
+## Index storage directory
+
+Index files are persisted outside the repository in a managed cache tree:
+
+- Each workspace is resolved to an **identity** derived from the absolute root, supported metadata (headers/env vars such as `x-workspace-id`, `MCP_WORKSPACE_ID`, `GITHUB_REPOSITORY`), and Git remotes/worktree info when available. The root hash remains the first directory segment, and unique identities nest underneath it (`~/.index-mcp/indexes/<rootHash>/<identityHash>/`).
+- Every identity directory stores an `index-manifest.json` with the resolved components so operators can trace which repo/workspace produced the database. Subsequent tool calls automatically reuse the same namespace, preventing agents that work across multiple repositories from mixing context.
+- The file name defaults to `.mcp-index.sqlite`, but you can supply a custom name via tool inputs or `--watch-database`. The value is sanitized to a file name before use.
+- Set `INDEX_MCP_DB_DIR` to override the base directory (for example to place indexes on faster storage).
+- Set `INDEX_MCP_DB` to override the database file path entirely (useful for single-tenant deployments). When this is provided the server attempts to create the parent directory and fails the request if it is not writable.
+
+If neither environment variable is set and the home directory is unavailable, the server falls back to `${TMPDIR}/index-mcp/indexes/`. Only when all candidates fail will it place the database inside the workspace, and a warning is logged in that case. When the path is fully overridden via `INDEX_MCP_DB`, the identity manifest is not written (the operator is expected to manage the target directory).
+
+Calls to `ingest_codebase` include a `storage` block in the structured response so agents can audit which namespace was used (directory, source, root hash, identity hash, and the individual identity components).
 
 When embedding the server in another process, call `await runCleanup()` from `src/cleanup.ts` before exit so watchers, transports, and embedding pipelines shut down cleanly.
 

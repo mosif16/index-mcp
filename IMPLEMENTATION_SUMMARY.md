@@ -136,7 +136,7 @@ The implementation supports the suggested configuration:
 [mcp_servers.index_mcp]
 command = "/Users/mohammedsayf/Desktop/index-mcp/start.sh"
 env = {
-  INDEX_MCP_DB = "/Users/mohammedsayf/Desktop/index-mcp/.mcp-index.sqlite",
+  INDEX_MCP_DB = "/Users/mohammedsayf/.index-mcp/indexes/custom.sqlite",
   INDEX_MCP_BUDGET_TOKENS = "3000"
 }
 startup_timeout_ms = 120000
@@ -144,8 +144,11 @@ startup_timeout_ms = 120000
 
 **Environment variables added:**
 - `INDEX_MCP_BUDGET_TOKENS`: Default token budget for context bundles (default: 3000)
+- `INDEX_MCP_DB_DIR`: Optional base directory for managed index files (defaults to `~/.index-mcp/indexes`).
+- `INDEX_MCP_DB`: Optional absolute path override for the SQLite database (takes precedence over `INDEX_MCP_DB_DIR`).
+- `MCP_WORKSPACE_ID`, `WORKSPACE_ID`, `GITHUB_REPOSITORY`, `CI_PROJECT_PATH`, and other workspace/repository identifiers (along with their `x-` header equivalents) are now consumed to derive a stable workspace identity so concurrent agents indexing different repos do not share a database. Git remotes/worktrees are used as a fallback when metadata is absent, and the resolved components are persisted in `index-manifest.json` alongside the database.
 
-**Note:** `INDEX_MCP_DB` is not currently used as the database is always stored at the repository root as `.mcp-index.sqlite`. This could be enhanced in the future.
+`ingest_codebase` responses include a `storage` object that reports the resolved directory, source, root hash, identity hash, and the identity components so orchestrators can audit and cache per-repo indexes safely.
 
 ## Current Practices Maintained ✅
 

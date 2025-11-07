@@ -2,7 +2,8 @@ import Database from 'better-sqlite3';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
-import { DEFAULT_DB_FILENAME } from './constants.js';
+import { resolveIndexDatabasePath } from './index-storage.js';
+import type { WorkspaceIdentity } from './workspace-identity.js';
 
 export interface ContextBundleSymbolSelector {
   name: string;
@@ -17,6 +18,7 @@ export interface ContextBundleOptions {
   maxSnippets?: number;
   maxNeighbors?: number;
   budgetTokens?: number;
+  workspaceIdentity?: WorkspaceIdentity;
 }
 
 export interface BundleFileMetadata {
@@ -337,7 +339,11 @@ export async function getContextBundle(options: ContextBundleOptions): Promise<C
     throw new Error(`Context bundle root must be a directory: ${absoluteRoot}`);
   }
 
-  const databasePath = path.join(absoluteRoot, options.databaseName ?? DEFAULT_DB_FILENAME);
+  const { databasePath } = resolveIndexDatabasePath(
+    absoluteRoot,
+    options.databaseName,
+    options.workspaceIdentity
+  );
   const db = new Database(databasePath, { fileMustExist: true });
 
   try {
