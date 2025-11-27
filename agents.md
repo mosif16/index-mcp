@@ -45,7 +45,7 @@ This document explains how to run and use the **index-mcp** server with the Code
 
 ## 1. Overview
 
-- **Purpose:** Index a codebase into a root-level SQLite database (`.mcp-index.sqlite`) so agents can perform fast metadata/content queries.
+- **Purpose:** Index a codebase into a managed SQLite database (default `.mcp-index.sqlite` stored under `~/.index-mcp/indexes/<rootHash>/<identityHash>/`) so agents can perform fast metadata/content queries without polluting the workspace or mixing data between repositories.
 - **Primary tool:** `ingest_codebase` – scans files, stores hashes, metadata, and optionally UTF-8 content.
 - **Supporting prompt:** `indexing_guidance` – returns reminders about when to run the ingestor.
 - **Helper script:** `start.sh` – rebuilds the TypeScript bundles, refreshes the native addon, spins up the local HTTP/SSE backend, and launches the stdio MCP server.
@@ -103,9 +103,15 @@ The sidecar backend (`src/local-backend/server.ts`) exposes an HTTP/SSE surface 
 - `--watch-debounce <ms>` — adjust the debounce window before an ingest is triggered (default 500 ms, minimum 50 ms).
 - `--watch-no-initial` — skip the initial full ingest when the watcher starts.
 - `--watch-quiet` — silence watcher log output.
-- `--watch-database <filename>` — customize the SQLite filename instead of `.mcp-index.sqlite`.
+- `--watch-database <filename>` — customize the SQLite filename stored in the managed index directory (defaults to `.mcp-index.sqlite`).
 
 These align with the `startIngestWatcher` options and make it easy to tune incremental ingest behaviour for larger projects.
+
+### Workspace identity & storage namespace
+
+- The server derives a stable workspace identity from the absolute root, Git remotes/worktree metadata, and any caller-provided identifiers (headers like `x-workspace-id`, `x-repository`, `x-github-repository`; env vars such as `MCP_WORKSPACE_ID`, `WORKSPACE_ID`, `GITHUB_REPOSITORY`, `CI_PROJECT_PATH`). Each unique identity is mapped to `~/.index-mcp/indexes/<rootHash>/<identityHash>/`.
+- Every namespace directory gets an `index-manifest.json` so operators can audit which components produced a given database. Managed tools automatically reuse the same manifest to avoid mixing indexes when agents move between repos.
+- When `INDEX_MCP_DB` explicitly overrides the database path the manifest is skipped—manage that directory yourself if you need multi-tenant isolation.
 
 ## 5. Codex CLI Configuration
 
@@ -145,7 +151,7 @@ Environment variables scoped in the `env` table support both the `INDEX_MCP_*` n
 | Name             | Type  | Description |
 |------------------|-------|-------------|
 | `code_lookup`     | Tool  | Unified entry point that auto-routes queries to semantic search, context bundles, or graph neighbors so Codex doesn’t need to pick a specialist tool manually. |
-| `ingest_codebase` | Tool  | Walks a directory, stores metadata + optional UTF-8 content for each file in `.mcp-index.sqlite`, and prunes deleted entries. Accepts optional glob include/exclude, custom database name, file-size limits, and `storeFileContent` toggle. |
+| `ingest_codebase` | Tool  | Walks a directory, stores metadata + optional UTF-8 content in the managed SQLite database (default filename `.mcp-index.sqlite`), and prunes deleted entries. Accepts optional glob include/exclude, custom database name, file-size limits, and `storeFileContent` toggle. Structured output includes a `storage` block with the resolved namespace (directory/source/hashes/identity components). |
 | `semantic_search` | Tool  | Embedding-powered retrieval across stored `file_chunks` for natural-language or code queries. Returns scored snippets along with byte offsets, line spans, and nearby context so agents can understand matches without opening the source file. |
 | `graph_neighbors` | Tool  | Query GraphRAG nodes/edges produced during ingestion to inspect imports and call relationships. |
 | `context_bundle` | Tool  | Package file metadata, definitions, related edges, and representative snippets into a single response so agents can bootstrap context quickly. |
@@ -182,9 +188,9 @@ If your client does not yet support MCP prompts, call `indexing_guidance_tool` t
    - `mode="graph"` plus `symbol`/`node` -> graph neighbor exploration.
 4. *(Optional)* **Run the watcher:** `npm run watch` keeps the database fresh by triggering incremental ingests when files change.
 5. **Use specialist tools** directly when you need their structured responses without routing (e.g. `index_status` or `info`).
-6. **Re-index after edits:** call `ingest_codebase` again (or rely on the watcher) so `.mcp-index.sqlite` reflects the latest changes.
+6. **Re-index after edits:** call `ingest_codebase` again (or rely on the watcher) so the managed SQLite index reflects the latest changes.
 7. **Shut down cleanly:** `await runCleanup()` (or rely on the CLI’s built-in signal handlers) when stopping the server so the asynchronous teardown can finish terminating watchers, closing transports, and draining embedding/native caches before the process exits.
-8. **Optional inspection:** use `sqlite3 .mcp-index.sqlite` to run ad-hoc queries if needed.
+8. **Optional inspection:** use `sqlite3 $(ingest_codebase.databasePath)` (or the resolved path under `~/.index-mcp/indexes/<rootHash>/<identityHash>/`) to run ad-hoc queries if needed.
 
 ## 8. Database Schema (summary)
 
@@ -229,7 +235,7 @@ If your client does not yet support MCP prompts, call `indexing_guidance_tool` t
 | `root`             | none (required)       | Path to scan. Relative paths resolve against the server’s working directory. |
 | `include`          | `["**/*"]`           | Glob patterns to include (fast-glob syntax). |
 | `exclude`          | Several defaults      | Includes VCS folders, `node_modules`, `dist`, and the database itself. You can pass extra patterns. |
-| `databaseName`     | `.mcp-index.sqlite`   | File created at the root. |
+| `databaseName`     | `.mcp-index.sqlite`   | File name stored in the managed index directory (value is sanitized to a base name). |
 | `maxFileSizeBytes` | `8388608` (8 MiB)     | Larger files are skipped and logged in `skipped`. |
 | `storeFileContent` | `true`                | If `false`, only metadata is stored. Binary detection uses a null-byte heuristic. |
 | `contentSanitizer` | `undefined`           | Optional `{ module, exportName?, options? }` descriptor that loads a sanitizer to redact or strip contents before storage. |

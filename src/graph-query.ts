@@ -2,7 +2,8 @@ import Database from 'better-sqlite3';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
-import { DEFAULT_DB_FILENAME } from './constants.js';
+import { resolveIndexDatabasePath } from './index-storage.js';
+import type { WorkspaceIdentity } from './workspace-identity.js';
 
 export type GraphNeighborDirection = 'incoming' | 'outgoing' | 'both';
 
@@ -19,6 +20,7 @@ export interface GraphNeighborsOptions {
   node: GraphNodeDescriptor;
   direction?: GraphNeighborDirection;
   limit?: number;
+  workspaceIdentity?: WorkspaceIdentity;
 }
 
 export interface GraphNodeSummary {
@@ -94,7 +96,11 @@ export async function graphNeighbors(options: GraphNeighborsOptions): Promise<Gr
     throw new Error(`Graph query root must be a directory: ${absoluteRoot}`);
   }
 
-  const dbPath = path.join(absoluteRoot, options.databaseName ?? DEFAULT_DB_FILENAME);
+  const { databasePath: dbPath } = resolveIndexDatabasePath(
+    absoluteRoot,
+    options.databaseName,
+    options.workspaceIdentity
+  );
   const db = new Database(dbPath, { readonly: true });
 
   try {

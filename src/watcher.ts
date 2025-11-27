@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import { DEFAULT_DB_FILENAME, DEFAULT_EXCLUDE_GLOBS, DEFAULT_INCLUDE_GLOBS } from './constants.js';
 import { ingestCodebase, type IngestOptions, type IngestResult } from './ingest.js';
+import type { WorkspaceIdentity } from './workspace-identity.js';
 import { createLogger } from './logger.js';
 
 export interface WatcherOptions {
@@ -10,6 +11,7 @@ export interface WatcherOptions {
   includeGlobs?: string[];
   excludeGlobs?: string[];
   databaseName?: string;
+  workspaceIdentity?: WorkspaceIdentity;
   debounceMs?: number;
   runInitial?: boolean;
   quiet?: boolean;
@@ -35,7 +37,7 @@ function toPosixPath(input: string): string {
 export async function startIngestWatcher(options: WatcherOptions): Promise<WatcherHandle> {
   const absoluteRoot = path.resolve(options.root);
   const includeGlobs = options.includeGlobs?.length ? options.includeGlobs : DEFAULT_INCLUDE_GLOBS;
-  const databaseName = options.databaseName ?? DEFAULT_DB_FILENAME;
+  const databaseName = path.basename(options.databaseName ?? DEFAULT_DB_FILENAME);
   const excludeGlobs = Array.from(
     new Set([
       ...DEFAULT_EXCLUDE_GLOBS,
@@ -72,6 +74,7 @@ export async function startIngestWatcher(options: WatcherOptions): Promise<Watch
       include: includeGlobs,
       exclude: excludeGlobs,
       databaseName,
+      workspaceIdentity: options.workspaceIdentity,
       maxFileSizeBytes: options.maxFileSizeBytes,
       storeFileContent: options.storeFileContent,
       contentSanitizer: options.contentSanitizer,

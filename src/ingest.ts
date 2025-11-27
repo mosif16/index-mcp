@@ -10,7 +10,9 @@ import { promisify } from 'node:util';
 
 import { embedTexts, float32ArrayToBuffer, getDefaultEmbeddingModel } from './embedding.js';
 import { extractGraphMetadata } from './graph.js';
-import { DEFAULT_DB_FILENAME, DEFAULT_INCLUDE_GLOBS, DEFAULT_EXCLUDE_GLOBS } from './constants.js';
+import { DEFAULT_INCLUDE_GLOBS, DEFAULT_EXCLUDE_GLOBS } from './constants.js';
+import { resolveIndexDatabasePath, type IndexStorageSource } from './index-storage.js';
+import type { WorkspaceIdentity, WorkspaceIdentityComponent } from './workspace-identity.js';
 import { loadNativeModule } from './native/index.js';
 import type {
   NativeBatchAnalysisResult,
@@ -81,6 +83,7 @@ export interface IngestOptions {
   include?: string[];
   exclude?: string[];
   databaseName?: string;
+  workspaceIdentity?: WorkspaceIdentity;
   maxFileSizeBytes?: number;
   storeFileContent?: boolean;
   contentSanitizer?: ContentSanitizerSpec;
@@ -101,6 +104,13 @@ export interface SkippedFile {
 export interface IngestResult {
   root: string;
   databasePath: string;
+  storage: {
+    directory: string;
+    source: IndexStorageSource;
+    rootHash: string;
+    identityHash: string;
+    identityComponents: WorkspaceIdentityComponent[];
+  };
   databaseSizeBytes: number;
   ingestedFileCount: number;
   skipped: SkippedFile[];
@@ -751,7 +761,16 @@ function normalizeTargetPaths(root: string, paths?: string[]): string[] {
 }
 
 export async function ingestCodebase(options: IngestOptions): Promise<IngestResult> {
-  const databaseName = options.databaseName ?? DEFAULT_DB_FILENAME;
+  const absoluteRoot = path.resolve(options.root);
+  const {
+    databasePath,
+    storageDirectory,
+    source: storageSource,
+    rootHash,
+    identityHash,
+    identityComponents
+  } = resolveIndexDatabasePath(absoluteRoot, options.databaseName, options.workspaceIdentity);
+  const databaseName = path.basename(databasePath);
   const includeGlobs = options.include ?? DEFAULT_INCLUDE_GLOBS;
   const excludeGlobs = Array.from(
     new Set([
@@ -767,7 +786,6 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
   const embeddingConfig = resolveEmbeddingDefaults(options.embedding);
   const graphConfig = resolveGraphDefaults(options.graph);
 
-  const absoluteRoot = path.resolve(options.root);
   const targetPaths = normalizeTargetPaths(absoluteRoot, options.paths);
   const usingTargetPaths = targetPaths.length > 0;
   const searchPatterns = usingTargetPaths ? targetPaths : includeGlobs;
@@ -776,10 +794,9 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
     throw new Error(`Ingest root must be a directory: ${absoluteRoot}`);
   }
 
-  const dbPath = path.join(absoluteRoot, databaseName);
   const startTime = Date.now();
 
-  const db: DatabaseInstance = new Database(dbPath);
+  const db: DatabaseInstance = new Database(databasePath);
   try {
     ensureSchema(db);
 
@@ -1143,7 +1160,7 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
 
     db.close();
 
-    let dbStats = await fs.stat(dbPath);
+    let dbStats = await fs.stat(databasePath);
     let evictionResult: { chunks: number; nodes: number } | undefined;
 
     // Check if eviction is needed
@@ -1155,7 +1172,8 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
       const evicted = await evictLeastUsed({
         root: absoluteRoot,
         databaseName: databaseName,
-        maxSizeBytes: maxDatabaseSizeBytes
+        maxSizeBytes: maxDatabaseSizeBytes,
+        workspaceIdentity: options.workspaceIdentity
       });
       
       if (evicted.wasEvictionNeeded) {
@@ -1163,13 +1181,20 @@ export async function ingestCodebase(options: IngestOptions): Promise<IngestResu
           chunks: evicted.evictedChunks,
           nodes: evicted.evictedNodes
         };
-        dbStats = await fs.stat(dbPath);
+        dbStats = await fs.stat(databasePath);
       }
     }
 
     return {
       root: absoluteRoot,
-      databasePath: dbPath,
+      databasePath,
+      storage: {
+        directory: storageDirectory,
+        source: storageSource,
+        rootHash,
+        identityHash,
+        identityComponents
+      },
       databaseSizeBytes: dbStats.size,
       ingestedFileCount: files.length,
       skipped,

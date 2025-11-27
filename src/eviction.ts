@@ -2,12 +2,14 @@ import Database from 'better-sqlite3';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
-import { DEFAULT_DB_FILENAME } from './constants.js';
+import { resolveIndexDatabasePath } from './index-storage.js';
+import type { WorkspaceIdentity } from './workspace-identity.js';
 
 export interface EvictionOptions {
   root: string;
   databaseName?: string;
   maxSizeBytes?: number;
+  workspaceIdentity?: WorkspaceIdentity;
 }
 
 export interface EvictionResult {
@@ -23,7 +25,11 @@ const DEFAULT_MAX_SIZE_BYTES = 150 * 1024 * 1024; // 150 MB
 
 export async function evictLeastUsed(options: EvictionOptions): Promise<EvictionResult> {
   const absoluteRoot = path.resolve(options.root);
-  const dbPath = path.join(absoluteRoot, options.databaseName ?? DEFAULT_DB_FILENAME);
+  const { databasePath: dbPath } = resolveIndexDatabasePath(
+    absoluteRoot,
+    options.databaseName,
+    options.workspaceIdentity
+  );
   const maxSizeBytes = options.maxSizeBytes ?? DEFAULT_MAX_SIZE_BYTES;
 
   const statsBefore = await fs.stat(dbPath);
